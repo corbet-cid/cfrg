@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "free_only": true,
+  "forges": {
+    "hub": {"kind": "github", "url": "https://hub.example.org"},
+    "mirror": {"kind": "forgejo", "url": "https://forge.example.org"},
+    "lab": {"kind": "gitlab", "url": "https://lab.example.org"},
+    "bucket": {"kind": "bitbucket", "url": "https://bucket.example.org"}
+  },
+  "ci": {
+    "primary": {"driver": "github-actions", "forge": "hub", "execution": "free-hosted", "capabilities": ["linux-x86_64"]},
+    "backup": {"driver": "crow", "forge": "mirror", "execution": "owned", "capabilities": ["linux-x86_64"]}
+  },
+  "repositories": {
+    "widget": {
+      "ci": "primary",
+      "visibility": "public",
+      "sensitive": false,
+      "attributes": {"distribution": "public"},
+      "locations": {"hub": "team/widget", "mirror": "backup/widget", "lab": "group/subgroup/widget", "bucket": "workspace/widget"},
+      "clone_fallbacks": ["mirror", "lab", "bucket"],
+      "execution_fallbacks": ["backup"],
+      "promotion": "manual"
+    }
+  },
+  "placement_rules": [
+    {"name": "public-source", "attributes": {"distribution": "public"}, "require": ["hub"], "forbid": []}
+  ]
+}

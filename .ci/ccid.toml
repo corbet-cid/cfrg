@@ -1,0 +1,27 @@
+schema = 1
+project = "cfrg"
+
+[render]
+tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+
+# Locked: Cargo.lock is worker-resolved (see S-split/CI-NOTES.md); the
+# pinned tool passes --locked to every cargo invocation.
+[checks.test]
+kind = "cargo"
+
+[checks.build]
+kind = "cargo"
+actions = ["build"]
+release = true
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["test"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-job.sh"]
+
+[jobs.build]
+scheduler = "crow"
+checks = ["build"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-job.sh"]

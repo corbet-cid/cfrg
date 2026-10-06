@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "generator": "ccid render v1",
+  "tool_revision": "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58",
+  "manifest_sha256": "fa7899a84bb9857fbe0b0182ebe6876bcfe7126e422e38d0f9ace445ab5787c0",
+  "jobs": {
+    "build": {
+      "job": "build",
+      "scheduler": "crow",
+      "checks": [
+        "build"
+      ],
+      "workflow": "repository-jobs",
+      "command": [
+        "bash",
+        ".ci/run-job.sh"
+      ]
+    },
+    "verify": {
+      "job": "verify",
+      "scheduler": "crow",
+      "checks": [
+        "test"
+      ],
+      "workflow": "repository-jobs",
+      "command": [
+        "bash",
+        ".ci/run-job.sh"
+      ]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+schema = 1
+
+# Fictional example only. One entry per person: stable person id with the
+# handle that person uses on each forge where they hold an account. Handles
+# only; never emails or secrets. Absent means no account on that forge.
+# Matching across forges uses ONLY this map; names and emails are never
+# guessed.
+[people.alice-example]
+github = "alice-gh"
+forgejo = "alice-fj"
+gitlab = "alice-gl"
+
+[people.bruno-example]
+github = "bruno-gh"
+forgejo = "bruno-fj"
+bitbucket = "bruno-bb"
+
+[people.cara-example]
+forgejo = "cara-fj"
+gitlab = "cara-gl"

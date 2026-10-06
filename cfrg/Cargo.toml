@@ -1,0 +1,30 @@
+[package]
+name = "cfrg"
+edition.workspace = true
+version.workspace = true
+license-file = "LICENSE.md"
+description = "Forge-independent model, pure planners and bounded transports"
+repository = "https://git.corbet.ch/corbet-libs/cfrg.git"
+
+[features]
+windows-experimental = []
+
+[dependencies]
+cqlt.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+process-wrap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
+tokio = { version = "1", features = ["rt", "process", "io-util", "time"] }
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

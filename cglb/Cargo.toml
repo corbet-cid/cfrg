@@ -1,0 +1,14 @@
+[package]
+name = "cglb"
+edition.workspace = true
+version.workspace = true
+license-file = "LICENSE.md"
+description = "GitLab adapter for cfrg: roles, grants, status, bridge API, profile"
+repository = "https://git.corbet.ch/corbet-libs/cfrg.git"
+
+[dependencies]
+cfrg.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
