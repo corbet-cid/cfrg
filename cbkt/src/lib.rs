@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod native;
+
 use cfrg::{
     access::{Call, Grants, RoleMap},
     model::{Forge, Level},

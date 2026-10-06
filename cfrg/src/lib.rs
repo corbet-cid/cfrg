@@ -28,6 +28,7 @@ pub mod access;
 pub mod bridge;
 pub mod collect;
 pub mod model;
+pub mod native;
 pub mod placement;
 pub mod process;
 pub mod profile;

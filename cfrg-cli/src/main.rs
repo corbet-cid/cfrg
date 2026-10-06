@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 
+mod native;
 mod resolve;
 
 #[derive(Parser)]
@@ -35,6 +36,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Reconcile Forgejo native push mirrors from repository-owned placement.
+    Native(native::Options),
     /// Validate all placements, costs, primary CI/forge relationships and rules.
     Validate {
         #[arg(long)]
@@ -375,6 +378,7 @@ fn observed_world(
 
 fn run(action: Action) -> Result<()> {
     match action {
+        Action::Native(options) => native::run(options)?,
         Action::Validate { policy } => {
             let policy = read(policy)?;
             println!(

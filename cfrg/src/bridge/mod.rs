@@ -1,7 +1,7 @@
 //! Opt-in, one-shot contribution import. This module never executes imported code.
 mod approval;
 mod git;
-mod http;
+pub(crate) mod http;
 mod lifecycle;
 mod sandbox;
 
