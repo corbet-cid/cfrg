@@ -66,7 +66,10 @@ pub fn helper_arg_safe(value: &str) -> bool {
 pub fn credentials(request: &Request, decisions: &[RepoDecision]) -> Vec<CredentialScope> {
     let mut out: Vec<CredentialScope> = Vec::new();
     for decision in decisions {
-        if decision.outcome != crate::Routing::Routed {
+        if !matches!(
+            decision.outcome,
+            crate::Routing::Routed | crate::Routing::EmergencyFallback
+        ) {
             continue;
         }
         let Some(index) = decision.store else {
@@ -232,6 +235,7 @@ mod tests {
             }],
             timeout_secs: 30,
             primary_source: None,
+            emergency_fallback: false,
         };
         let decisions = vec![RepoDecision {
             id: "w".into(),

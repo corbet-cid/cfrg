@@ -90,6 +90,7 @@ fn request(repos: Vec<Repository>, stores: Vec<Store>) -> Request {
         stores,
         timeout_secs: 30,
         primary_source: None,
+        emergency_fallback: false,
     }
 }
 
@@ -682,6 +683,7 @@ fn contract_alias_example_validates_and_selects() {
         stores: vec![],
         timeout_secs: 30,
         primary_source: None,
+        emergency_fallback: false,
     };
     let table = Table::new(vec![]);
     let response = clmr::select(&req, &table).unwrap();
@@ -855,4 +857,236 @@ fn contract_example_round_trips() {
     let rendered = serde_json::to_string_pretty(&response).unwrap();
     assert!(rendered.contains("https://forge.example:3001/acme/widget.git"));
     assert!(response.git_config.contains("insteadOf"));
+}
+
+// ---------------------------------------------------------------------------
+// Emergency fallback (decided 2026-10-07): when the canonical pointer or the
+// primary forge cannot answer, a moving ref may come from a declared store
+// that is not its primary, with a warning. Pinned refs never need it.
+// ---------------------------------------------------------------------------
+
+/// A table prober that also answers whether the canonical path is up.
+struct Reach {
+    table: Table,
+    reachable: Option<bool>,
+    asked: std::cell::Cell<u32>,
+}
+
+impl Reach {
+    fn new(answers: Vec<((usize, &str, &str), Outcome)>, reachable: Option<bool>) -> Self {
+        Self {
+            table: Table::new(answers),
+            reachable,
+            asked: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Prober for Reach {
+    fn probe(&self, store: usize, path: &str, need: &RefKind) -> Outcome {
+        self.table.probe(store, path, need)
+    }
+
+    fn canonical_reachable(&self, _path: &str) -> Option<bool> {
+        self.asked.set(self.asked.get() + 1);
+        self.reachable
+    }
+}
+
+const MOVING_KEY: &str = "moving:refs/heads/main";
+
+#[test]
+fn foreign_primary_with_live_pointer_never_consults_other_identity_stores() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("github"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let reach = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Hit)],
+        Some(true),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+    assert!(reach.table.calls.borrow().is_empty());
+}
+
+#[test]
+fn foreign_primary_with_dead_pointer_takes_the_emergency_fallback_with_a_warning() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("github"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let reach = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Hit)],
+        Some(false),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    let decision = &response.decisions[0];
+    assert_eq!(decision.outcome, Routing::EmergencyFallback);
+    assert_eq!(decision.store, Some(0));
+    assert!(decision.note.starts_with("EMERGENCY FALLBACK"));
+    assert!(decision.note.contains("may lag"));
+    assert_eq!(
+        decision.via.as_deref(),
+        Some("https://forge.example:3001/acme/widget.git")
+    );
+    // The emergency store gets its credential scope and its rewrite, like any routed store.
+    assert_eq!(response.credentials.len(), 1);
+    assert!(response
+        .git_config
+        .contains("insteadOf = https://pointer.example/acme/widget"));
+}
+
+#[test]
+fn foreign_primary_dead_pointer_and_no_copy_stays_on_the_pointer() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("github"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    for answer in [Outcome::Miss, Outcome::Denied, Outcome::Error] {
+        let reach = Reach::new(vec![((0, "acme/widget", MOVING_KEY), answer)], Some(false));
+        let response = clmr::select(&req, &reach).unwrap();
+        assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+    }
+}
+
+#[test]
+fn unknown_primary_with_dead_pointer_takes_the_emergency_fallback() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), None)],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let reach = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Hit)],
+        Some(false),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::EmergencyFallback);
+    let live = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Hit)],
+        Some(true),
+    );
+    let response = clmr::select(&req, &live).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+}
+
+#[test]
+fn unanswered_reachability_keeps_the_pure_canonical_fallback() {
+    let mut req = request(
+        vec![
+            repo("a", "acme/widget", branch(), Some("github")),
+            repo("b", "acme/other", branch(), None),
+        ],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    // None: the prober never learned anything (probing off). Nothing changes.
+    let reach = Reach::new(
+        vec![
+            ((0, "acme/widget", MOVING_KEY), Outcome::Hit),
+            ((0, "acme/other", MOVING_KEY), Outcome::Hit),
+        ],
+        None,
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert!(response
+        .decisions
+        .iter()
+        .all(|d| d.outcome == Routing::CanonicalPointer));
+    assert!(reach.table.calls.borrow().is_empty());
+}
+
+#[test]
+fn home_primary_whose_store_fails_falls_to_the_pointer_without_emergency() {
+    // The express lane failing is the next link of the chain (the public
+    // forge as a second store, then the pointer), not an emergency: the
+    // primary's own stores are the ones that failed.
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("forgejo"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let reach = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Error)],
+        Some(false),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+    assert_eq!(reach.asked.get(), 0);
+}
+
+#[test]
+fn home_primary_chain_prefers_the_express_lane_then_the_public_forge() {
+    let mut public = forgejo_store("forgejo", vec!["acme"]);
+    public.location = "https://forge.example".into();
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("forgejo"))],
+        vec![forgejo_store("forgejo", vec!["acme"]), public],
+    );
+    req.emergency_fallback = true;
+    // Express lane (store 0) fails, the public forge (store 1) holds the ref.
+    let reach = Reach::new(
+        vec![
+            ((0, "acme/widget", MOVING_KEY), Outcome::Error),
+            ((1, "acme/widget", MOVING_KEY), Outcome::Hit),
+        ],
+        Some(true),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::Routed);
+    assert_eq!(response.decisions[0].store, Some(1));
+    assert_eq!(
+        response.decisions[0].via.as_deref(),
+        Some("https://forge.example/acme/widget.git")
+    );
+    // Both stores failing leaves the canonical pointer.
+    let reach = Reach::new(
+        vec![
+            ((0, "acme/widget", MOVING_KEY), Outcome::Error),
+            ((1, "acme/widget", MOVING_KEY), Outcome::Error),
+        ],
+        Some(true),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+}
+
+#[test]
+fn pinned_commits_never_need_the_emergency_path_and_stay_hash_verified() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", pinned(), Some("github"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let key = "pinned:0123456789abcdef0123456789abcdef01234567";
+    let hit = Reach::new(vec![((0, "acme/widget", key), Outcome::Hit)], Some(false));
+    let response = clmr::select(&req, &hit).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::Routed);
+    assert_eq!(hit.asked.get(), 0);
+    // A store that does not hold the exact hash is never used, whatever is down.
+    let miss = Reach::new(vec![((0, "acme/widget", key), Outcome::Miss)], Some(false));
+    let response = clmr::select(&req, &miss).unwrap();
+    assert_eq!(response.decisions[0].outcome, Routing::CanonicalPointer);
+}
+
+#[test]
+fn emergency_outcome_has_a_stable_wire_name() {
+    let mut req = request(
+        vec![repo("a", "acme/widget", branch(), Some("github"))],
+        vec![forgejo_store("forgejo", vec!["acme"])],
+    );
+    req.emergency_fallback = true;
+    let reach = Reach::new(
+        vec![((0, "acme/widget", MOVING_KEY), Outcome::Hit)],
+        Some(false),
+    );
+    let response = clmr::select(&req, &reach).unwrap();
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(wire.contains("\"outcome\":\"emergency-fallback\""));
+    let back: clmr::Response = serde_json::from_str(&wire).unwrap();
+    assert_eq!(back.decisions[0].outcome, Routing::EmergencyFallback);
 }

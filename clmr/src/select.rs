@@ -24,6 +24,15 @@ pub enum Outcome {
 /// never forward one store's credential to another origin.
 pub trait Prober {
     fn probe(&self, store: usize, path: &str, need: &RefKind) -> Outcome;
+
+    /// Can the canonical pointer, and the primary forge behind it, answer for
+    /// this repository right now? Asked ONLY for a moving ref that no
+    /// primary-identity store served, to decide the emergency fallback below.
+    /// `None` means "not asked / unknown" and keeps the pure canonical
+    /// fallback, so probers that do not implement it never change a routing.
+    fn canonical_reachable(&self, _path: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// One repo decision: routed store fetch or canonical pointer.
@@ -52,6 +61,11 @@ pub struct RepoDecision {
 pub enum Routing {
     Routed,
     CanonicalPointer,
+    /// The canonical pointer or the primary forge could not answer, so a
+    /// moving ref is served from a declared store that is NOT its primary.
+    /// The copy may lag the primary; consumers must surface the decision note
+    /// as a warning. Pinned commits never need this: they are verified.
+    EmergencyFallback,
 }
 
 /// Full response: decisions plus credential scopes and rendered git config.
@@ -147,14 +161,34 @@ fn decide(
         }
         RefKind::Moving(_) => {
             let Some(primary) = repo.primary.as_deref() else {
+                // Unknown primary: the canonical pointer, unless it cannot
+                // answer and a declared store holds the ref (emergency).
+                if request.emergency_fallback
+                    && prober.canonical_reachable(&repo.path) == Some(false)
+                {
+                    let mut skipped = 0u32;
+                    for (index, store) in &indexed {
+                        match prober.probe(*index, &repo.path, &repo.r#ref) {
+                            Outcome::Hit => {
+                                let via = store_repo_url(store, &repo.path);
+                                return Ok(emergency(request, repo, *index, &via));
+                            }
+                            Outcome::Unsupported => skipped += 1,
+                            Outcome::Miss | Outcome::Denied | Outcome::Error => continue,
+                        }
+                    }
+                    return Ok(pointer_with(request, repo, skipped));
+                }
                 return Ok(pointer_with(request, repo, 0));
             };
             let mut skipped = 0u32;
             // Every same-identity store is probed in order; other identities
-            // are never consulted for moving refs (and never probed). First
-            // eligible hit wins; anything else falls to the pointer. No
-            // retry or sync: each declared store is probed at most once.
-            for (index, store) in indexed {
+            // are never consulted for moving refs (and never probed) while the
+            // canonical path can answer. First eligible hit wins; anything
+            // else falls to the pointer. No retry or sync: each declared store
+            // is probed at most once.
+            for (index, store) in &indexed {
+                let (index, store) = (*index, *store);
                 if store.identity != primary {
                     continue;
                 }
@@ -171,6 +205,29 @@ fn decide(
                     }
                     Outcome::Unsupported => skipped += 1,
                     Outcome::Miss | Outcome::Denied | Outcome::Error => continue,
+                }
+            }
+            // Resilience (decided 2026-10-07): when the primary is another
+            // forge, or unknown, the canonical pointer is the answer. Only if
+            // the pointer or that primary cannot answer at all does a declared
+            // store step in, for a moving ref, with a warning that it may lag.
+            // A primary that HAS a declared store never takes this path: its
+            // stores failing is the express lane failing, and the canonical
+            // pointer is the next link of that chain.
+            let primary_has_store = indexed.iter().any(|(_, store)| store.identity == primary);
+            if request.emergency_fallback
+                && !primary_has_store
+                && prober.canonical_reachable(&repo.path) == Some(false)
+            {
+                for (index, store) in &indexed {
+                    match prober.probe(*index, &repo.path, &repo.r#ref) {
+                        Outcome::Hit => {
+                            let via = store_repo_url(store, &repo.path);
+                            return Ok(emergency(request, repo, *index, &via));
+                        }
+                        Outcome::Unsupported => skipped += 1,
+                        Outcome::Miss | Outcome::Denied | Outcome::Error => continue,
+                    }
                 }
             }
             Ok(pointer_with(request, repo, skipped))
@@ -213,6 +270,28 @@ fn routed(
         via: Some(via.into()),
         primary_url: repo.primary_url.clone(),
         note: format!("{note} on store {index}"),
+        instead_of: crate::render::instead_of_pairs(repo, via),
+    }
+}
+
+fn emergency(
+    _request: &Request,
+    repo: &crate::Repository,
+    index: usize,
+    via: &str,
+) -> RepoDecision {
+    RepoDecision {
+        id: repo.id.clone(),
+        path: repo.path.clone(),
+        r#ref: ref_label(&repo.r#ref),
+        primary: repo.primary.clone(),
+        outcome: Routing::EmergencyFallback,
+        store: Some(index),
+        via: Some(via.into()),
+        primary_url: repo.primary_url.clone(),
+        note: format!(
+            "EMERGENCY FALLBACK: the canonical pointer or the primary forge cannot answer; moving ref served from store {index}, which is not the primary and may lag it"
+        ),
         instead_of: crate::render::instead_of_pairs(repo, via),
     }
 }

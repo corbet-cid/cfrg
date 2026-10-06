@@ -14,10 +14,12 @@
 
 #![forbid(unsafe_code)]
 
+mod placement;
 mod render;
 mod select;
 mod validate;
 
+pub use placement::Placement;
 pub use render::{credentials as render_credentials, git_config as render_git_config};
 pub use select::{select, Outcome, Prober, RepoDecision, Response, Routing};
 pub use validate::{

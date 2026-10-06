@@ -34,6 +34,7 @@ pub fn run_resolve(request_path: PathBuf, emit: &str) -> Result<()> {
     let prober = CliProber {
         stores: request.stores.clone(),
         timeout_secs: request.timeout_secs,
+        canonical_base: request.canonical_base.clone(),
         root,
     };
     let response = clmr::select(&request, &prober)?;
@@ -51,11 +52,30 @@ fn enrich_primaries(request: &mut Request, root: &Path) {
     let Some(source) = request.primary_source.clone() else {
         return;
     };
+    // Read the declared file once. Never fall back to a network lookup when
+    // a declared file is missing or malformed: unknown stays on the pointer.
+    let placement = source.placement_file.as_ref().and_then(|path| {
+        let file = std::fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 1_048_576 {
+            return None;
+        }
+        let placement: clmr::Placement = serde_json::from_slice(&bytes).ok()?;
+        placement.validate().ok()?;
+        Some(placement)
+    });
     for repo in &mut request.repositories {
         if repo.primary.is_some() {
             continue;
         }
         if !matches!(repo.r#ref, RefKind::Moving(_)) {
+            continue;
+        }
+        if source.placement_file.is_some() {
+            repo.primary = placement
+                .as_ref()
+                .and_then(|p| source.identities.get(p.primary(&repo.path)).cloned());
             continue;
         }
         let bound = source.timeout_secs.min(request.timeout_secs).max(1);
@@ -145,6 +165,7 @@ fn lookup_primary(
 struct CliProber {
     stores: Vec<Store>,
     timeout_secs: u64,
+    canonical_base: String,
     root: PathBuf,
 }
 
@@ -158,6 +179,84 @@ impl Prober for CliProber {
             clmr::StoreKind::Filesystem => self.fs_probe(target, path, need),
         }
     }
+
+    fn canonical_reachable(&self, path: &str) -> Option<bool> {
+        canonical_reachable(&self.canonical_base, path, self.timeout_secs, &self.root)
+    }
+}
+
+/// Does the canonical pointer, and the primary forge it points at, answer for
+/// this repository right now? One bounded, UNAUTHENTICATED GET of the smart
+/// HTTP advertisement, following at most two redirects (the pointer redirects
+/// or proxies to the primary), with no credential, cookie or netrc anywhere in
+/// the request, so the primary host never receives anything of ours. The
+/// answer is only liveness: a 2xx/3xx/4xx status (a private repository
+/// answers 401 or 404 anonymously) means the path is up, while a transport
+/// failure, a timeout, a server error and 429 (the Workers quota answer, as on
+/// 2026-10-07) mean it is down. `None` when the probe itself could not run, so
+/// an unusable probe never changes a routing.
+fn canonical_reachable(base: &str, path: &str, bound_secs: u64, root: &Path) -> Option<bool> {
+    let url = format!("{base}/{path}.git/info/refs?service=git-upload-pack");
+    if url.contains('@') || url.contains(['#', ' ', '\t', '\n', '\0']) {
+        return None;
+    }
+    let scheme = if base.starts_with("https://") {
+        "=https"
+    } else {
+        "=http,https"
+    };
+    let mut environment = Environment::new();
+    for name in ["PATH", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            environment.insert(name.into(), value);
+        }
+    }
+    let bound = bound_secs.clamp(1, 30);
+    let runner = Runner::new(
+        root.to_path_buf(),
+        environment,
+        Duration::from_secs(bound + 5),
+    )
+    .ok()?
+    .with_stderr_events()
+    .without_child_stderr();
+    let args: Vec<String> = [
+        "curl",
+        "--disable",
+        "--silent",
+        "--globoff",
+        "--no-netrc",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        &bound.to_string(),
+        "--max-filesize",
+        "1048576",
+        "--location",
+        "--max-redirs",
+        "2",
+        "--proto",
+        scheme,
+        "--proto-redir",
+        "=https",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code}",
+        "--url",
+        &url,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // A failed run (connection refused, DNS failure, timeout) is the pointer
+    // being down. Only an unparsable answer from a run that succeeded is
+    // "unknown".
+    let Ok(stdout) = runner.run(&args, true) else {
+        return Some(false);
+    };
+    let code = stdout.trim().parse::<u16>().ok()?;
+    Some(!(code == 0 || code == 429 || code >= 500))
 }
 
 /// Credential posture for one store probe. A token is used only when a
