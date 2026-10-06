@@ -49,6 +49,8 @@ pub struct State {
     pub windows: BTreeMap<String, Window>,
     pub pending: BTreeMap<String, String>,
     pub next_request: u64,
+    #[serde(default)]
+    pub next_mutation: u64,
     pub next_creation: u64,
 }
 #[derive(Debug, Deserialize, Serialize)]
@@ -57,6 +59,14 @@ pub struct Window {
     pub status: u16,
     /// None means operator intervention, not permission to retry.
     pub retry_at: Option<u64>,
+}
+
+impl State {
+    fn deadline(&self, write: bool, creation: bool) -> u64 {
+        self.next_request
+            .max(if write { self.next_mutation } else { 0 })
+            .max(if creation { self.next_creation } else { 0 })
+    }
 }
 
 pub struct Http {
@@ -152,17 +162,16 @@ impl Transport for Http {
         if write && self.state.pending.contains_key(&request.scope) {
             return Err(failure("Uncertain prior write; read provider state and resolve the recorded intent before retrying"));
         }
-        let deadline = self.state.next_request.max(if request.creation {
-            self.state.next_creation
-        } else {
-            0
-        });
+        let deadline = self.state.deadline(write, request.creation);
         if deadline.saturating_sub(timestamp) > 120 {
             return Err(failure("Pacing deadline is invalid or not yet due"));
         }
         std::thread::sleep(Duration::from_secs(deadline.saturating_sub(timestamp)));
         let timestamp = now()?;
-        self.state.next_request = timestamp + 12;
+        self.state.next_request = timestamp + 2;
+        if write {
+            self.state.next_mutation = timestamp + 12;
+        }
         if request.creation {
             self.state.next_creation = timestamp + 60;
         }
@@ -281,6 +290,18 @@ impl Transport for Http {
             )));
         }
         let bytes = fs::read(output.path())?;
+        if status == 422 {
+            // Static diagnostic only, never the provider's potentially secret body.
+            let kind = if String::from_utf8_lossy(&bytes).contains("already been taken") {
+                "duplicate-value"
+            } else {
+                "validation-rejected"
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"native-rejection","status":status,"kind":kind})
+            );
+        }
         // Never parse or echo error bodies (may contain credentials).
         let body = if (200..300).contains(&status) && !bytes.is_empty() {
             serde_json::from_slice(&bytes)
@@ -315,6 +336,19 @@ fn retry_after(headers: &str, now: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_cannot_shorten_write_or_creation_pacing() {
+        let mut state = State {
+            next_request: 102,
+            next_mutation: 112,
+            next_creation: 160,
+            ..State::default()
+        };
+        assert_eq!(state.deadline(false, false), 102);
+        state.next_request = 107;
+        assert_eq!(state.deadline(true, false), 112);
+        assert_eq!(state.deadline(true, true), 160);
+    }
     #[test]
     fn windows_do_not_guess_missing_or_date_delays() {
         assert_eq!(retry_after("Retry-After: 86400\r\n", 100), Some(86500));

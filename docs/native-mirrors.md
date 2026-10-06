@@ -59,7 +59,9 @@ Bitbucket restricts branch pushes to the declared account, denies merges and
 refuses existing force/delete restrictions that would prevent native mirroring.
 Administrative changes and destination tags are outside these branch checks.
 
-Every API call is paced (12 seconds; repository creation at least 60 seconds).
+API calls are serialized with at least two seconds between requests, twelve
+seconds between mutations, and sixty seconds between repository creations.
+Reads cannot shorten either durable write deadline.
 The first 429/402 stops execution and records its window. GitLab project creation
 has a separate scope: existing-project reads/protection still work during that
 cooldown. A Bitbucket 402 holds all writes in that workspace; reads remain

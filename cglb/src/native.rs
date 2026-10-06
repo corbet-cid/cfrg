@@ -287,14 +287,18 @@ fn protect_principal(
         let name = rule["name"]
             .as_str()
             .ok_or("Missing protected branch name")?;
-        let destroy = |field: &str| -> Result<Vec<Value>> {
-            rule[field].as_array().ok_or("Missing protected branch access levels")?.iter()
-                .map(|r| Ok(json!({"id":r["id"].as_u64().ok_or("Missing access level ID")?, "_destroy":true}))).collect()
-        };
-        let mut push = destroy("push_access_levels")?;
-        push.push(json!({field:id}));
-        let mut merge = destroy("merge_access_levels")?;
-        merge.push(json!({"access_level":0}));
+        let push = access_delta(&rule["push_access_levels"], field, id)?;
+        let merge = access_delta(&rule["merge_access_levels"], "access_level", 0)?;
+        if push.is_empty() && merge.is_empty() && rule["allow_force_push"] == true {
+            continue;
+        }
+        let mut body = json!({"allow_force_push":true});
+        if !push.is_empty() {
+            body["allowed_to_push"] = json!(push);
+        }
+        if !merge.is_empty() {
+            body["allowed_to_merge"] = json!(merge);
+        }
         expect(
             call(
                 io,
@@ -305,25 +309,24 @@ fn protect_principal(
                     encode(&dest.path),
                     encode(name)
                 ),
-                Some(json!({
-                    "allow_force_push":true, "allowed_to_push":push, "allowed_to_merge":merge
-                })),
+                Some(body),
                 false,
             )?,
             &[200],
         )?;
     }
     if !current.iter().any(|r| r["name"] == "*") {
+        let mut body = json!({"name":"*", "allow_force_push":true, "push_access_level":0, "merge_access_level":0});
+        if field != "access_level" {
+            body["allowed_to_push"] = json!([{field:id}]);
+        }
         expect(
             call(
                 io,
                 dest,
                 "POST",
                 format!("/projects/{}/protected_branches", encode(&dest.path)),
-                Some(json!({
-                    "name":"*", "allow_force_push":true, "allowed_to_push":[{field:id}],
-                    "push_access_level":0, "merge_access_level":0
-                })),
+                Some(body),
                 false,
             )?,
             &[201],
@@ -336,6 +339,31 @@ fn protect_principal(
         );
     }
     Ok(true)
+}
+
+fn access_delta(levels: &Value, field: &str, id: u64) -> Result<Vec<Value>> {
+    let mut changes = Vec::new();
+    let mut kept = false;
+    for row in levels
+        .as_array()
+        .ok_or("Missing protected branch access levels")?
+    {
+        let matches = row[field] == id
+            && ["user_id", "group_id", "member_role_id", "deploy_key_id"]
+                .iter()
+                .all(|key| *key == field || row[*key].is_null());
+        if matches && !kept {
+            kept = true;
+        } else {
+            changes.push(
+                json!({"id":row["id"].as_u64().ok_or("Missing access level ID")?, "_destroy":true}),
+            );
+        }
+    }
+    if !kept {
+        changes.push(json!({field:id}));
+    }
+    Ok(changes)
 }
 
 /// Before the new Forgejo key has write access, deny all branch writers.
@@ -440,6 +468,22 @@ pub fn protect_ssh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permission_delta_preserves_matching_grants_without_duplicate_recreation() {
+        let no_access = json!([{"id":123,"access_level":0}]);
+        assert!(access_delta(&no_access, "access_level", 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            access_delta(&no_access, "deploy_key_id", 7).unwrap(),
+            vec![
+                json!({"id":123,"_destroy":true}),
+                json!({"deploy_key_id":7})
+            ]
+        );
+        let key = json!([{"id":124,"access_level":40,"deploy_key_id":7}]);
+        assert!(access_delta(&key, "deploy_key_id", 7).unwrap().is_empty());
+    }
     #[test]
     fn permissive_overlapping_rule_prevents_enrollment() {
         let exact = json!({"name":"*", "allow_force_push":true, "push_access_levels":[{"user_id":7}], "merge_access_levels":[{"access_level":0}]});
