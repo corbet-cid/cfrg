@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cfrg", "cfrg-cli", "cfgj", "cglb", "cbkt", "cghb"]
+members = ["cfrg", "cfrg-cli", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
 
 [workspace.package]
 edition = "2021"
@@ -17,6 +17,7 @@ sha2 = "0.10"
 toml = "0.8"
 tempfile = "3"
 cfrg = { path = "cfrg" }
+clmr = { path = "clmr" }
 cfgj = { path = "cfgj" }
 cglb = { path = "cglb" }
 cbkt = { path = "cbkt" }

@@ -21,6 +21,8 @@ use std::{
     time::Duration,
 };
 
+mod resolve;
+
 #[derive(Parser)]
 #[command(
     about = "Forge placement, reconciliation, status, bridge, evidence collection and access",
@@ -102,6 +104,25 @@ enum Action {
     Bridge(cfrg::bridge::Options),
     Collect(cfrg::collect::Options),
     SourceRevision,
+    /// Resolve declared stores for one request (pure clmr selection over
+    /// bounded probes); prints response JSON or rendered git config.
+    Resolve {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, default_value = "json")]
+        emit: String,
+    },
+    /// Git credential helper: answers `get` from per-job env only.
+    CredentialHelper {
+        #[arg(long)]
+        env: String,
+        #[arg(long)]
+        expect_origin: String,
+        #[arg(long)]
+        username: Option<String>,
+        /// Git appends the action (`get`, `store`, `erase`); only `get` answers.
+        action: String,
+    },
 }
 
 /// Offline access reconciliation. Observations are collector-supplied JSON
@@ -482,9 +503,12 @@ fn run(action: Action) -> Result<()> {
             }
             result?;
         }
-        Action::Status(_) | Action::Bridge(_) | Action::Collect(_) | Action::SourceRevision => {
-            return Err("dispatched directly by main".into())
-        }
+        Action::Status(_)
+        | Action::Bridge(_)
+        | Action::Collect(_)
+        | Action::SourceRevision
+        | Action::Resolve { .. }
+        | Action::CredentialHelper { .. } => return Err("dispatched directly by main".into()),
     }
     Ok(())
 }
@@ -605,6 +629,25 @@ fn main() -> ExitCode {
             println!("{}", cfrg::SOURCE_REVISION);
             ExitCode::SUCCESS
         }
+        Action::Resolve { request, emit } => match resolve::run_resolve(request, &emit) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cfrg resolve: {error}");
+                ExitCode::from(2)
+            }
+        },
+        Action::CredentialHelper {
+            env,
+            expect_origin,
+            username,
+            action,
+        } => match resolve::run_credential_helper(env, expect_origin, username, action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cfrg credential-helper: {error}");
+                ExitCode::from(2)
+            }
+        },
         action => match run(action) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

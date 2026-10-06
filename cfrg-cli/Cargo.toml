@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 cfrg.workspace = true
+clmr.workspace = true
 cfgj.workspace = true
 cglb.workspace = true
 cbkt.workspace = true

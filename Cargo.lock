@@ -137,6 +137,7 @@ dependencies = [
  "cghb",
  "cglb",
  "clap",
+ "clmr",
  "cqlt",
  "ctrlc",
  "serde_json",
@@ -158,6 +159,14 @@ name = "cglb"
 version = "0.1.0"
 dependencies = [
  "cfrg",
+ "serde_json",
+]
+
+[[package]]
+name = "clmr"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 

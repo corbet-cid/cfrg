@@ -1,0 +1,14 @@
+[package]
+name = "clmr"
+edition.workspace = true
+version.workspace = true
+license-file = "LICENSE.md"
+description = "Resolver over declared stores: pure pinned/moving selection, no topology in code"
+repository = "https://git.corbet.ch/corbet-libs/cfrg.git"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

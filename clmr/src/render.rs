@@ -1,0 +1,255 @@
+//! Git config rendering over DECLARED source URLs only.
+//!
+//! Git `insteadOf` is a RAW prefix match: a key of `.../acme/widget` also
+//! rewrites `.../acme/widget-evil`, and a key of `.../widget.git` also
+//! rewrites `.../widget.git-evil`. There are no exact-safe key shapes. This
+//! renderer therefore maps ONLY explicitly declared `source_urls` forms, one
+//! pair per declared URL:
+//!
+//! - routed repo: every declared form -> the verified store `via` URL;
+//! - pointer repo: every declared form -> its canonical pointer URL,
+//!   INCLUDING identity pairs (`from == to`).
+//!
+//! Identity pairs rewrite a URL to itself, but they still participate in
+//! git's LONGEST-match selection: the declared bare canonical form of a
+//! pointer neighbor (`.../widget-evil` -> itself) shields that exact URL
+//! from a shorter routed neighbor key (`.../widget`). Without the identity
+//! key, the bare neighbor URL would take the store rewrite. Every declared
+//! form needs its key, including self-maps.
+//!
+//! Declared pointer neighbors act as longer-match guards, but protection
+//! covers declared URLs ONLY. This config is not a sandbox: an UNDECLARED
+//! URL may match a shorter routed key and be misrouted, and the result is
+//! not guaranteed to fail. Dot-segment remainders are the sharp case: an
+//! undeclared `.../widget/../other` matches the routed `.../widget` key,
+//! and transports normalize the `..`, so the fetch can land on a DIFFERENT,
+//! existing repository (silent wrong content). The same holds for any
+//! remainder under which the derived store path happens to exist. The
+//! safety guarantee applies ONLY to a deterministic, complete declared
+//! inventory for the job inputs: every URL the job will fetch must be
+//! declared, and undeclared fetches must not occur. Supported jobs keep
+//! their dependency inventory exhaustive; anything else is out of scope.
+use crate::validate::{
+    normalize_origin, valid_username, CredentialScope, Repository, Request, StoreKind,
+};
+use crate::RepoDecision;
+
+/// insteadOf pairs (`(from, to)`) for one repo: every declared source URL
+/// mapped to `dest` (the verified store `via`, or the canonical pointer).
+/// Identity pairs (`from == to`) are EMITTED, not skipped: a bare canonical
+/// self-map is the longest-match guard that keeps that exact URL on the
+/// pointer despite a shorter routed neighbor key. Nothing is invented.
+pub fn instead_of_pairs(repo: &Repository, dest: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for from in &repo.source_urls {
+        pairs.push((from.clone(), dest.to_owned()));
+    }
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+/// Shell/config-safe interpolation check for credential helper arguments.
+/// Values are pre-validated charsets, but the helper line runs through git's
+/// config parser and (with `!`) a shell: reject anything outside a narrow
+/// allowlist so a value can never break out of its argument.
+pub fn helper_arg_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:/-%@+=,".contains(&b))
+}
+
+/// Credential scopes for routed http-forge stores: strict full
+/// scheme+host+port match with env references only. No token values anywhere.
+pub fn credentials(request: &Request, decisions: &[RepoDecision]) -> Vec<CredentialScope> {
+    let mut out: Vec<CredentialScope> = Vec::new();
+    for decision in decisions {
+        if decision.outcome != crate::Routing::Routed {
+            continue;
+        }
+        let Some(index) = decision.store else {
+            continue;
+        };
+        let Some(store) = request.stores.get(index) else {
+            continue;
+        };
+        if store.kind != StoreKind::HttpForge {
+            continue;
+        }
+        let (Some(matched), Some(env)) = (
+            normalize_origin(&store.location),
+            store.credential_env.clone(),
+        ) else {
+            continue;
+        };
+        if !helper_arg_safe(&matched)
+            || !helper_arg_safe(&env)
+            || store
+                .username
+                .as_deref()
+                .is_some_and(|u| !valid_username(u))
+        {
+            continue;
+        }
+        let scope = CredentialScope {
+            r#match: matched,
+            env,
+            username: store.username.clone(),
+        };
+        if !out.contains(&scope) {
+            out.push(scope);
+        }
+    }
+    out
+}
+
+/// Render the git config: declared-URL insteadOf pairs (identity pairs
+/// included as longest-match guards) plus exact-scope credential sections
+/// (inherited helpers cleared first for the matched origin). Duplicate
+/// pairs across decisions are emitted once. Comment-only when a response
+/// carries no pairs at all.
+pub fn git_config(request: &Request, decisions: &[RepoDecision]) -> String {
+    let mut text = String::from("# Generated by cfrg resolve; per-job only, never global.\n");
+    let mut emitted = false;
+    let mut seen = std::collections::BTreeSet::new();
+    for decision in decisions {
+        for (from, to) in &decision.instead_of {
+            if seen.insert((from, to)) {
+                emitted = true;
+                text.push_str(&format!("[url \"{to}\"]\n\tinsteadOf = {from}\n"));
+            }
+        }
+    }
+    for scope in credentials(request, decisions) {
+        emitted = true;
+        let mut helper = format!(
+            "!cfrg credential-helper --env {} --expect-origin {}",
+            scope.env, scope.r#match
+        );
+        if let Some(user) = scope.username {
+            helper.push_str(&format!(" --username {user}"));
+        }
+        text.push_str(&format!(
+            "[credential \"{}\"]\n\thelper =\n\thelper = {helper}\n",
+            scope.r#match
+        ));
+    }
+    if !emitted {
+        text.push_str("# No mappings emitted: canonical operation.\n");
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RefKind, Routing, Store};
+
+    fn repo() -> Repository {
+        Repository {
+            id: "w".into(),
+            path: "acme/widget".into(),
+            r#ref: RefKind::Pinned("a".repeat(40)),
+            primary: Some("forgejo".into()),
+            primary_url: None,
+            source_urls: vec![
+                "https://pointer.example/acme/widget".into(),
+                "https://pointer.example/acme/widget.git".into(),
+                "https://github.com/acme/widget".into(),
+                "https://github.com/acme/widget.git".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn pairs_map_every_declared_form_and_nothing_else() {
+        let via = "https://forge.example:3001/acme/widget.git";
+        let pairs = instead_of_pairs(&repo(), via);
+        assert_eq!(pairs.len(), 4);
+        for from in [
+            "https://pointer.example/acme/widget",
+            "https://pointer.example/acme/widget.git",
+            "https://github.com/acme/widget",
+            "https://github.com/acme/widget.git",
+        ] {
+            assert!(pairs.contains(&(from.into(), via.into())), "{from}");
+        }
+    }
+
+    #[test]
+    fn pointer_pairs_include_identity_guard_for_bare_form() {
+        let canonical = "https://pointer.example/acme/widget";
+        let pairs = instead_of_pairs(&repo(), canonical);
+        // All four declared forms are emitted, INCLUDING the bare canonical
+        // self-map: that identity key is the longest-match guard keeping the
+        // exact bare URL on the pointer despite shorter routed neighbor keys.
+        assert_eq!(pairs.len(), 4);
+        assert!(pairs.contains(&(
+            "https://pointer.example/acme/widget".into(),
+            canonical.into()
+        )));
+        assert!(pairs.contains(&("https://github.com/acme/widget".into(), canonical.into())));
+        assert!(pairs.contains(&(
+            "https://github.com/acme/widget.git".into(),
+            canonical.into()
+        )));
+        assert!(pairs.contains(&(
+            "https://pointer.example/acme/widget.git".into(),
+            canonical.into()
+        )));
+    }
+
+    #[test]
+    fn helper_args_reject_shell_breakout() {
+        assert!(helper_arg_safe("CFRG_RESOLVER_FORGEJO_TOKEN"));
+        assert!(helper_arg_safe("https://forge.example:3001"));
+        for bad in [
+            "a;b", "a$(b)", "a`b`", "a b", "a'b", "a\"b", "a\\b", "a\nb", "a*b", "a?b", "a|b",
+            "a&b", "a<b", "a>b", "a(b)",
+        ] {
+            assert!(!helper_arg_safe(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn credential_match_is_full_origin_with_port() {
+        let request = Request {
+            schema: 1,
+            canonical_base: "https://pointer.example".into(),
+            aliases: vec![],
+            repositories: vec![],
+            stores: vec![Store {
+                kind: StoreKind::HttpForge,
+                location: "https://forge.example".into(),
+                identity: "forgejo".into(),
+                scope: vec!["acme".into()],
+                provider: Some("forgejo".into()),
+                credential_env: Some("CFRG_RESOLVER_FORGEJO_TOKEN".into()),
+                username: Some("ci".into()),
+                trusted_single_user: false,
+            }],
+            timeout_secs: 30,
+            primary_source: None,
+        };
+        let decisions = vec![RepoDecision {
+            id: "w".into(),
+            path: "acme/widget".into(),
+            r#ref: "pinned:a".into(),
+            primary: Some("forgejo".into()),
+            outcome: Routing::Routed,
+            store: Some(0),
+            via: Some("https://forge.example/acme/widget.git".into()),
+            primary_url: None,
+            note: "t".into(),
+            instead_of: vec![],
+        }];
+        let scopes = credentials(&request, &decisions);
+        assert_eq!(scopes[0].r#match, "https://forge.example:443");
+        let config = git_config(&request, &decisions);
+        assert!(config.contains("[credential \"https://forge.example:443\"]"));
+        assert!(config.contains("\thelper =\n\thelper = !cfrg credential-helper"));
+        assert!(config.contains("--expect-origin https://forge.example:443"));
+    }
+}
