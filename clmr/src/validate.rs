@@ -52,6 +52,10 @@ pub struct Alias {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimarySource {
+    /// Optional absolute path to the declared placement file. When present,
+    /// it replaces HTTP lookup; unreadable/invalid means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_file: Option<String>,
     /// Bare `http(s)` origin of the redirect authority (no path).
     pub pointer_base: String,
     /// Exact primary base origin -> opaque identity allowlist. A lookup
@@ -319,6 +323,14 @@ fn valid_alias_prefix(value: &str) -> Result<(), Error> {
 /// Declared live primary feed validation: bare-origin pointer base, exact
 /// bare-origin identity keys with opaque identity values, bounded timeout.
 fn valid_primary_source(source: &PrimarySource) -> Result<(), Error> {
+    if let Some(path) = &source.placement_file {
+        if !std::path::Path::new(path).is_absolute()
+            || path.contains(['\0', '\n', '\r'])
+            || path.split('/').any(|part| part == "..")
+        {
+            return Err(failure("Placement file must be an absolute path"));
+        }
+    }
     if !clean_url_text(&source.pointer_base) {
         return Err(failure("Invalid primary source characters"));
     }
@@ -917,6 +929,7 @@ mod tests {
     fn primary_source_validation() {
         use std::collections::BTreeMap;
         let good = PrimarySource {
+            placement_file: None,
             pointer_base: "https://pointer.example".into(),
             identities: BTreeMap::from([("https://forge.example:3001".into(), "forgejo".into())]),
             timeout_secs: 10,

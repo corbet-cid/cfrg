@@ -51,11 +51,30 @@ fn enrich_primaries(request: &mut Request, root: &Path) {
     let Some(source) = request.primary_source.clone() else {
         return;
     };
+    // Read the declared file once. Never fall back to a network lookup when
+    // a declared file is missing or malformed: unknown stays on the pointer.
+    let placement = source.placement_file.as_ref().and_then(|path| {
+        let file = std::fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 1_048_576 {
+            return None;
+        }
+        let placement: clmr::Placement = serde_json::from_slice(&bytes).ok()?;
+        placement.validate().ok()?;
+        Some(placement)
+    });
     for repo in &mut request.repositories {
         if repo.primary.is_some() {
             continue;
         }
         if !matches!(repo.r#ref, RefKind::Moving(_)) {
+            continue;
+        }
+        if source.placement_file.is_some() {
+            repo.primary = placement
+                .as_ref()
+                .and_then(|p| source.identities.get(p.primary(&repo.path)).cloned());
             continue;
         }
         let bound = source.timeout_secs.min(request.timeout_secs).max(1);

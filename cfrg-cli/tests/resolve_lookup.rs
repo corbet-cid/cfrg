@@ -665,3 +665,53 @@ fn non_unicode_token_fails_closed_without_probe() {
     let hits = server.stop();
     assert!(hits.is_empty(), "malformed credential must not probe");
 }
+
+#[test]
+fn declared_placement_routes_primary_and_preserves_foreign_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path(), "acme/widget");
+    let placement = dir.path().join("placement.json");
+    let mut request = moving_request(
+        9,
+        json!({"https://home.example": "forgejo", "https://github.com": "github"}),
+        "acme/widget",
+        &store,
+        Value::Null,
+    );
+    request["primary_source"]["placement_file"] = json!(placement);
+    for (primaries, expected) in [
+        (json!({}), "routed"),
+        (json!({"acme/widget":"https://github.com"}), "pointer"),
+        (json!({"acme/widget":"https://unknown.example"}), "pointer"),
+    ] {
+        fs::write(
+            &placement,
+            serde_json::to_vec(&json!({
+                "version":1,"default":"https://home.example","primaries":primaries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolve(&request)["decisions"][0]["outcome"], expected);
+    }
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(store.join("acme/widget.git"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let hash = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    request["repositories"][0]["ref"] = json!({"pinned":hash});
+    assert_eq!(resolve(&request)["decisions"][0]["outcome"], "routed");
+    request["repositories"][0]["ref"] = json!({"moving":"refs/heads/main"});
+    for invalid in [
+        "not json",
+        r#"{"version":2,"default":"https://home.example","primaries":{}}"#,
+    ] {
+        fs::write(&placement, invalid).unwrap();
+        assert_eq!(resolve(&request)["decisions"][0]["outcome"], "pointer");
+    }
+    fs::remove_file(&placement).unwrap();
+    assert_eq!(resolve(&request)["decisions"][0]["outcome"], "pointer");
+}
