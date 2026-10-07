@@ -74,6 +74,12 @@ pub struct MirrorSweep {
     /// giving the push mirror time to sync.
     #[serde(default = "default_mirror_delay")]
     pub delay_seconds: u64,
+    /// Besides verifying, rename a destination that no longer carries its
+    /// primary's name and re-point its mirror (`cfrg native --operation rename
+    /// --apply`). Needs the destination credentials in the environment of the
+    /// process; without them the lane only reports `rename-pending`.
+    #[serde(default)]
+    pub rename: bool,
 }
 
 fn default_sweep() -> u64 {

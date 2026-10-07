@@ -39,6 +39,9 @@ pub const CAPABILITIES: Capabilities = Capabilities {
         support: Support::NativeFill,
         note: "native: push mirrors and branch protection; cfrg fills the order (freeze, hash check, disable, unlock, create, verify); a normal repository cannot become a pull mirror, so the receiver stays a protected normal repository",
     },
+    rename: Capability::unsupported(
+        "unsupported here: Forgejo is where the names are made (renaming is native there, PATCH repository); cfrg follows a rename by id and does not rename a Forgejo receiver",
+    ),
 };
 
 const RULE: &str = "**";

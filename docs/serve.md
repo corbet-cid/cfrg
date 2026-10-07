@@ -10,7 +10,7 @@ passes themselves).
 |---|---|
 | receiver | `POST /hook`: verifies the HMAC-SHA256 signature of the raw body (`X-Forgejo-Signature`, also `X-Gitea-Signature` and `X-Hub-Signature-256`) before parsing anything, then marks the repository due. `GET /healthz` (liveness), `GET /status` (lanes, last results, accepted and rejected counts) |
 | land lane | the pass `cfrg land --step` runs: merge green heads, rebase and retest when the base moved, notice merges the forge made alone, start the `retest` and `landed` hooks. Waiting work is looked at every `interval_seconds`, idle repositories on the sweep or the next delivery |
-| mirror lane | read-only verification of the declared push mirrors (`cfrg native --operation status`): a push to the default branch verifies that repository after `delay_seconds`, every repository at least every `sweep_seconds` |
+| mirror lane | read-only verification of the declared push mirrors (`cfrg native --operation status`): a push to the default branch verifies that repository after `delay_seconds`, every repository at least every `sweep_seconds`. A primary renamed on Forgejo shows as `rename-pending` (Forgejo sends no rename event, so the sweep notices it); with `"rename": true` the lane also applies it (`cfrg native --operation rename --apply`: rename the destination, replace the mirror, record ownership), which needs the destination credentials in the environment |
 | registration | `cfrg serve --register [--apply] [--rotate]` reconciles the webhooks on the forge |
 
 With `"follow": "serve"` in the policy, `cfrg land REPO BRANCH` only enqueues
@@ -28,7 +28,7 @@ follower of `docs/land.md` keeps working, so both can coexist during a rollout.
    "sweep_seconds": 3600, "debounce_seconds": 3,
    "webhook": {"url": "http://cfrg-serve.ci.svc.cluster.local:8080/hook", "orgs": ["corbet-libs"]},
    "mirrors": {"placement": "/etc/cfrg/placement.json", "state": "/var/lib/cfrg/mirror-state.json",
-               "sweep_seconds": 21600, "delay_seconds": 60}}}
+               "sweep_seconds": 21600, "delay_seconds": 60, "rename": false}}}
 ```
 
 * The secret (at least 16 characters) and the forge token come from the

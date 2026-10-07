@@ -21,6 +21,41 @@ Pass credentials by the named environment references. Keep mutable state on
 persistent private storage, outside Git; it contains rate windows, pacing,
 uncertain mutation intents and remote ownership IDs, never credentials.
 
+## Renames: destinations follow the primary
+
+The name of a destination is the primary's current `<org>/<repo>`, unless the
+placement pins a different path and says why (`"path"` together with
+`"path_reason"`; a path without a reason is only a record of the last known name
+and the destination follows the primary anyway, so a `path` may simply be left
+out). Forgejo keeps a repository's numeric `source_id` through a rename or
+transfer, so every pass looks the primary up by that id
+(`GET /repositories/{id}`), not by the name written in the file. A name that
+differs is reported as `source-renamed` (the declared placement is stale, the
+destinations follow the live name regardless).
+
+Forgejo has no webhook for a rename or a transfer (the `repository` event only
+says `created` or `deleted`, verified against the 15.0 notifier), so renames are
+found by the passes themselves: `cfrg serve` verifies every repository on a
+push and at least every sweep, and `--operation status` reports a mirror that
+still points at an earlier name as `rename-pending`.
+
+| Operation | What a rename of the primary does |
+|---|---|
+| `status` | reads Forgejo only; `rename-pending` when a mirror points at an earlier name of the destination |
+| `plan` | looks the destination up by its immutable id (`repository_id`) and reports `rename-planned`, `rename-blocked` (name taken, other namespace) or nothing |
+| `reconcile --apply` | renames the destination through its adapter, replaces the owned Forgejo mirror that points at the old name, moves the ownership record, removes the old SSH deploy key |
+| `rename --apply` | the same, and only for destinations whose name is out of date; never creates a destination |
+
+Adapter capability `rename` (`cfrg switch --capabilities`): GitLab native (the
+project path, and the display name when it carried the same text; the old path
+redirects), Bitbucket native (the repository name, the slug follows; the old slug
+answers 404, so the repository is addressed by UUID), Forgejo as a destination
+and GitHub unsupported. A rename is refused and reported, never forced, when the
+wanted name is taken by another repository or when the namespace differs (a
+transfer is not implemented). The recorded `remote_name` of a replaced mirror
+changes: the report prints the new one, and the declared placement keeps it
+(`remote_name` is the durable ownership claim; the state file is the cache).
+
 ```json
 {
   "schema": 1,

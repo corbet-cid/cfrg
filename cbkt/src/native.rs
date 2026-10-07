@@ -1,8 +1,9 @@
 //! Bitbucket destination operations. A workspace 402 holds every later write.
 use cfrg::{
     native::{
+        encode,
         http::{expect, Auth, Request, Response, Transport},
-        Destination, Provider, Repository,
+        plan_move, Destination, Move, Naming, Provider, Repository,
     },
     Result,
 };
@@ -87,6 +88,74 @@ pub fn ensure_destination_repo(
         &[200, 201],
     )?;
     Ok(Some(verify(value, repo, dest)?))
+}
+
+/// The destination addressed by its immutable UUID instead of its name, which a
+/// rename makes outdated. Bitbucket answers the UUID under the workspace.
+fn by_uuid(dest: &Destination, uuid: &str) -> Result<Destination> {
+    let workspace = dest.path.split('/').next().ok_or("Missing workspace")?;
+    let mut copy = dest.clone();
+    copy.path = format!("{workspace}/{}", encode(uuid));
+    Ok(copy)
+}
+
+/// Compare the repository's actual name, found by its UUID, with the wanted one
+/// (`dest.path`) and rename it when only the slug differs: Bitbucket derives the
+/// slug from the name, and the old slug stops answering (no redirect), which is
+/// why every lookup goes by UUID. A taken name or another workspace is
+/// reported and never forced. Without a recorded UUID the by-name flow runs.
+pub fn naming(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<Naming> {
+    let Some(uuid) = dest.repository_id.as_deref() else {
+        return Ok(Naming::Current);
+    };
+    let known = by_uuid(dest, uuid)?;
+    let response = call(io, &known, "GET", "", None, false)?;
+    if response.status == 404 {
+        return Err("Declared Bitbucket repo disappeared; refusing replacement".into());
+    }
+    let repository = expect(response, &[200])?;
+    if repository["uuid"] != uuid {
+        return Err("Bitbucket destination identity mismatch".into());
+    }
+    let live = repository["full_name"]
+        .as_str()
+        .ok_or("Missing Bitbucket repository name")?
+        .to_string();
+    let leaf = match plan_move(&live, &dest.path) {
+        Move::Same => return Ok(Naming::Current),
+        Move::Transfer => {
+            return Ok(Naming::Blocked {
+                from: live,
+                reason: "the workspace differs; transfers are not supported",
+            })
+        }
+        Move::Rename { leaf } => leaf,
+    };
+    let wanted = call(io, dest, "GET", "", None, false)?;
+    match wanted.status {
+        404 => {}
+        200 if wanted.body["uuid"] == uuid => return Ok(Naming::Current),
+        200 => {
+            return Ok(Naming::Blocked {
+                from: live,
+                reason: "the wanted name is already taken",
+            })
+        }
+        other => return Err(format!("Bitbucket name lookup failed with HTTP {other}").into()),
+    }
+    if !apply {
+        return Ok(Naming::Planned { from: live });
+    }
+    let response = call(io, &known, "PUT", "", Some(json!({"name":leaf})), false)?;
+    match response.status {
+        200 if response.body["full_name"] == dest.path => Ok(Naming::Renamed { from: live }),
+        200 => Err("Bitbucket rename not confirmed; inspect the repository before retrying".into()),
+        400 | 404 | 409 | 422 => Ok(Naming::Blocked {
+            from: live,
+            reason: "Bitbucket refused the new name",
+        }),
+        other => Err(format!("Bitbucket rename failed with HTTP {other}").into()),
+    }
 }
 
 pub(crate) fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
@@ -303,5 +372,108 @@ mod tests {
             &[push, merge, json!({"kind":"force","pattern":"*"})],
             "{mirror}"
         ));
+    }
+    /// Plays back canned answers and records what was asked.
+    struct Script {
+        answers: Vec<(u16, Value)>,
+        asked: Vec<(&'static str, String, Option<Value>)>,
+    }
+    impl Script {
+        fn new(answers: Vec<(u16, Value)>) -> Self {
+            Self {
+                answers,
+                asked: Vec::new(),
+            }
+        }
+    }
+    impl Transport for Script {
+        fn send(&mut self, request: Request) -> Result<Response> {
+            self.asked
+                .push((request.method, request.path, request.body));
+            let (status, body) = self.answers.remove(0);
+            Ok(Response { status, body })
+        }
+    }
+    fn wanted(path: &str, id: Option<&str>) -> Destination {
+        serde_json::from_value(json!({"provider":"bitbucket","endpoint":{"origin":"https://api.bitbucket.org","token_env":"TOKEN"},"path":path,"namespace":"CORE","repository_id":id,"mirror_user":"{m}","password_env":"TOKEN","interval_seconds":3600})).unwrap()
+    }
+    fn repository(full_name: &str) -> Value {
+        json!({"uuid":"{u-1}","full_name":full_name})
+    }
+
+    #[test]
+    fn a_renamed_primary_renames_the_repository_found_by_uuid() {
+        let mut io = Script::new(vec![
+            (200, repository("team/old")),
+            (404, Value::Null),
+            (200, repository("team/new")),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("{u-1}")), true).unwrap();
+        assert_eq!(
+            result,
+            Naming::Renamed {
+                from: "team/old".into()
+            }
+        );
+        let asked: Vec<_> = io.asked.iter().map(|(m, p, _)| (*m, p.as_str())).collect();
+        assert_eq!(
+            asked,
+            [
+                ("GET", "/2.0/repositories/team/%7Bu-1%7D"),
+                ("GET", "/2.0/repositories/team/new"),
+                ("PUT", "/2.0/repositories/team/%7Bu-1%7D"),
+            ]
+        );
+        assert_eq!(io.asked[2].2, Some(json!({"name":"new"})));
+    }
+
+    #[test]
+    fn planning_writes_nothing_and_a_taken_name_is_not_forced() {
+        let mut io = Script::new(vec![(200, repository("team/old")), (404, Value::Null)]);
+        let result = naming(&mut io, &wanted("team/new", Some("{u-1}")), false).unwrap();
+        assert_eq!(
+            result,
+            Naming::Planned {
+                from: "team/old".into()
+            }
+        );
+        assert!(io.asked.iter().all(|(method, _, _)| *method == "GET"));
+
+        let mut io = Script::new(vec![
+            (200, repository("team/old")),
+            (200, json!({"uuid":"{other}","full_name":"team/new"})),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("{u-1}")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("taken")));
+        assert_eq!(io.asked.len(), 2);
+    }
+
+    #[test]
+    fn another_workspace_a_refusal_the_right_name_or_no_uuid() {
+        let mut io = Script::new(vec![(200, repository("elsewhere/old"))]);
+        let result = naming(&mut io, &wanted("team/new", Some("{u-1}")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("workspace")));
+
+        let mut io = Script::new(vec![
+            (200, repository("team/old")),
+            (404, Value::Null),
+            (400, Value::Null),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("{u-1}")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("refused")));
+
+        let mut io = Script::new(vec![(200, repository("team/new"))]);
+        assert_eq!(
+            naming(&mut io, &wanted("team/new", Some("{u-1}")), true).unwrap(),
+            Naming::Current
+        );
+        let mut io = Script::new(vec![]);
+        assert_eq!(
+            naming(&mut io, &wanted("team/new", None), true).unwrap(),
+            Naming::Current
+        );
+        assert!(io.asked.is_empty());
+        let mut io = Script::new(vec![(404, Value::Null)]);
+        assert!(naming(&mut io, &wanted("team/new", Some("{u-1}")), true).is_err());
     }
 }

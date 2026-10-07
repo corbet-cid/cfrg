@@ -31,6 +31,10 @@ pub const CAPABILITIES: Capabilities = Capabilities {
         support: Support::Native,
         note: "native: branch restriction create, update and delete",
     },
+    rename: Capability {
+        support: Support::Native,
+        note: "native: updating the repository name changes its slug; the old slug stops answering (no redirect), so cfrg addresses the repository by UUID and re-points the Forgejo push mirror",
+    },
 };
 
 pub struct Bitbucket {

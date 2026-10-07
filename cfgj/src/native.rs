@@ -37,10 +37,23 @@ impl Mirrors<'_> {
             statuses,
         )
     }
-    pub fn verify_source(&self, io: &mut dyn Transport) -> Result<()> {
-        let value = self.call(io, "GET", "", None, &[200])?;
+    /// Look the primary up by its immutable id and return its CURRENT
+    /// `<org>/<repo>`. A repository renamed or moved on Forgejo keeps its id, so
+    /// a stale declared path is a finding (`source-renamed`), not an error.
+    pub fn verify_source(&self, io: &mut dyn Transport) -> Result<String> {
+        let value = expect(
+            io.send(Request {
+                endpoint: self.endpoint.clone(),
+                auth: Auth::Token,
+                method: "GET",
+                path: format!("/api/v1/repositories/{}", self.repository.source_id),
+                body: None,
+                scope: format!("{}/api", self.endpoint.origin),
+                creation: false,
+            })?,
+            &[200],
+        )?;
         if value["id"].as_u64() != Some(self.repository.source_id)
-            || value["full_name"] != self.repository.path
             || value["private"] != self.repository.private
             || value["default_branch"] != self.repository.default_branch
             || value["mirror"] != false
@@ -50,7 +63,11 @@ impl Mirrors<'_> {
                     .into(),
             );
         }
-        Ok(())
+        let current = value["full_name"]
+            .as_str()
+            .ok_or("Missing Forgejo repository name")?;
+        path(current, false)?;
+        Ok(current.to_string())
     }
     pub fn list(&self, io: &mut dyn Transport) -> Result<Vec<Value>> {
         let mut result = Vec::new();
@@ -246,5 +263,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["remote_name"], "remote_mirror_test");
+    }
+    struct Found(u64);
+    impl Transport for Found {
+        fn send(&mut self, request: Request) -> Result<cfrg::native::http::Response> {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/api/v1/repositories/7");
+            Ok(cfrg::native::http::Response {
+                status: 200,
+                body: json!({"id":self.0,"full_name":"team/renamed","private":true,"default_branch":"main","mirror":false}),
+            })
+        }
+    }
+    #[test]
+    fn the_primary_is_found_by_its_id_under_the_name_it_has_now() {
+        let repo: Repository = serde_json::from_value(json!({"path":"team/project","source_id":7,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
+        let endpoint = Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "TOKEN".into(),
+        };
+        let api = Mirrors {
+            endpoint: &endpoint,
+            repository: &repo,
+        };
+        assert_eq!(api.verify_source(&mut Found(7)).unwrap(), "team/renamed");
+        assert!(api.verify_source(&mut Found(8)).is_err());
     }
 }

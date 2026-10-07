@@ -43,6 +43,9 @@ pub struct Capabilities {
     pub receiver_lock: Capability,
     /// Becoming primary again, and turning the old primary into a receiver.
     pub switch: Capability,
+    /// Renaming this forge's copy of a repository in place, so that it keeps
+    /// the name of its primary (`cfrg native`, `docs/native-mirrors.md`).
+    pub rename: Capability,
 }
 
 fn native(support: Support) -> bool {
@@ -273,6 +276,7 @@ mod tests {
             pull_mirror_converts_existing: converts,
             receiver_lock: cap(Support::Native),
             switch: cap(Support::Native),
+            rename: cap(Support::Native),
         }
     }
 

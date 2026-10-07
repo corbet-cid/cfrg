@@ -44,6 +44,7 @@ pub const REPLICATION: cfrg::replicate::Capabilities = cfrg::replicate::Capabili
         "unsupported: GitHub is frozen, no writes of any kind (private repositories on Free have no protection API anyway)",
     ),
     switch: cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind"),
+    rename: cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind"),
 };
 
 use cfrg::{

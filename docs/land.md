@@ -18,7 +18,7 @@ same pass every `interval_seconds` until the queue is settled; `cfrg land
 
 | Rule | How it holds |
 |---|---|
-| Only the exact green commit lands | the merge is fast-forward-only and names the verified head (`head_commit_id`); a moved head is refused by the forge |
+| Only the exact green commit lands | cfrg merges (fast-forward-only, naming `head_commit_id`) only a head it saw succeed for every declared context, re-reads the pull request right before the merge and refuses when the head moved; a new push resets the wait |
 | One queue per repository | the open pull requests carrying the cfrg marker, oldest first; only the head-of-line entry may land or be rebased |
 | Base moved | the forge rebases the branch (`pulls/{n}/update?style=rebase`), the merge is scheduled again for the new head and a retest is requested; it lands only after the new head is green |
 | Conflict | the entry is closed with an explanation; push a rebased branch and land again |
@@ -30,7 +30,7 @@ same pass every `interval_seconds` until the queue is settled; `cfrg land
 | Step | Native mechanism | cfrg fills |
 |---|---|---|
 | Review unit | pull request | the marker that makes it a queue entry |
-| Merge when green | `merge_when_checks_succeed` with `Do=fast-forward-only` (201) | fires only on the NEXT success status of the head: never for a head that is already green, never after a rebase, silently never for a stale head, so cfrg schedules it and also merges green heads itself |
+| Merge when green | `merge_when_checks_succeed` with `Do=fast-forward-only` (201), ONLY where the default branch is status-gated for the declared contexts | on a branch without that protection Forgejo treats "no required checks" as success and merges a head that has no status at all (seen live: cmsh PR 1, merged on a push before any CI status existed). cfrg therefore asks the forge whether the rule exists (`gated`); where it does not, it never schedules the native merge, cancels one an older cfrg scheduled (`native-merge-cancelled`) and merges itself after observing the status. Where it does, the native path fires on the next success status and cfrg still merges green heads itself |
 | Linear history | `Do=fast-forward-only` | a stale head would answer 500, so cfrg checks the fresh tip first |
 | Rebase | `POST pulls/{n}/update?style=rebase` (200, 409 on conflict) | queue order and the retest after it |
 | Gate | branch protection with `status_check_contexts` (glob patterns) | declared and reconciled by `cfrg land --protect` |

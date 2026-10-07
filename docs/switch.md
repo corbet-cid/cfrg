@@ -23,6 +23,7 @@ For every edge (sender to receiver) cfrg picks the most native mechanism:
 | pull mirror (receiver) | native at creation only | unsupported (Premium) | unsupported | unsupported |
 | receiver lock | native + fill (user whitelist, every rule locked) | native + fill (deploy key only, delete and recreate rules) | native (push restrictions) | unsupported |
 | switch | native + fill | native + fill | native | unsupported |
+| rename (follow the primary's name, `docs/native-mirrors.md`) | unsupported (names are made here) | native (project path) | native (name, the slug follows) | unsupported |
 
 ## Placement
 

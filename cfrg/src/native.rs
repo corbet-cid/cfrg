@@ -56,7 +56,20 @@ pub struct Repository {
 pub struct Destination {
     pub provider: Provider,
     pub endpoint: Endpoint,
+    /// Where the destination lives. Without `path_reason` the destination follows
+    /// the primary's current `<org>/<repo>` and this only records the last known
+    /// name (it may be left out); with a reason it is pinned to exactly this path.
+    #[serde(default)]
     pub path: String,
+    /// Why this destination deliberately keeps a name other than the primary's.
+    /// Only a declared reason pins `path`; without one the destination is renamed
+    /// whenever the primary is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_reason: Option<String>,
+    /// The name as written in the file, before the destination followed its
+    /// primary. Set on loading; not part of the file format.
+    #[serde(skip)]
+    pub recorded_path: String,
     /// Namespace ID for GitLab; existing project key for Bitbucket.
     pub namespace: String,
     /// Immutable destination identity once known. Required for existing repos.
@@ -90,6 +103,70 @@ pub enum Content {
     Profile,
 }
 
+impl Destination {
+    /// Only a declared reason pins the path; every other destination follows the
+    /// primary's name.
+    pub fn pinned(&self) -> bool {
+        !self.path.is_empty()
+            && self
+                .path_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+    }
+}
+
+impl Repository {
+    /// Where `dest` must live now: its pinned path, else the primary's current
+    /// `<org>/<repo>` (this repository's `path`).
+    pub fn destination_path(&self, dest: &Destination) -> String {
+        if dest.pinned() {
+            dest.path.clone()
+        } else {
+            self.path.clone()
+        }
+    }
+}
+
+/// How the actual name of a destination compares with the wanted one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Naming {
+    /// The destination already has the wanted name (or has no recorded identity
+    /// to look it up by).
+    Current,
+    /// It lives at `from` and would be renamed; nothing was written.
+    Planned { from: String },
+    /// It lived at `from` and was renamed by this call.
+    Renamed { from: String },
+    /// It lives at `from` and cannot be renamed; reported, never forced.
+    Blocked { from: String, reason: &'static str },
+}
+
+/// What a rename of `live` to `wanted` would have to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Move<'a> {
+    Same,
+    /// Same namespace, other last component.
+    Rename {
+        leaf: &'a str,
+    },
+    /// The namespace differs: a transfer, which no adapter implements.
+    Transfer,
+}
+
+pub fn plan_move<'a>(live: &str, wanted: &'a str) -> Move<'a> {
+    if live == wanted {
+        return Move::Same;
+    }
+    match (live.rsplit_once('/'), wanted.rsplit_once('/')) {
+        (Some((live_ns, _)), Some((wanted_ns, leaf)))
+            if live_ns.eq_ignore_ascii_case(wanted_ns) =>
+        {
+            Move::Rename { leaf }
+        }
+        _ => Move::Transfer,
+    }
+}
+
 impl Placement {
     /// Read the placement from either view of the one declared file: the
     /// native view itself, or the whole `lib/placement.json` (its `native`
@@ -104,7 +181,25 @@ impl Placement {
             }
             value = native;
         }
-        Ok(serde_json::from_value(value)?)
+        let mut placement: Self = serde_json::from_value(value)?;
+        placement.follow_primaries();
+        Ok(placement)
+    }
+
+    /// Keep the destination names as written and let every destination that is
+    /// not pinned follow the declared name of its primary. `cfrg native` follows
+    /// the primary's live name on top of this (a rename the file has not caught
+    /// up with yet).
+    fn follow_primaries(&mut self) {
+        for repo in &mut self.repositories {
+            let current = repo.path.clone();
+            for dest in &mut repo.destinations {
+                dest.recorded_path = dest.path.clone();
+                if !dest.pinned() {
+                    dest.path = current.clone();
+                }
+            }
+        }
     }
 
     /// Base URL of the primary of `path`: its exception, else the declared
@@ -151,6 +246,17 @@ impl Placement {
             }
             for dest in &repo.destinations {
                 dest.endpoint.validate()?;
+                // `path` was resolved on loading; the written one is `recorded_path`.
+                match (&dest.path_reason, dest.recorded_path.is_empty()) {
+                    (Some(reason), false)
+                        if !reason.trim().is_empty() && !reason.chars().any(char::is_control) => {}
+                    (None, _) => {}
+                    _ => {
+                        return Err(failure(
+                            "A path reason needs a pinned path and must be plain text",
+                        ))
+                    }
+                }
                 path(&dest.path, dest.provider == Provider::Gitlab)?;
                 if !targets.insert((&dest.endpoint.origin, &dest.path))
                     || dest.interval_seconds < 600
@@ -286,5 +392,68 @@ mod tests {
             .is_err());
         }
         assert_eq!(encode("a/b*"), "a%2Fb%2A");
+    }
+    fn followers_document(extra: &str) -> String {
+        format!(
+            r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[
+            {{"path":"team/new","source_id":1,"private":false,"default_branch":"main","content":"native-git","hold":null,"destinations":[
+              {{"provider":"gitlab","endpoint":{{"origin":"https://gitlab.example","token_env":"G"}},"path":"team/old","namespace":"2","repository_id":"7","mirror_user":"9","password_env":"G","interval_seconds":3600,"hold":null,"remote_name":null}},
+              {{"provider":"gitlab","endpoint":{{"origin":"https://gitlab.other","token_env":"G"}},"path":"archive/keep","path_reason":"the archive keeps the original name","namespace":"3","mirror_user":"9","password_env":"G","interval_seconds":3600,"hold":null,"remote_name":null}},
+              {{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"namespace":"CORE","mirror_user":"{{u}}","password_env":"B","interval_seconds":3600,"hold":null,"remote_name":null{extra}}}
+            ]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn destinations_follow_the_primary_unless_pinned_with_a_reason() {
+        let placement = Placement::from_document(followers_document("").as_bytes()).unwrap();
+        placement.validate().unwrap();
+        let repo = &placement.repositories[0];
+        let [renamed_by_file, pinned, left_out] = &repo.destinations[..] else {
+            panic!("three destinations")
+        };
+        // A written name without a reason is only a record of the last known name.
+        assert_eq!(renamed_by_file.path, "team/new");
+        assert_eq!(renamed_by_file.recorded_path, "team/old");
+        assert!(!renamed_by_file.pinned());
+        assert_eq!(pinned.path, "archive/keep");
+        assert!(pinned.pinned());
+        assert_eq!(
+            (left_out.path.as_str(), left_out.recorded_path.as_str()),
+            ("team/new", "")
+        );
+        // The primary moves on: followers go with it, the pinned one stays.
+        let mut live = repo.clone();
+        live.path = "team/newer".into();
+        assert_eq!(live.destination_path(renamed_by_file), "team/newer");
+        assert_eq!(live.destination_path(left_out), "team/newer");
+        assert_eq!(live.destination_path(pinned), "archive/keep");
+    }
+
+    #[test]
+    fn a_path_reason_needs_a_pinned_path_and_plain_text() {
+        for bad in [
+            r#","path_reason":"why""#,
+            r#","path":"team/x","path_reason":"""#,
+            r#","path":"team/x","path_reason":"   ""#,
+            r#","path":"team/x","path_reason":"bad\u0007""#,
+        ] {
+            let placement = Placement::from_document(followers_document(bad).as_bytes()).unwrap();
+            assert!(placement.validate().is_err(), "{bad}");
+        }
+        let good = r#","path":"team/x","path_reason":"kept for the archive""#;
+        let placement = Placement::from_document(followers_document(good).as_bytes()).unwrap();
+        placement.validate().unwrap();
+        assert!(placement.repositories[0].destinations[2].pinned());
+    }
+
+    #[test]
+    fn a_move_is_a_rename_only_inside_one_namespace() {
+        assert_eq!(plan_move("a/x", "a/x"), Move::Same);
+        assert_eq!(plan_move("a/x", "a/y"), Move::Rename { leaf: "y" });
+        assert_eq!(plan_move("A/x", "a/y"), Move::Rename { leaf: "y" });
+        assert_eq!(plan_move("g/s/x", "g/s/y"), Move::Rename { leaf: "y" });
+        assert_eq!(plan_move("a/x", "b/x"), Move::Transfer);
+        assert_eq!(plan_move("g/s/x", "g/x"), Move::Transfer);
     }
 }

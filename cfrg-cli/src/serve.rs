@@ -159,21 +159,53 @@ struct MirrorLane {
     placement: PathBuf,
     state: PathBuf,
     sweep: u64,
+    /// Apply the renames the primary's names call for after verifying.
+    rename: bool,
 }
 
 impl Reconciler for MirrorLane {
     fn reconcile(&mut self, key: &str) -> Result<Outcome> {
-        let report = crate::native::verify(&self.placement, &self.state, Some(key))?;
+        let mut report = crate::native::verify(&self.placement, &self.state, Some(key))?;
+        let pending = rename_pending(&report);
+        if pending && self.rename {
+            // The primary was renamed and a destination still carries its old
+            // name: follow it, then look again. A refusal (a taken name, a missing
+            // credential) is logged and leaves the finding in the report.
+            match crate::native::rename(&self.placement, &self.state, Some(key)) {
+                Ok(applied) => println!(
+                    "{}",
+                    json!({"event":"mirror-renamed","repository":key,"complete":applied["complete"]})
+                ),
+                Err(error) => println!(
+                    "{}",
+                    json!({"event":"mirror-rename-failed","repository":key,"error":error.to_string()})
+                ),
+            }
+            report = crate::native::verify(&self.placement, &self.state, Some(key))?;
+        }
         let complete = report["complete"] == true;
         println!(
             "{}",
-            json!({"event":"mirror-verified","repository":key,"complete":complete})
+            json!({"event":"mirror-verified","repository":key,"complete":complete,"rename_pending":rename_pending(&report)})
         );
         Ok(Outcome {
-            summary: json!({"complete": complete, "at": serve::now()}),
+            summary: json!({"complete": complete, "rename_pending": rename_pending(&report), "at": serve::now()}),
             next_in: Some(self.sweep),
         })
     }
+}
+
+/// Whether a verification found a rename of the primary that its destinations
+/// (or the declared placement) have not followed.
+fn rename_pending(report: &serde_json::Value) -> bool {
+    report["repositories"].as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            matches!(
+                row["state"].as_str(),
+                Some("rename-pending" | "source-renamed")
+            )
+        })
+    })
 }
 
 fn run_server(policy: Policy, serve_policy: ServePolicy, state_dir: PathBuf) -> Result<()> {
@@ -246,6 +278,7 @@ fn run_server(policy: Policy, serve_policy: ServePolicy, state_dir: PathBuf) -> 
         placement: PathBuf::from(&sweep.placement),
         state: PathBuf::from(&sweep.state),
         sweep: sweep.sweep_seconds,
+        rename: sweep.rename,
     });
     thread::scope(|scope| {
         scope.spawn(|| land.work(&mut land_lane, &INTERRUPTED));
@@ -261,4 +294,23 @@ fn run_server(policy: Policy, serve_policy: ServePolicy, state_dir: PathBuf) -> 
     // Holding the lock until here is the point.
     drop(owner);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_findings_are_noticed() {
+        assert!(rename_pending(
+            &json!({"repositories":[{"state":"configured"},{"state":"rename-pending"}]})
+        ));
+        assert!(rename_pending(
+            &json!({"repositories":[{"state":"source-renamed"}]})
+        ));
+        assert!(!rename_pending(
+            &json!({"repositories":[{"state":"checked"}]})
+        ));
+        assert!(!rename_pending(&json!({"complete":true})));
+    }
 }

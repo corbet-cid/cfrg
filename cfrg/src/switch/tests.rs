@@ -49,6 +49,7 @@ impl Replica for Fake {
             pull_mirror_converts_existing: false,
             receiver_lock: cap(Support::Native),
             switch: cap(Support::Native),
+            rename: cap(Support::Native),
         }
     }
     fn verify(&self, _io: &mut dyn Transport) -> Result<()> {

@@ -40,6 +40,10 @@ pub const CAPABILITIES: Capabilities = Capabilities {
         support: Support::NativeFill,
         note: "native: remote mirrors and protected branches; cfrg fills the order (freeze, hash check, disable, unlock, create, verify)",
     },
+    rename: Capability {
+        support: Support::Native,
+        note: "native: updating the project path (and name) inside its namespace; GitLab redirects the old path (301), so cfrg addresses the project by ID and re-points the Forgejo push mirror; a namespace change is a transfer and is not implemented",
+    },
 };
 
 pub struct Gitlab {

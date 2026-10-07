@@ -3,7 +3,7 @@ use cfrg::{
     native::{
         encode,
         http::{expect, Auth, Request, Response, Transport},
-        Destination, Provider, Repository,
+        plan_move, Destination, Move, Naming, Provider, Repository,
     },
     Result,
 };
@@ -138,6 +138,131 @@ pub fn ensure_destination_repo(
         &[201],
     )?;
     Ok(Some(verify(value, repo, dest)?))
+}
+
+/// Compare the project's actual name, found by its immutable ID, with the wanted
+/// one (`dest.path`) and rename it when only the last component differs. GitLab
+/// keeps redirecting the old path, so existing remotes keep working. The path
+/// moves, and so does the display name when it carried the same text. A taken
+/// name or a different namespace is reported and never forced. Without a
+/// recorded ID there is nothing to look up and the caller's by-path flow runs.
+pub fn naming(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<Naming> {
+    let Some(id) = dest.repository_id.as_deref() else {
+        return Ok(Naming::Current);
+    };
+    let id: u64 = id
+        .parse()
+        .map_err(|_| "GitLab repository_id must be a numeric project ID")?;
+    let response = call(io, dest, "GET", format!("/projects/{id}"), None, false)?;
+    if response.status == 404 {
+        return Err("Declared GitLab project disappeared; refusing replacement".into());
+    }
+    let project = expect(response, &[200])?;
+    if project["id"].as_u64() != Some(id) {
+        return Err("GitLab destination identity mismatch".into());
+    }
+    let live = project["path_with_namespace"]
+        .as_str()
+        .ok_or("Missing GitLab project path")?
+        .to_string();
+    let leaf = match plan_move(&live, &dest.path) {
+        Move::Same => return Ok(Naming::Current),
+        Move::Transfer => {
+            return Ok(Naming::Blocked {
+                from: live,
+                reason: "the namespace differs; transfers are not supported",
+            })
+        }
+        Move::Rename { leaf } => leaf,
+    };
+    let wanted = call(
+        io,
+        dest,
+        "GET",
+        format!("/projects/{}", encode(&dest.path)),
+        None,
+        false,
+    )?;
+    match wanted.status {
+        // 301: only a redirect that an earlier project of that name left behind.
+        404 | 301 => {}
+        200 if wanted.body["id"].as_u64() == Some(id) => return Ok(Naming::Current),
+        200 => {
+            return Ok(Naming::Blocked {
+                from: live,
+                reason: "the wanted name is already taken",
+            })
+        }
+        other => return Err(format!("GitLab name lookup failed with HTTP {other}").into()),
+    }
+    if !apply {
+        return Ok(Naming::Planned { from: live });
+    }
+    let mut body = json!({"path":leaf});
+    if project["name"] == project["path"] {
+        body["name"] = json!(leaf);
+    }
+    let response = call(
+        io,
+        dest,
+        "PUT",
+        format!("/projects/{id}"),
+        Some(body),
+        false,
+    )?;
+    match response.status {
+        200 if response.body["path_with_namespace"] == dest.path => {
+            Ok(Naming::Renamed { from: live })
+        }
+        200 => Err("GitLab rename not confirmed; inspect the project before retrying".into()),
+        400 | 404 | 409 | 422 => Ok(Naming::Blocked {
+            from: live,
+            reason: "GitLab refused the new name",
+        }),
+        other => Err(format!("GitLab rename failed with HTTP {other}").into()),
+    }
+}
+
+/// Remove the deploy key cfrg enrolled for a mirror that no longer exists (its
+/// private half died with the mirror), so a replaced mirror leaves no orphan.
+pub fn forget_key(io: &mut dyn Transport, dest: &Destination, remote_name: &str) -> Result<()> {
+    let title = format!("cfrg:{remote_name}");
+    for page in 1..=20 {
+        let value = expect(
+            call(
+                io,
+                dest,
+                "GET",
+                format!(
+                    "/projects/{}/deploy_keys?per_page=100&page={page}",
+                    encode(&dest.path)
+                ),
+                None,
+                false,
+            )?,
+            &[200],
+        )?;
+        let keys = value.as_array().ok_or("Malformed deploy key list")?;
+        if let Some(key) = keys.iter().find(|key| key["title"] == title.as_str()) {
+            let id = key["id"].as_u64().ok_or("Missing deploy key ID")?;
+            expect(
+                call(
+                    io,
+                    dest,
+                    "DELETE",
+                    format!("/projects/{}/deploy_keys/{id}", encode(&dest.path)),
+                    None,
+                    false,
+                )?,
+                &[204],
+            )?;
+            return Ok(());
+        }
+        if keys.len() < 100 {
+            return Ok(());
+        }
+    }
+    Err("Deploy key pagination bound exceeded".into())
 }
 
 /// Strict verification includes every overlapping rule: GitLab uses the most
@@ -545,5 +670,145 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    /// Plays back canned answers and records what was asked.
+    struct Script {
+        answers: Vec<(u16, Value)>,
+        asked: Vec<(&'static str, String, Option<Value>)>,
+    }
+    impl Script {
+        fn new(answers: Vec<(u16, Value)>) -> Self {
+            Self {
+                answers,
+                asked: Vec::new(),
+            }
+        }
+    }
+    impl Transport for Script {
+        fn send(&mut self, request: Request) -> Result<Response> {
+            self.asked
+                .push((request.method, request.path, request.body));
+            let (status, body) = self.answers.remove(0);
+            Ok(Response { status, body })
+        }
+    }
+    fn wanted(path: &str, id: Option<&str>) -> Destination {
+        serde_json::from_value(json!({"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"TOKEN"},"path":path,"namespace":"2","repository_id":id,"mirror_user":"9","password_env":"TOKEN","interval_seconds":3600})).unwrap()
+    }
+    fn project(path: &str, name: &str) -> Value {
+        json!({"id":7,"path_with_namespace":path,"name":name,"path":path.rsplit('/').next().unwrap()})
+    }
+
+    #[test]
+    fn a_renamed_primary_renames_the_project_inside_its_namespace() {
+        let mut io = Script::new(vec![
+            (200, project("team/old", "old")),
+            (404, Value::Null),
+            (200, json!({"path_with_namespace":"team/new"})),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("7")), true).unwrap();
+        assert_eq!(
+            result,
+            Naming::Renamed {
+                from: "team/old".into()
+            }
+        );
+        let asked: Vec<_> = io.asked.iter().map(|(m, p, _)| (*m, p.as_str())).collect();
+        assert_eq!(
+            asked,
+            [
+                ("GET", "/api/v4/projects/7"),
+                ("GET", "/api/v4/projects/team%2Fnew"),
+                ("PUT", "/api/v4/projects/7"),
+            ]
+        );
+        // The display name moved with the path because it carried the same text.
+        assert_eq!(io.asked[2].2, Some(json!({"path":"new","name":"new"})));
+    }
+
+    #[test]
+    fn a_custom_display_name_is_left_alone() {
+        let mut io = Script::new(vec![
+            (200, project("team/old", "Old, with a story")),
+            (404, Value::Null),
+            (200, json!({"path_with_namespace":"team/new"})),
+        ]);
+        naming(&mut io, &wanted("team/new", Some("7")), true).unwrap();
+        assert_eq!(io.asked[2].2, Some(json!({"path":"new"})));
+    }
+
+    #[test]
+    fn planning_writes_nothing() {
+        let mut io = Script::new(vec![(200, project("team/old", "old")), (404, Value::Null)]);
+        let result = naming(&mut io, &wanted("team/new", Some("7")), false).unwrap();
+        assert_eq!(
+            result,
+            Naming::Planned {
+                from: "team/old".into()
+            }
+        );
+        assert!(io.asked.iter().all(|(method, _, _)| *method == "GET"));
+    }
+
+    #[test]
+    fn a_taken_name_or_another_namespace_is_reported_not_forced() {
+        let mut io = Script::new(vec![
+            (200, project("team/old", "old")),
+            (200, json!({"id":99,"path_with_namespace":"team/new"})),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("7")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("taken")));
+        assert_eq!(io.asked.len(), 2);
+
+        let mut io = Script::new(vec![(200, project("elsewhere/old", "old"))]);
+        let result = naming(&mut io, &wanted("team/new", Some("7")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("namespace")));
+        assert_eq!(io.asked.len(), 1);
+
+        let mut io = Script::new(vec![
+            (200, project("team/old", "old")),
+            (404, Value::Null),
+            (422, Value::Null),
+        ]);
+        let result = naming(&mut io, &wanted("team/new", Some("7")), true).unwrap();
+        assert!(matches!(result, Naming::Blocked { reason, .. } if reason.contains("refused")));
+    }
+
+    #[test]
+    fn the_right_name_or_no_recorded_identity_asks_for_nothing_more() {
+        let mut io = Script::new(vec![(200, project("team/new", "new"))]);
+        assert_eq!(
+            naming(&mut io, &wanted("team/new", Some("7")), true).unwrap(),
+            Naming::Current
+        );
+        assert_eq!(io.asked.len(), 1);
+        let mut io = Script::new(vec![]);
+        assert_eq!(
+            naming(&mut io, &wanted("team/new", None), true).unwrap(),
+            Naming::Current
+        );
+        assert!(io.asked.is_empty());
+        let mut io = Script::new(vec![(404, Value::Null)]);
+        assert!(naming(&mut io, &wanted("team/new", Some("7")), true).is_err());
+    }
+
+    #[test]
+    fn only_the_key_of_the_replaced_mirror_is_removed() {
+        let mut io = Script::new(vec![
+            (
+                200,
+                json!([{"id":1,"title":"cfrg:remote_mirror_old"},{"id":2,"title":"cfrg:remote_mirror_new"}]),
+            ),
+            (204, Value::Null),
+        ]);
+        forget_key(&mut io, &wanted("team/new", Some("7")), "remote_mirror_old").unwrap();
+        assert_eq!(io.asked[1].0, "DELETE");
+        assert_eq!(io.asked[1].1, "/api/v4/projects/team%2Fnew/deploy_keys/1");
+        let mut io = Script::new(vec![(
+            200,
+            json!([{"id":2,"title":"cfrg:remote_mirror_new"}]),
+        )]);
+        forget_key(&mut io, &wanted("team/new", Some("7")), "remote_mirror_old").unwrap();
+        assert_eq!(io.asked.len(), 1);
     }
 }
