@@ -23,7 +23,7 @@ pub struct Options {
     #[arg(long)]
     repository: Option<String>,
     /// Reconcile one provider without changing other declared destinations.
-    #[arg(long, value_parser = ["gitlab", "bitbucket"])]
+    #[arg(long, value_parser = ["gitlab", "bitbucket", "github"])]
     provider: Option<String>,
     /// Existing projects still reconcile; missing repositories are only reported.
     #[arg(long)]
@@ -197,6 +197,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         != match declared_dest.provider {
                             Provider::Gitlab => "gitlab",
                             Provider::Bitbucket => "bitbucket",
+                            Provider::Github => "github",
                         }
                 }) {
                     continue;
@@ -283,6 +284,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 let naming = match dest.provider {
                     Provider::Gitlab => cglb::native::naming(&mut io, &dest, write)?,
                     Provider::Bitbucket => cbkt::native::naming(&mut io, &dest, write)?,
+                    Provider::Github => cghb::native::naming(&mut io, &dest, write)?,
                 };
                 let was = match naming {
                     Naming::Current => None,
@@ -364,6 +366,13 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         write,
                         allow_create,
                     )?,
+                    Provider::Github => cghb::native::ensure_destination_repo(
+                        &mut io,
+                        repo,
+                        &dest,
+                        write,
+                        allow_create,
+                    )?,
                 };
                 if dest.use_ssh && target.is_some() && mirror.is_none() && write {
                     let value = create_owned(&api, &mut io, &dest, &url, &key)?;
@@ -373,11 +382,20 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 let protected = if target.is_some() {
                     match dest.provider {
                         Provider::Gitlab if dest.use_ssh => match &mirror {
-                            Some(value) => cglb::native::protect_ssh(&mut io, &dest, value, write)?,
+                            Some(value) => cglb::native::protect_ssh(
+                                &mut io,
+                                &dest,
+                                &repo.default_branch,
+                                value,
+                                write,
+                            )?,
                             None => false,
                         },
-                        Provider::Gitlab => cglb::native::protect(&mut io, &dest, write)?,
+                        Provider::Gitlab => {
+                            cglb::native::protect(&mut io, &dest, &repo.default_branch, write)?
+                        }
                         Provider::Bitbucket => cbkt::native::protect(&mut io, &dest, write)?,
+                        Provider::Github => cghb::native::protect(&mut io, repo, &dest, write)?,
                     }
                 } else {
                     false
@@ -410,7 +428,13 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 if mirror.is_none() && write {
                     let value = create_owned(&api, &mut io, &dest, &url, &key)?;
                     if dest.use_ssh {
-                        cglb::native::protect_ssh(&mut io, &dest, &value, true)?;
+                        cglb::native::protect_ssh(
+                            &mut io,
+                            &dest,
+                            &repo.default_branch,
+                            &value,
+                            true,
+                        )?;
                         if let Some(old) = &replaced {
                             // The new key is enrolled: the old mirror's key is an orphan.
                             cglb::native::forget_key(&mut io, &dest, old)?;
@@ -428,10 +452,26 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         Provider::Bitbucket => cbkt::native::finalize_default_branch(
                             &mut io, repo, &dest, target, write,
                         )?,
+                        Provider::Github => cghb::native::finalize_default_branch(
+                            &mut io, repo, &dest, target, write,
+                        )?,
                     };
                     incomplete |= !default_branch_ready;
                     managed.push(value["remote_name"].clone());
-                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"configured", "default_branch_ready":default_branch_ready, "mirror":cfgj::native::status(value)}));
+                    let mut row = json!({"source":repo.path, "destination":dest.path, "state":"configured", "default_branch_ready":default_branch_ready, "mirror":cfgj::native::status(value)});
+                    // A configured mirror is not proof of replication: where the
+                    // destination can be read cheaply, compare the refs themselves.
+                    if dest.provider == Provider::Github
+                        && matches!(
+                            options.operation,
+                            Operation::Plan | Operation::Reconcile | Operation::SyncNow
+                        )
+                    {
+                        let heads = compare_heads(&mut io, &api, repo, &dest)?;
+                        incomplete |= heads["equal"] != true;
+                        row["heads"] = heads;
+                    }
+                    report.push(row);
                 } else {
                     incomplete = true;
                     report.push(
@@ -492,6 +532,7 @@ fn audit_names(
         let naming = match dest.provider {
             Provider::Gitlab => cglb::native::naming(io, &dest, false)?,
             Provider::Bitbucket => cbkt::native::naming(io, &dest, false)?,
+            Provider::Github => cghb::native::naming(io, &dest, false)?,
         };
         drift |= !matches!(naming, Naming::Current);
         report.push(match naming {
@@ -563,7 +604,24 @@ fn destination_url(dest: &Destination, path: &str) -> String {
     match dest.provider {
         Provider::Gitlab => cglb::native::clone_url(&named),
         Provider::Bitbucket => cbkt::native::clone_url(&named),
+        Provider::Github => cghb::native::clone_url(&named),
     }
+}
+
+/// The commit the default branch points at on the primary and on the
+/// destination, and whether they are the same one.
+fn compare_heads(
+    io: &mut dyn Transport,
+    api: &cfgj::native::Mirrors<'_>,
+    repo: &Repository,
+    dest: &Destination,
+) -> Result<Value> {
+    let source = api.head(io, &repo.default_branch)?;
+    let destination = cghb::native::head(io, dest, &repo.default_branch)?;
+    Ok(json!({
+        "branch": repo.default_branch, "source": source, "destination": destination,
+        "equal": source.is_some() && source == destination
+    }))
 }
 
 /// The key under which the state records which Forgejo mirror is ours.

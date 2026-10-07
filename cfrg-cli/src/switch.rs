@@ -117,6 +117,10 @@ pub fn run(options: Options) -> Result<()> {
         replicas.push(match dest.provider {
             Provider::Gitlab => Box::new(cglb::replica::Gitlab::new(repo, dest)),
             Provider::Bitbucket => Box::new(cbkt::replica::Bitbucket::new(repo, dest)),
+            Provider::Github => return Err(
+                "A GitHub destination takes no part in a switch: GitHub is a mirror target only"
+                    .into(),
+            ),
         });
     }
     let sites: Vec<&dyn Replica> = replicas.iter().map(|r| r.as_ref()).collect();

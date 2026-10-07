@@ -26,7 +26,7 @@ follower of `docs/land.md` keeps working, so both can coexist during a rollout.
    "listen": "0.0.0.0:8080",
    "secret_env": "CFRG_WEBHOOK_SECRET",
    "sweep_seconds": 3600, "debounce_seconds": 3,
-   "webhook": {"url": "http://cfrg-serve.ci.svc.cluster.local:8080/hook", "orgs": ["corbet-libs"]},
+   "webhook": {"url": "http://cfrg-serve.ci.svc.cluster.local:8080/hook", "orgs": ["corbet-cid"]},
    "mirrors": {"placement": "/etc/cfrg/placement.json", "state": "/var/lib/cfrg/mirror-state.json",
                "sweep_seconds": 21600, "delay_seconds": 60, "rename": false}}}
 ```

@@ -50,7 +50,7 @@ Adapter capability `rename` (`cfrg switch --capabilities`): GitLab native (the
 project path, and the display name when it carried the same text; the old path
 redirects), Bitbucket native (the repository name, the slug follows; the old slug
 answers 404, so the repository is addressed by UUID), Forgejo as a destination
-and GitHub unsupported. A rename is refused and reported, never forced, when the
+and GitHub reported only (its repositories are renamed in GitHub). A rename is refused and reported, never forced, when the
 wanted name is taken by another repository or when the namespace differs (a
 transfer is not implemented). The recorded `remote_name` of a replaced mirror
 changes: the report prints the new one, and the declared placement keeps it
@@ -83,16 +83,63 @@ Leading-dot GitLab profiles, declared LFS/profile content, and explicit holds
 remain exceptions. Content classification must come from reviewed source
 inventory; this controller does not inspect Git objects. There is no LFS fallback.
 
+## The receiver lock protects the default branch only
+
+A destination is a receiver: only the mirror principal may write the default
+branch, and no other branch is protected. The reason is deletion. Forgejo's push
+mirror deletes on the destination every branch the primary no longer has, and
+a forge refuses to delete a protected branch by push. GitLab declines the WHOLE
+push then (`You can only delete protected branches using the web interface`,
+verified live), so one protected branch that the primary removed freezes the
+mirror: nothing else reaches the destination either, and every sync fails the
+same way. A lock over `*` therefore turns every branch deletion on the primary
+into a frozen mirror. The lock is one rule, on the default branch, and a branch
+protected for any other pattern is removed by the reconcile (the destination is
+a receiver, cfrg owns its protection). When the default branch moves, the next
+reconcile locks the new one and removes the old rule.
+
+| Forge | Receiver lock | Branch deletion by the mirror |
+|---|---|---|
+| GitLab Free | one protected branch rule named after the default branch: only the Forgejo deploy key (`use_ssh`) or, on Premium, the mirror user may push; merges denied; force-push on for that principal. Other rules are deleted after the default rule is verified | refused on a protected branch (the freeze above), allowed on the others |
+| Bitbucket Free | branch restriction `push` on `*` for the mirror account plus `restrict_merges` for nobody | allowed: a push restriction names who may push, and that includes deleting (verified live on a probe repository: the branch deleted on Forgejo disappeared from Bitbucket while both restrictions stayed). Only a separate `delete` restriction forbids it, and such a restriction is refused |
+| GitHub | one ruleset `cfrg receiver lock` on `~DEFAULT_BRANCH` with the rules `update`, `deletion` and `non_fast_forward`, bypass for organisation owners (the mirror principal must be one) | allowed on every other branch; no other ruleset or classic protection may exist |
+
 GitLab supports SSH deploy-key branch protection on Free from 18.10. With
 `use_ssh`, cfrg denies branch writes before creating the Forgejo-generated key,
 adds only its public part to GitLab using the declared mirror account, and then
 grants that key alone. No private key leaves Forgejo. HTTPS mirrors instead need
 GitLab's named-user protection capability (Premium/Ultimate). Neither path
-falls back to permitting a broad role. Existing overlapping rules are reconciled
-and re-read, with merges denied and force-push enabled only for the mirror.
+falls back to permitting a broad role. Existing rules of the default branch are
+patched in place and re-read, with merges denied and force-push enabled only for
+the mirror; the rules of other names go last, once the default branch is
+verified exclusive.
 Bitbucket restricts branch pushes to the declared account, denies merges and
 refuses existing force/delete restrictions that would prevent native mirroring.
 Administrative changes and destination tags are outside these branch checks.
+
+## GitHub as a destination
+
+`"provider": "github"` declares a GitHub repository as a destination of Forgejo's
+native HTTPS push mirror (GitHub has no mirror feature of its own; it stays a
+target, never a primary, and takes part in no switch). The endpoint is always
+`https://api.github.com`; `namespace` is the owner (organisation) login and
+equals the first component of the path; `repository_id` is the numeric
+repository ID; `mirror_user` is the login of the account whose token is both the
+API credential (`token_env`) and the mirror credential (`password_env`). Reconcile:
+
+* Ensures the repository (a missing one is created in the organisation, private
+  as the primary is, with issues, projects and wiki off; creation is paced by the
+  creation window) and switches GitHub Actions off on it.
+* Locks it as above. GitHub Free has rulesets for public repositories only: a
+  private destination in a free organisation cannot be locked and is reported as
+  `destination-or-protection-required`, never mirrored unprotected. The API
+  credential must be the declared mirror principal and an organisation owner.
+* Owns the Forgejo mirror like any other (`remote_name` in the placement, or the
+  state's record). A rename of the GitHub repository is reported
+  (`rename-blocked`), never applied.
+* Verifies the heads: the `configured` row carries `heads` with the default
+  branch's commit on the primary and on GitHub; a difference makes the pass
+  incomplete.
 
 API calls are serialized with at least two seconds between requests, twelve
 seconds between mutations, and sixty seconds between repository creations.
@@ -116,5 +163,6 @@ deployment migration to avoid two writers.
 
 API contracts: [Forgejo source](https://codeberg.org/forgejo/forgejo/src/branch/forgejo/routers/api/v1/repo/mirror.go),
 [GitLab protected branches](https://docs.gitlab.com/api/protected_branches/),
+[GitHub repository rules](https://docs.github.com/en/rest/repos/rules),
 [GitLab deploy keys](https://docs.gitlab.com/api/deploy_keys/),
 [Bitbucket branch restrictions](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-branch-restrictions/).

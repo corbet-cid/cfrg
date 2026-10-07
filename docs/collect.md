@@ -2,7 +2,7 @@
 
 `cfrg collect` collects read-only forge facts and writes a saved snapshot for
 offline evaluation through the separate
-[cqlt](https://github.com/corbet-foss/cqlt) Rust library (see
+[cqlt](https://git.corbet.ch/corbet-cid/cqlt) Rust library (see
 `ccid quality check`). Network collection is separate from deterministic
 evaluation; saved evidence can be reviewed and checked offline.
 

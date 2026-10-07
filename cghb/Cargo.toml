@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license-file = "LICENSE.md"
 description = "GitHub adapter for cfrg: roles, grants, evidence, profile"
-repository = "https://git.corbet.ch/corbet-libs/cfrg.git"
+repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 
 [dependencies]
 cfrg.workspace = true

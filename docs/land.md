@@ -5,7 +5,7 @@ The agent that wants a change landed pushes its branch once, runs one command
 and is done.
 
 ```sh
-cfrg land --policy land-policy.json --state-dir "$STATE" corbet-libs/cfrg ci/my-change
+cfrg land --policy land-policy.json --state-dir "$STATE" corbet-cid/cfrg ci/my-change
 ```
 
 The command puts the branch in the repository's queue, runs one pass (a branch
@@ -54,7 +54,7 @@ pushes and branch deletion.
   "follow_seconds": 14400,
   "retest": ["ci-job", "run", "--repo", "{checkout}", "--branch", "{branch}", "--job", "verify"],
   "landed": ["ci-job", "run", "--repo", "{checkout}", "--branch", "{branch}", "--job", "release"],
-  "repositories": [{"path": "corbet-libs/cfrg", "contexts": ["ci/crow/*"]}]
+  "repositories": [{"path": "corbet-cid/cfrg", "contexts": ["ci/crow/*"]}]
 }
 ```
 

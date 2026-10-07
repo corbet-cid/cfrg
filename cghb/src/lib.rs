@@ -9,8 +9,14 @@
 //! Rate-limit signals: GitHub answers throttled API use with HTTP 429 or a
 //! 403 carrying exhausted rate-limit headers. The core paced executor stops
 //! a run on the first 401/403/429/402 and records the halt.
+//!
+//! The one write path is [`native`]: GitHub as a destination of Forgejo's own
+//! push mirrors (ensure the repository, lock it as a receiver, verify heads).
+//! GitHub is a mirror target, never a primary, and takes no part in a switch.
 
 #![forbid(unsafe_code)]
+
+pub mod native;
 
 /// Declared landing and release capability of this adapter. Never guessed:
 /// `unsupported` means the procedure is not implemented here.

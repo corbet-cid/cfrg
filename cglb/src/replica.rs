@@ -298,7 +298,7 @@ impl Replica for Gitlab {
         match admit {
             Admit::Nobody => crate::native::deny_branch_writes(io, &self.dest),
             Admit::User(id) if *id == self.dest.mirror_user => {
-                crate::native::protect(io, &self.dest, true).map(|_| ())
+                crate::native::protect(io, &self.dest, &self.repo.default_branch, true).map(|_| ())
             }
             Admit::User(_) => Err("GitLab Free locks a receiver to its mirror key or to the declared mirror_user only".into()),
             Admit::Key { public_key, title } => {
@@ -306,7 +306,7 @@ impl Replica for Gitlab {
                     "public_key": public_key,
                     "remote_name": title.strip_prefix("cfrg:").unwrap_or(title),
                 });
-                crate::native::protect_ssh(io, &self.dest, &mirror, true)?;
+                crate::native::protect_ssh(io, &self.dest, &self.repo.default_branch, &mirror, true)?;
                 self.forget_old_keys(io, title)
             }
         }

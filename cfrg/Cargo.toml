@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license-file = "LICENSE.md"
 description = "Forge-independent model, pure planners and bounded transports"
-repository = "https://git.corbet.ch/corbet-libs/cfrg.git"
+repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 
 [features]
 windows-experimental = []

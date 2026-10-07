@@ -69,6 +69,29 @@ impl Mirrors<'_> {
         path(current, false)?;
         Ok(current.to_string())
     }
+    /// The commit a branch of the primary points at (`None` when it is gone).
+    pub fn head(&self, io: &mut dyn Transport, branch: &str) -> Result<Option<String>> {
+        let branch = branch
+            .split('/')
+            .map(cfrg::native::encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        let response = io.send(Request {
+            endpoint: self.endpoint.clone(),
+            auth: Auth::Token,
+            method: "GET",
+            path: format!("/api/v1/repos/{}/branches/{branch}", self.repository.path),
+            body: None,
+            scope: format!("{}/api", self.endpoint.origin),
+            creation: false,
+        })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        Ok(expect(response, &[200])?["commit"]["id"]
+            .as_str()
+            .map(String::from))
+    }
     pub fn list(&self, io: &mut dyn Transport) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         for page in 1..=20 {
@@ -107,6 +130,8 @@ impl Mirrors<'_> {
             "remote_address": remote_address, "remote_username": match destination.provider {
                 cfrg::native::Provider::Gitlab => "oauth2",
                 cfrg::native::Provider::Bitbucket => "x-bitbucket-api-token-auth",
+                // A token over HTTPS: the account that owns it is the user name.
+                cfrg::native::Provider::Github => destination.mirror_user.as_str(),
             },
             "remote_password": password, "interval": format!("{}s", destination.interval_seconds),
             "sync_on_commit": true, "branch_filter": destination.branch_filter,
@@ -288,5 +313,34 @@ mod tests {
         };
         assert_eq!(api.verify_source(&mut Found(7)).unwrap(), "team/renamed");
         assert!(api.verify_source(&mut Found(8)).is_err());
+    }
+
+    struct Branch(u16);
+    impl Transport for Branch {
+        fn send(&mut self, request: Request) -> Result<cfrg::native::http::Response> {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/api/v1/repos/team/project/branches/ci/topic");
+            Ok(cfrg::native::http::Response {
+                status: self.0,
+                body: json!({"name":"ci/topic","commit":{"id":"abc"}}),
+            })
+        }
+    }
+    #[test]
+    fn the_head_of_a_branch_is_its_commit_or_nothing_when_it_is_gone() {
+        let repo: Repository = serde_json::from_value(json!({"path":"team/project","source_id":7,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
+        let endpoint = Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "TOKEN".into(),
+        };
+        let api = Mirrors {
+            endpoint: &endpoint,
+            repository: &repo,
+        };
+        assert_eq!(
+            api.head(&mut Branch(200), "ci/topic").unwrap().as_deref(),
+            Some("abc")
+        );
+        assert_eq!(api.head(&mut Branch(404), "ci/topic").unwrap(), None);
     }
 }

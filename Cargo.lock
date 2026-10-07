@@ -228,7 +228,7 @@ dependencies = [
 [[package]]
 name = "cqlt"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-foss/cqlt?rev=e6275c5373954ca7f3b4fc680ffaccc149dc32f6#e6275c5373954ca7f3b4fc680ffaccc149dc32f6"
+source = "git+https://git.corbet.ch/corbet-cid/cqlt?rev=e6275c5373954ca7f3b4fc680ffaccc149dc32f6#e6275c5373954ca7f3b4fc680ffaccc149dc32f6"
 dependencies = [
  "serde",
  "serde_json",

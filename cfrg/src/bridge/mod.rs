@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Args)]
@@ -472,8 +472,23 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(root.join("lock"))?;
-        lock.try_lock()
-            .map_err(|_| failure("Bridge state is busy; no work started"))?;
+        // A lock can outlive its owner for a moment: a child that another thread
+        // forked before this one closed the file still holds a copy of the open file
+        // description until it executes. Wait out that window; a second writer that
+        // really holds the lock keeps it and is refused after the wait.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(failure("Bridge state is busy; no work started"));
+                }
+                Err(TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,

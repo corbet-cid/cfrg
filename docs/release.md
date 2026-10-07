@@ -39,7 +39,7 @@ pkgs.fetchurl { url = "<url>"; hash = "sha256-..."; executable = true; }
 ```json
 {"schema": 1, "forge": "forgejo",
  "endpoint": {"origin": "https://forge.corbet.ch", "token_env": "CFRG_RELEASE_TOKEN"},
- "owner": "corbet-libs", "package": "cfrg"}
+ "owner": "corbet-cid", "package": "cfrg"}
 ```
 
 The token needs package write for the owner. Other forges answer `unsupported`

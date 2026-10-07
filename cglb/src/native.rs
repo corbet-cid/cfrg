@@ -265,13 +265,28 @@ pub fn forget_key(io: &mut dyn Transport, dest: &Destination, remote_name: &str)
     Err("Deploy key pagination bound exceeded".into())
 }
 
-/// Strict verification includes every overlapping rule: GitLab uses the most
-/// permissive matching rule. We protect all branches, including the default.
-pub fn exclusive_rules(values: &[Value], user: u64) -> bool {
-    exclusive_principal(values, "user_id", user)
+/// Which branches a lock covers.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// Every branch (`*`): the freeze that denies all writers, used while a key
+    /// is being enrolled and when a receiver is frozen for a switch.
+    All,
+    /// The default branch only: the receiver lock. GitLab refuses to delete a
+    /// protected branch by push, whatever the pusher may do, so a protected
+    /// non-default branch that the primary deletes would freeze the mirror
+    /// (the push is refused and the stale branch never leaves). Other branches
+    /// stay unprotected: deletions and prunes mirror through.
+    Default(&'a str),
 }
 
-fn exclusive_principal(values: &[Value], field: &str, id: u64) -> bool {
+/// Strict verification includes every overlapping rule: GitLab uses the most
+/// permissive matching rule. The receiver lock is exactly one rule, the one of
+/// the default branch.
+pub fn exclusive_rules(values: &[Value], user: u64, default_branch: &str) -> bool {
+    exclusive_principal(values, "user_id", user, Scope::Default(default_branch))
+}
+
+fn exclusive_principal(values: &[Value], field: &str, id: u64, scope: Scope) -> bool {
     let only = |levels: &Value, push: bool| {
         levels.as_array().is_some_and(|rows| {
             !rows.is_empty()
@@ -288,13 +303,20 @@ fn exclusive_principal(values: &[Value], field: &str, id: u64) -> bool {
                 })
         })
     };
+    let covers = |name: &Value| match scope {
+        Scope::All => name == "*",
+        Scope::Default(branch) => name == branch,
+    };
     values.iter().any(|v| {
-        v["name"] == "*"
+        covers(&v["name"])
             && v["push_access_levels"]
                 .as_array()
                 .is_some_and(|a| a.iter().any(|r| r[field] == id))
     }) && values.iter().all(|v| {
-        v["allow_force_push"] == true
+        // A rule of another name is never part of the lock. For the default
+        // branch it is a foreign protection that would block pruning.
+        (matches!(scope, Scope::All) || covers(&v["name"]))
+            && v["allow_force_push"] == true
             && only(&v["push_access_levels"], true)
             && only(&v["merge_access_levels"], false)
     })
@@ -336,12 +358,24 @@ pub(crate) fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Va
     Err("GitLab protection pagination exceeded".into())
 }
 
-pub fn protect(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<bool> {
+pub fn protect(
+    io: &mut dyn Transport,
+    dest: &Destination,
+    default_branch: &str,
+    apply: bool,
+) -> Result<bool> {
     let user: u64 = dest
         .mirror_user
         .parse()
         .map_err(|_| "GitLab mirror_user must be numeric user ID")?;
-    protect_principal(io, dest, apply, "user_id", user)
+    protect_principal(
+        io,
+        dest,
+        apply,
+        "user_id",
+        user,
+        Scope::Default(default_branch),
+    )
 }
 
 pub fn finalize_default_branch(
@@ -398,17 +432,96 @@ fn protect_principal(
     apply: bool,
     field: &str,
     id: u64,
+    scope: Scope,
 ) -> Result<bool> {
     let current = rules(io, dest)?;
-    if exclusive_principal(&current, field, id) {
+    if exclusive_principal(&current, field, id, scope) {
         return Ok(true);
     }
     if !apply {
         return Ok(false);
     }
-    // Updating existing protection is possible without an unprotected interval.
-    // Never delete protection to make a write succeed, and never widen to a role.
-    for rule in &current {
+    match scope {
+        Scope::All => {
+            // Updating existing protection is possible without an unprotected interval.
+            // Never delete protection to make a write succeed, and never widen to a role.
+            narrow_rules(io, dest, field, id, current.iter())?;
+            if !current.iter().any(|r| r["name"] == "*") {
+                create_rule(io, dest, field, id, "*")?;
+            }
+        }
+        Scope::Default(branch) => {
+            narrow_rules(
+                io,
+                dest,
+                field,
+                id,
+                current.iter().filter(|r| r["name"] == branch),
+            )?;
+            if !current.iter().any(|r| r["name"] == branch) {
+                create_rule(io, dest, field, id, branch)?;
+            }
+            // Only once the default branch is locked to the principal are the other
+            // rules removed (the wildcard of the earlier lock, a branch protected
+            // for an earlier default, GitLab's own rule for a pushed branch). The
+            // branches they covered are plain unprotected branches afterwards.
+            let locked = rules(io, dest)?;
+            if !exclusive_principal(
+                &locked
+                    .iter()
+                    .filter(|r| r["name"] == branch)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                field,
+                id,
+                scope,
+            ) {
+                return Err(
+                    "GitLab did not enforce exclusive mirror user (tier capability); no mirror enabled"
+                        .into(),
+                );
+            }
+            for rule in locked.iter().filter(|r| r["name"] != branch) {
+                let name = rule["name"]
+                    .as_str()
+                    .ok_or("Missing protected branch name")?;
+                expect(
+                    call(
+                        io,
+                        dest,
+                        "DELETE",
+                        format!(
+                            "/projects/{}/protected_branches/{}",
+                            encode(&dest.path),
+                            encode(name)
+                        ),
+                        None,
+                        false,
+                    )?,
+                    &[204],
+                )?;
+            }
+        }
+    }
+    if !exclusive_principal(&rules(io, dest)?, field, id, scope) {
+        return Err(
+            "GitLab did not enforce exclusive mirror user (tier capability); no mirror enabled"
+                .into(),
+        );
+    }
+    Ok(true)
+}
+
+/// Update `rules` in place so that only the principal may push, nobody may merge
+/// and force-push is on.
+fn narrow_rules<'a>(
+    io: &mut dyn Transport,
+    dest: &Destination,
+    field: &str,
+    id: u64,
+    list: impl Iterator<Item = &'a Value>,
+) -> Result<()> {
+    for rule in list {
         let name = rule["name"]
             .as_str()
             .ok_or("Missing protected branch name")?;
@@ -440,30 +553,32 @@ fn protect_principal(
             &[200],
         )?;
     }
-    if !current.iter().any(|r| r["name"] == "*") {
-        let mut body = json!({"name":"*", "allow_force_push":true, "push_access_level":0, "merge_access_level":0});
-        if field != "access_level" {
-            body["allowed_to_push"] = json!([{field:id}]);
-        }
-        expect(
-            call(
-                io,
-                dest,
-                "POST",
-                format!("/projects/{}/protected_branches", encode(&dest.path)),
-                Some(body),
-                false,
-            )?,
-            &[201],
-        )?;
+    Ok(())
+}
+
+fn create_rule(
+    io: &mut dyn Transport,
+    dest: &Destination,
+    field: &str,
+    id: u64,
+    name: &str,
+) -> Result<()> {
+    let mut body = json!({"name":name, "allow_force_push":true, "push_access_level":0, "merge_access_level":0});
+    if field != "access_level" {
+        body["allowed_to_push"] = json!([{field:id}]);
     }
-    if !exclusive_principal(&rules(io, dest)?, field, id) {
-        return Err(
-            "GitLab did not enforce exclusive mirror user (tier capability); no mirror enabled"
-                .into(),
-        );
-    }
-    Ok(true)
+    expect(
+        call(
+            io,
+            dest,
+            "POST",
+            format!("/projects/{}/protected_branches", encode(&dest.path)),
+            Some(body),
+            false,
+        )?,
+        &[201],
+    )?;
+    Ok(())
 }
 
 fn access_delta(levels: &Value, field: &str, id: u64) -> Result<Vec<Value>> {
@@ -493,7 +608,7 @@ fn access_delta(levels: &Value, field: &str, id: u64) -> Result<Vec<Value>> {
 
 /// Before the new Forgejo key has write access, deny all branch writers.
 pub fn deny_branch_writes(io: &mut dyn Transport, dest: &Destination) -> Result<()> {
-    protect_principal(io, dest, true, "access_level", 0)?;
+    protect_principal(io, dest, true, "access_level", 0, Scope::All)?;
     Ok(())
 }
 
@@ -502,6 +617,7 @@ pub fn deny_branch_writes(io: &mut dyn Transport, dest: &Destination) -> Result<
 pub fn protect_ssh(
     io: &mut dyn Transport,
     dest: &Destination,
+    default_branch: &str,
     mirror: &Value,
     apply: bool,
 ) -> Result<bool> {
@@ -587,7 +703,14 @@ pub fn protect_ssh(
     {
         return Err("Deploy key capability or identity mismatch".into());
     }
-    protect_principal(io, dest, apply, "deploy_key_id", id)
+    protect_principal(
+        io,
+        dest,
+        apply,
+        "deploy_key_id",
+        id,
+        Scope::Default(default_branch),
+    )
 }
 
 #[cfg(test)]
@@ -611,23 +734,49 @@ mod tests {
     }
     #[test]
     fn permissive_overlapping_rule_prevents_enrollment() {
-        let exact = json!({"name":"*", "allow_force_push":true, "push_access_levels":[{"user_id":7}], "merge_access_levels":[{"access_level":0}]});
-        assert!(exclusive_rules(std::slice::from_ref(&exact), 7));
+        let exact = json!({"name":"main", "allow_force_push":true, "push_access_levels":[{"user_id":7}], "merge_access_levels":[{"access_level":0}]});
+        assert!(exclusive_rules(std::slice::from_ref(&exact), 7, "main"));
         let broad = json!({"name":"main", "allow_force_push":true, "push_access_levels":[{"access_level":40}], "merge_access_levels":[{"access_level":0}]});
-        assert!(!exclusive_rules(&[exact, broad], 7));
+        assert!(!exclusive_rules(&[broad], 7, "main"));
+    }
+
+    #[test]
+    fn any_rule_beyond_the_default_branch_breaks_the_lock() {
+        // A wildcard (the earlier lock) or any other protected branch would block
+        // the deletion of a branch by push, even when only the mirror may push.
+        let rule = |name: &str| json!({"name":name, "allow_force_push":true, "push_access_levels":[{"user_id":7}], "merge_access_levels":[{"access_level":0}]});
+        assert!(exclusive_rules(&[rule("main")], 7, "main"));
+        assert!(!exclusive_rules(&[rule("*")], 7, "main"));
+        assert!(!exclusive_rules(&[rule("main"), rule("*")], 7, "main"));
+        assert!(!exclusive_rules(
+            &[rule("main"), rule("release/*")],
+            7,
+            "main"
+        ));
+        // The default branch moved: the rule of the old one is foreign now.
+        assert!(!exclusive_rules(&[rule("master")], 7, "main"));
+        // The everywhere scope is the freeze and still demands the wildcard.
+        assert!(exclusive_principal(&[rule("*")], "user_id", 7, Scope::All));
+        assert!(!exclusive_principal(
+            &[rule("main")],
+            "user_id",
+            7,
+            Scope::All
+        ));
     }
 
     #[test]
     fn deploy_key_and_deny_all_are_exclusive_without_role_fallback() {
-        let key = json!({"name":"*", "allow_force_push":true, "push_access_levels":[{"deploy_key_id":9,"access_level":40}], "merge_access_levels":[{"access_level":0}]});
+        let key = json!({"name":"main", "allow_force_push":true, "push_access_levels":[{"deploy_key_id":9,"access_level":40}], "merge_access_levels":[{"access_level":0}]});
         assert!(exclusive_principal(
             std::slice::from_ref(&key),
             "deploy_key_id",
-            9
+            9,
+            Scope::Default("main")
         ));
-        assert!(!exclusive_rules(&[key], 9));
+        assert!(!exclusive_rules(&[key], 9, "main"));
         let deny = json!({"name":"*", "allow_force_push":true, "push_access_levels":[{"access_level":0}], "merge_access_levels":[{"access_level":0}]});
-        assert!(exclusive_principal(&[deny], "access_level", 0));
+        assert!(exclusive_principal(&[deny], "access_level", 0, Scope::All));
     }
 
     struct Existing;
@@ -810,5 +959,76 @@ mod tests {
         )]);
         forget_key(&mut io, &wanted("team/new", Some("7")), "remote_mirror_old").unwrap();
         assert_eq!(io.asked.len(), 1);
+    }
+
+    fn user_rule(name: &str) -> Value {
+        json!({"name":name, "allow_force_push":true, "push_access_levels":[{"access_level":40,"user_id":9}], "merge_access_levels":[{"access_level":0}]})
+    }
+    fn methods(io: &Script) -> Vec<&'static str> {
+        io.asked.iter().map(|(method, _, _)| *method).collect()
+    }
+
+    #[test]
+    fn the_wildcard_lock_is_narrowed_to_the_default_branch() {
+        // The state of every receiver locked before: the default branch and `*`.
+        let mut io = Script::new(vec![
+            (200, json!([user_rule("main"), user_rule("*")])),
+            (200, json!([])),
+            (200, json!([user_rule("main"), user_rule("*")])),
+            (200, json!([])),
+            (204, Value::Null),
+            (200, json!([user_rule("main")])),
+            (200, json!([])),
+        ]);
+        assert!(protect(&mut io, &wanted("team/new", Some("7")), "main", true).unwrap());
+        assert_eq!(
+            methods(&io),
+            ["GET", "GET", "GET", "GET", "DELETE", "GET", "GET"]
+        );
+        assert_eq!(
+            io.asked[4].1,
+            "/api/v4/projects/team%2Fnew/protected_branches/%2A"
+        );
+    }
+
+    #[test]
+    fn the_default_branch_rule_exists_before_any_other_rule_goes() {
+        // Only the wildcard exists: create the rule of the default branch first.
+        let mut io = Script::new(vec![
+            (200, json!([user_rule("*")])),
+            (200, json!([])),
+            (201, Value::Null),
+            (200, json!([user_rule("*"), user_rule("main")])),
+            (200, json!([])),
+            (204, Value::Null),
+            (200, json!([user_rule("main")])),
+            (200, json!([])),
+        ]);
+        assert!(protect(&mut io, &wanted("team/new", Some("7")), "main", true).unwrap());
+        assert_eq!(
+            methods(&io),
+            ["GET", "GET", "POST", "GET", "GET", "DELETE", "GET", "GET"]
+        );
+        let body = io.asked[2].2.as_ref().unwrap();
+        assert_eq!(body["name"], "main");
+        assert_eq!(body["allowed_to_push"], json!([{"user_id":9}]));
+        assert_eq!(body["allow_force_push"], true);
+    }
+
+    #[test]
+    fn a_planning_run_changes_nothing_and_reports_the_wildcard() {
+        let mut io = Script::new(vec![
+            (200, json!([user_rule("main"), user_rule("*")])),
+            (200, json!([])),
+        ]);
+        assert!(!protect(&mut io, &wanted("team/new", Some("7")), "main", false).unwrap());
+        assert_eq!(methods(&io), ["GET", "GET"]);
+    }
+
+    #[test]
+    fn a_lock_that_is_already_narrow_is_left_alone() {
+        let mut io = Script::new(vec![(200, json!([user_rule("main")])), (200, json!([]))]);
+        assert!(protect(&mut io, &wanted("team/new", Some("7")), "main", true).unwrap());
+        assert_eq!(methods(&io), ["GET", "GET"]);
     }
 }

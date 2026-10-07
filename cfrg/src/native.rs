@@ -70,7 +70,8 @@ pub struct Destination {
     /// primary. Set on loading; not part of the file format.
     #[serde(skip)]
     pub recorded_path: String,
-    /// Namespace ID for GitLab; existing project key for Bitbucket.
+    /// Namespace ID for GitLab; existing project key for Bitbucket; the owner
+    /// (organisation) login for GitHub.
     pub namespace: String,
     /// Immutable destination identity once known. Required for existing repos.
     pub repository_id: Option<String>,
@@ -93,6 +94,7 @@ pub struct Destination {
 pub enum Provider {
     Gitlab,
     Bitbucket,
+    Github,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -266,6 +268,18 @@ impl Placement {
                     ));
                 }
                 env_name(&dest.password_env)?;
+                if dest.provider == Provider::Github {
+                    // GitHub is a mirror destination only, in an organisation that
+                    // owns the path, reached through its one API origin.
+                    let owner = dest.path.split('/').next().unwrap_or_default();
+                    if dest.endpoint.origin != "https://api.github.com"
+                        || !dest.namespace.eq_ignore_ascii_case(owner)
+                    {
+                        return Err(failure(
+                            "GitHub destinations use https://api.github.com and name their owner as namespace",
+                        ));
+                    }
+                }
                 if dest.use_ssh && dest.provider != Provider::Gitlab {
                     return Err(failure("SSH enrollment requires GitLab deploy keys"));
                 }
@@ -445,6 +459,32 @@ mod tests {
         let placement = Placement::from_document(followers_document(good).as_bytes()).unwrap();
         placement.validate().unwrap();
         assert!(placement.repositories[0].destinations[2].pinned());
+    }
+
+    #[test]
+    fn a_github_destination_names_its_owner_and_its_one_api_origin() {
+        let document = |origin: &str, namespace: &str| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[
+                {{"path":"team/repo","source_id":1,"private":false,"default_branch":"main","content":"native-git","hold":null,"destinations":[
+                  {{"provider":"github","endpoint":{{"origin":"{origin}","token_env":"G"}},"namespace":"{namespace}","repository_id":"7","mirror_user":"bot","password_env":"G","interval_seconds":3600,"hold":null,"remote_name":null}}
+                ]}}]}}"#
+            )
+        };
+        let good = Placement::from_document(document("https://api.github.com", "Team").as_bytes())
+            .unwrap();
+        good.validate().unwrap();
+        assert_eq!(
+            good.repositories[0].destinations[0].provider,
+            Provider::Github
+        );
+        for bad in [
+            document("https://github.com", "team"),
+            document("https://api.github.com", "other"),
+        ] {
+            let placement = Placement::from_document(bad.as_bytes()).unwrap();
+            assert!(placement.validate().is_err());
+        }
     }
 
     #[test]
