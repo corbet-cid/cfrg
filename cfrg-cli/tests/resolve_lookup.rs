@@ -681,8 +681,14 @@ fn declared_placement_routes_primary_and_preserves_foreign_pins() {
     request["primary_source"]["placement_file"] = json!(placement);
     for (primaries, expected) in [
         (json!({}), "routed"),
-        (json!({"acme/widget":"https://github.com"}), "pointer"),
-        (json!({"acme/widget":"https://unknown.example"}), "pointer"),
+        (
+            json!({"acme/widget":"https://github.com"}),
+            "canonical-pointer",
+        ),
+        (
+            json!({"acme/widget":"https://unknown.example"}),
+            "canonical-pointer",
+        ),
     ] {
         fs::write(
             &placement,
@@ -710,10 +716,16 @@ fn declared_placement_routes_primary_and_preserves_foreign_pins() {
         r#"{"version":2,"default":"https://home.example","primaries":{}}"#,
     ] {
         fs::write(&placement, invalid).unwrap();
-        assert_eq!(resolve(&request)["decisions"][0]["outcome"], "pointer");
+        assert_eq!(
+            resolve(&request)["decisions"][0]["outcome"],
+            "canonical-pointer"
+        );
     }
     fs::remove_file(&placement).unwrap();
-    assert_eq!(resolve(&request)["decisions"][0]["outcome"], "pointer");
+    assert_eq!(
+        resolve(&request)["decisions"][0]["outcome"],
+        "canonical-pointer"
+    );
 }
 
 /// Emergency fallback through the real executable: a dead canonical pointer
