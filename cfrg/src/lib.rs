@@ -13,7 +13,7 @@
 //! ([`process`], Git, curl) and the paced [`access::apply_plan`] executor
 //! (stops on the first 401/403/429/402, records state) carry the side
 //! effects. The binary maps these modules to
-//! `cfrg validate/plan/decide/clone/sync/status/bridge/collect/access`.
+//! `cfrg validate/plan/decide/clone/sync/status/bridge/collect/contents/observe/access`.
 
 #![forbid(unsafe_code)]
 
@@ -29,9 +29,11 @@ pub type Environment = BTreeMap<OsString, OsString>;
 pub mod access;
 pub mod bridge;
 pub mod collect;
+pub mod contents;
 pub mod land;
 pub mod model;
 pub mod native;
+pub mod observe;
 pub mod placement;
 pub mod process;
 pub mod profile;

@@ -1,4 +1,4 @@
-//! The `cfrg` command line: placement, sync, status, bridge, collect, access.
+//! The `cfrg` command line: placement, sync, status, bridge, collect, contents, access.
 
 #![forbid(unsafe_code)]
 
@@ -21,8 +21,10 @@ use std::{
     time::Duration,
 };
 
+mod contents;
 mod land;
 mod native;
+mod observe;
 mod release;
 mod resolve;
 mod serve;
@@ -115,6 +117,11 @@ enum Action {
     Status(cfrg::status::Options),
     Bridge(cfrg::bridge::Options),
     Collect(cfrg::collect::Options),
+    /// Read named root files of repository branches through the forge API, never by clone.
+    /// The query is one JSON document on standard input.
+    Contents(contents::Options),
+    /// Read-only facts about a repository: the head of a branch, the statuses of a commit.
+    Observe(observe::Options),
     SourceRevision,
     /// Resolve declared stores for one request (pure clmr selection over
     /// bounded probes); prints response JSON or rendered git config.
@@ -390,6 +397,7 @@ fn run(action: Action) -> Result<()> {
         Action::Native(options) => native::run(options)?,
         Action::Land(options) => land::run(options)?,
         Action::Release(options) => release::run(options)?,
+        Action::Observe(options) => observe::run(options)?,
         Action::Serve(options) => serve::run(options)?,
         Action::Validate { policy } => {
             let policy = read(policy)?;
@@ -522,6 +530,7 @@ fn run(action: Action) -> Result<()> {
         Action::Status(_)
         | Action::Bridge(_)
         | Action::Collect(_)
+        | Action::Contents(_)
         | Action::SourceRevision
         | Action::Resolve { .. }
         | Action::CredentialHelper { .. } => return Err("dispatched directly by main".into()),
@@ -641,6 +650,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Action::Contents(options) => match contents::run(options) {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("cfrg contents: {error}");
+                ExitCode::from(2)
+            }
+        },
         Action::SourceRevision => {
             println!("{}", cfrg::SOURCE_REVISION);
             ExitCode::SUCCESS

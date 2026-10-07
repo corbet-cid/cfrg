@@ -155,14 +155,16 @@ fn hand_over(policy: &Policy, state_dir: &Path, repository: &str, branch: &str) 
 pub fn capabilities() -> Value {
     let row = |land: cfrg::land::Capability,
                release: cfrg::land::Capability,
-               serve: cfrg::land::Capability| {
-        json!({"land": land, "release": release, "serve": serve})
+               serve: cfrg::land::Capability,
+               contents: cfrg::land::Capability,
+               observe: cfrg::land::Capability| {
+        json!({"land": land, "release": release, "serve": serve, "contents": contents, "observe": observe})
     };
     json!({
-        "forgejo": row(cfgj::land::LAND, cfgj::land::RELEASE, cfgj::hooks::SERVE),
-        "gitlab": row(cglb::LAND, cglb::RELEASE, cglb::SERVE),
-        "bitbucket": row(cbkt::LAND, cbkt::RELEASE, cbkt::SERVE),
-        "github": row(cghb::LAND, cghb::RELEASE, cghb::SERVE),
+        "forgejo": row(cfgj::land::LAND, cfgj::land::RELEASE, cfgj::hooks::SERVE, cfgj::contents::CONTENTS, cfgj::land::OBSERVE),
+        "gitlab": row(cglb::LAND, cglb::RELEASE, cglb::SERVE, cglb::CONTENTS, cglb::OBSERVE),
+        "bitbucket": row(cbkt::LAND, cbkt::RELEASE, cbkt::SERVE, cbkt::CONTENTS, cbkt::OBSERVE),
+        "github": row(cghb::LAND, cghb::RELEASE, cghb::SERVE, cghb::CONTENTS, cghb::OBSERVE),
     })
 }
 

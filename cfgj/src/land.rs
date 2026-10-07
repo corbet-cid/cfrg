@@ -20,9 +20,11 @@
 use cfrg::{
     land::{branch_name, commit_id, Capability, Entry, LandTarget, Merge, Support, MARKER},
     native::{
+        encode,
         http::{expect, Auth, Request, Response, Transport},
         path, Endpoint,
     },
+    observe::Observe,
     release::{Artifact, ReleaseTarget},
     status::State,
     Result,
@@ -32,6 +34,11 @@ use serde_json::{json, Value};
 pub const LAND: Capability = Capability {
     support: Support::NativeFill,
     note: "native: pull request, merge-when-checks-succeed, fast-forward-only merge, server-side rebase, status-gated branch protection; cfrg fills: one queue per repository, rebase and retest when the base moved, merging a head that is already green",
+};
+
+pub const OBSERVE: Capability = Capability {
+    support: Support::Native,
+    note: "native: branch head and combined commit status of the repository",
 };
 
 pub const RELEASE: Capability = Capability {
@@ -128,6 +135,26 @@ impl<'a> Land<'a> {
         let scope = self.scope();
         self.io.resolve(&scope)?;
         Ok(pull)
+    }
+}
+
+impl Observe for Land<'_> {
+    fn branch_head(&mut self, branch: &str) -> Result<Option<String>> {
+        branch_name(branch)?;
+        let response = self.call("GET", &format!("/branches/{}", encode(branch)), None)?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        let found = expect(response, &[200])?;
+        let head = found["commit"]["id"]
+            .as_str()
+            .ok_or("Missing branch head")?;
+        commit_id(head)?;
+        Ok(Some(head.to_owned()))
+    }
+
+    fn commit_statuses(&mut self, commit: &str) -> Result<Vec<(String, State)>> {
+        LandTarget::statuses(self, commit)
     }
 }
 
