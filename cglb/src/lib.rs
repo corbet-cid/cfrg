@@ -12,6 +12,11 @@
 
 pub mod native;
 
+/// Declared landing and release capability of this adapter. Never guessed:
+/// `unsupported` means the procedure is not implemented here.
+pub const LAND: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented. GitLab Free has auto_merge (PUT merge_requests/:iid/merge), merge_method ff and a rebase API natively (MATRIX P1); merge trains need Premium, so a serial queue would be cfrg-side");
+pub const RELEASE: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented. GitLab has release links and a generic package registry natively (MATRIX P3); a release adapter would publish to the registry and link it");
+
 use cfrg::{
     access::{Call, Grants, RoleMap},
     bridge::{

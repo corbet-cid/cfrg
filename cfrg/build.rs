@@ -17,4 +17,9 @@ fn main() {
         "CFRG_SOURCE_REVISION must be a full lowercase Git commit"
     );
     println!("cargo:rustc-env=CFRG_SOURCE_REVISION={revision}");
+    // The triple names the published release file, so consumers find the right build.
+    println!(
+        "cargo:rustc-env=CFRG_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".into())
+    );
 }

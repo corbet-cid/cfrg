@@ -39,6 +39,30 @@ pub struct Response {
 }
 pub trait Transport {
     fn send(&mut self, request: Request) -> Result<Response>;
+    /// Drop the recorded uncertain-write intent for `scope`. Call only after
+    /// the provider state was read back and the outcome is known.
+    fn resolve(&mut self, _scope: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Minimum spacing, in seconds, between requests. Reads never shorten the
+/// spacing owed after a write or a creation.
+#[derive(Clone, Copy, Debug)]
+pub struct Pacing {
+    pub read: u64,
+    pub write: u64,
+    pub creation: u64,
+}
+
+impl Default for Pacing {
+    fn default() -> Self {
+        Self {
+            read: 2,
+            write: 12,
+            creation: 60,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -75,6 +99,7 @@ pub struct Http {
     pub state: State,
     count: u32,
     apply: bool,
+    pacing: Pacing,
 }
 
 pub fn now() -> Result<u64> {
@@ -107,12 +132,18 @@ impl Http {
                 state,
                 count: 0,
                 apply,
+                pacing: Pacing::default(),
             }),
             Err(e) => {
                 fs::remove_file(&lock_path)?;
                 Err(e.into())
             }
         }
+    }
+    /// Use a tighter or looser request spacing than the conservative default.
+    pub fn paced(mut self, pacing: Pacing) -> Self {
+        self.pacing = pacing;
+        self
     }
     pub fn save(&self) -> Result<()> {
         let parent = self
@@ -168,12 +199,12 @@ impl Transport for Http {
         }
         std::thread::sleep(Duration::from_secs(deadline.saturating_sub(timestamp)));
         let timestamp = now()?;
-        self.state.next_request = timestamp + 2;
+        self.state.next_request = timestamp + self.pacing.read;
         if write {
-            self.state.next_mutation = timestamp + 12;
+            self.state.next_mutation = timestamp + self.pacing.write;
         }
         if request.creation {
-            self.state.next_creation = timestamp + 60;
+            self.state.next_creation = timestamp + self.pacing.creation;
         }
         if write {
             self.state.pending.insert(
@@ -310,6 +341,11 @@ impl Transport for Http {
             Value::Null
         };
         Ok(Response { status, body })
+    }
+
+    fn resolve(&mut self, scope: &str) -> Result<()> {
+        self.state.pending.remove(scope);
+        self.save()
     }
 }
 

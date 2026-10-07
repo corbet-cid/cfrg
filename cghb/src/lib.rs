@@ -12,6 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+/// Declared landing and release capability of this adapter. Never guessed:
+/// `unsupported` means the procedure is not implemented here.
+pub const LAND: cfrg::land::Capability =
+    cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind");
+pub const RELEASE: cfrg::land::Capability =
+    cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind");
+
 use cfrg::{
     access::{Call, Grants, RoleMap},
     collect::{self, EvidenceSource, Transport},

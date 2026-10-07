@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod land;
 pub mod native;
 
 use cfrg::{

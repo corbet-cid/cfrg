@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "forge": "forgejo",
+  "endpoint": {"origin": "https://forge.corbet.ch", "token_env": "CFRG_RELEASE_TOKEN"},
+  "owner": "corbet-libs",
+  "package": "cfrg"
+}

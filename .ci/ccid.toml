@@ -25,3 +25,16 @@ scheduler = "crow"
 checks = ["build"]
 workflow = "repository-jobs"
 command = ["bash", ".ci/run-job.sh"]
+
+# Publishes the binary built from this exact commit to the forge's package
+# registry (`cfrg release`): immutable per commit, fetched by URL and hash.
+# Needs CFRG_RELEASE_TOKEN in the trusted scheduler environment.
+[checks.publish]
+kind = "commands"
+commands = [["cargo", "run", "--release", "--locked", "-p", "cfrg-cli", "--", "release", "--config", ".ci/release.json", "publish", "--self"]]
+
+[jobs.release]
+scheduler = "crow"
+checks = ["publish"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-job.sh"]

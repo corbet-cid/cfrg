@@ -2,13 +2,25 @@
   "schema": 1,
   "generator": "ccid render v1",
   "tool_revision": "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58",
-  "manifest_sha256": "fa7899a84bb9857fbe0b0182ebe6876bcfe7126e422e38d0f9ace445ab5787c0",
+  "manifest_sha256": "d2cb188cd0fca585734743eb5eb734178a888f9f95dba20e7c1ee65f57471b92",
   "jobs": {
     "build": {
       "job": "build",
       "scheduler": "crow",
       "checks": [
         "build"
+      ],
+      "workflow": "repository-jobs",
+      "command": [
+        "bash",
+        ".ci/run-job.sh"
+      ]
+    },
+    "release": {
+      "job": "release",
+      "scheduler": "crow",
+      "checks": [
+        "publish"
       ],
       "workflow": "repository-jobs",
       "command": [

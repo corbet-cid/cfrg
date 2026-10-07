@@ -20,6 +20,8 @@
 use std::{collections::BTreeMap, ffi::OsString, io, sync::atomic::AtomicBool};
 
 pub const SOURCE_REVISION: &str = env!("CFRG_SOURCE_REVISION");
+/// Target triple this binary was compiled for.
+pub const TARGET: &str = env!("CFRG_TARGET");
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type Environment = BTreeMap<OsString, OsString>;
@@ -27,11 +29,13 @@ pub type Environment = BTreeMap<OsString, OsString>;
 pub mod access;
 pub mod bridge;
 pub mod collect;
+pub mod land;
 pub mod model;
 pub mod native;
 pub mod placement;
 pub mod process;
 pub mod profile;
+pub mod release;
 pub mod status;
 pub mod sync;
 

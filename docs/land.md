@@ -1,0 +1,89 @@
+# Landing
+
+`cfrg land` makes sure only an exact green commit reaches the default branch.
+The agent that wants a change landed pushes its branch once, runs one command
+and is done.
+
+```sh
+cfrg land --policy land-policy.json --state-dir "$STATE" corbet-libs/cfrg ci/my-change
+```
+
+The command puts the branch in the repository's queue, runs one pass (a branch
+that is already green and current lands right away), starts a detached
+follower when something is still waiting and returns. The follower repeats the
+same pass every `interval_seconds` until the queue is settled; `cfrg land
+--step` runs one pass for a timer or for a future `cfrg serve`.
+
+## Contract
+
+| Rule | How it holds |
+|---|---|
+| Only the exact green commit lands | the merge is fast-forward-only and names the verified head (`head_commit_id`); a moved head is refused by the forge |
+| One queue per repository | the open pull requests carrying the cfrg marker, oldest first; only the head-of-line entry may land or be rebased |
+| Base moved | the forge rebases the branch (`pulls/{n}/update?style=rebase`), the merge is scheduled again for the new head and a retest is requested; it lands only after the new head is green |
+| Conflict | the entry is closed with an explanation; push a rebased branch and land again |
+| Red head | skipped, never blocks the queue; a new push to the branch makes it live again |
+| No agent after the push | the follower needs only the policy file and the token variable |
+
+## Native first (Forgejo 15, verified live)
+
+| Step | Native mechanism | cfrg fills |
+|---|---|---|
+| Review unit | pull request | the marker that makes it a queue entry |
+| Merge when green | `merge_when_checks_succeed` with `Do=fast-forward-only` (201) | fires only on the NEXT success status of the head: never for a head that is already green, never after a rebase, silently never for a stale head, so cfrg schedules it and also merges green heads itself |
+| Linear history | `Do=fast-forward-only` | a stale head would answer 500, so cfrg checks the fresh tip first |
+| Rebase | `POST pulls/{n}/update?style=rebase` (200, 409 on conflict) | queue order and the retest after it |
+| Gate | branch protection with `status_check_contexts` (glob patterns) | declared and reconciled by `cfrg land --protect` |
+| Retest | none (manual-event CI) | `retest` command, or CI that starts from the forge's own events |
+
+The status gate applies to pull request merges only. A user who may push can
+still push to the protected branch directly: enforcement is SOFT and `cfrg land
+--protect` never restricts pushes. (Julian's decision on strictness is pending;
+nothing stricter exists.) Forgejo 15 protected branches always refuse force
+pushes and branch deletion.
+
+## Policy file (JSON, declared in a repository)
+
+```json
+{
+  "schema": 1,
+  "forge": "forgejo",
+  "endpoint": {"origin": "https://forge.corbet.ch", "token_env": "CFRG_LAND_TOKEN"},
+  "contexts": ["ci/*"],
+  "interval_seconds": 30,
+  "follow_seconds": 14400,
+  "retest": ["ci-retest", "{repository}", "{branch}", "{sha}"],
+  "repositories": [{"path": "corbet-libs/cfrg", "contexts": ["ci/crow/*"]}]
+}
+```
+
+* `contexts`: status context patterns (`*` wildcard); each must match at least
+  one status and every match must be `success` for the exact head. Overridable
+  per repository, together with `retest`.
+* `retest`: optional command, started detached, asked for a CI run of an exact
+  commit when the head has no status yet and after every rebase. Placeholders
+  `{repository}`, `{branch}`, `{sha}`, `{origin}`. Leave it out when CI starts
+  from the forge's push events. The token variable is removed from its
+  environment; it is asked at most twice per commit.
+* The token needs repository write (pull requests, merges) and, for
+  `--protect`, repository admin.
+
+## Modes
+
+| Command | What it does |
+|---|---|
+| `cfrg land REPO BRANCH` | enqueue, one pass, start the follower, return |
+| `cfrg land --step [REPO]` | one idempotent pass (all declared repositories without `REPO`) |
+| `cfrg land --status [REPO]` | read-only queue with each head's verdict |
+| `cfrg land --protect [--apply] [REPO]` | plan or reconcile the status gate on the default branch |
+| `cfrg land --capabilities` | what each forge adapter declares (`native`, `native-fill`, `adapter-only`, `unsupported`) |
+
+State is one directory: request windows and pacing (`http.json`), the journal
+of one-shot effects (`journal.json`) and follower logs. A request state lock
+whose owner process is gone is cleared; a recorded uncertain write is resolved
+by reading the pull request back.
+
+## Other forges
+
+Only Forgejo is implemented; every other adapter answers `unsupported` rather
+than guessing (see `--capabilities`).

@@ -16,6 +16,11 @@
 
 pub mod native;
 
+/// Declared landing and release capability of this adapter. Never guessed:
+/// `unsupported` means the procedure is not implemented here.
+pub const LAND: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented and a status gate is unsupported on Bitbucket Free: merge checks only warn (MATRIX P1); an adapter-only poll-then-merge would be needed");
+pub const RELEASE: cfrg::land::Capability = cfrg::land::Capability::unsupported("unsupported: Bitbucket Free has no releases, downloads or package registry (MATRIX P3); publish to the primary forge instead");
+
 use cfrg::{
     access::{Call, Grants, RoleMap},
     model::{Forge, Level},
