@@ -52,7 +52,8 @@ pushes and branch deletion.
   "contexts": ["ci/*"],
   "interval_seconds": 30,
   "follow_seconds": 14400,
-  "retest": ["ci-retest", "{repository}", "{branch}", "{sha}"],
+  "retest": ["ci-job", "run", "--repo", "{checkout}", "--branch", "{branch}", "--job", "verify"],
+  "landed": ["ci-job", "run", "--repo", "{checkout}", "--branch", "{branch}", "--job", "release"],
   "repositories": [{"path": "corbet-libs/cfrg", "contexts": ["ci/crow/*"]}]
 }
 ```
@@ -60,11 +61,18 @@ pushes and branch deletion.
 * `contexts`: status context patterns (`*` wildcard); each must match at least
   one status and every match must be `success` for the exact head. Overridable
   per repository, together with `retest`.
-* `retest`: optional command, started detached, asked for a CI run of an exact
-  commit when the head has no status yet and after every rebase. Placeholders
-  `{repository}`, `{branch}`, `{sha}`, `{origin}`. Leave it out when CI starts
-  from the forge's push events. The token variable is removed from its
-  environment; it is asked at most twice per commit.
+* `retest`: optional command asked for a CI run of an exact commit when the
+  head has no status yet and after every rebase (at most twice per commit).
+  Leave it out when CI starts from the forge's own push events.
+* `landed`: optional command started when an exact commit has reached the
+  default branch, whether cfrg merged it or the forge did on its own through
+  the scheduled merge (for example the job that publishes the release).
+* Placeholders in both: `{repository}`, `{branch}`, `{sha}`, `{origin}` and
+  `{checkout}`. `{checkout}` is a work clone of the repository that cfrg
+  prepares at exactly that commit (fetched with the token from its
+  environment, never from argv). Hook commands run to completion in order
+  inside a pass, with a ten-minute bound, and get the environment without the
+  token variable; they should only submit work.
 * The token needs repository write (pull requests, merges) and, for
   `--protect`, repository admin.
 
@@ -78,8 +86,13 @@ pushes and branch deletion.
 | `cfrg land --protect [--apply] [REPO]` | plan or reconcile the status gate on the default branch |
 | `cfrg land --capabilities` | what each forge adapter declares (`native`, `native-fill`, `adapter-only`, `unsupported`) |
 
+With `"follow": "serve"` in the policy, `cfrg land REPO BRANCH` only enqueues and
+schedules the native merge; `cfrg serve` (`docs/serve.md`) reacts to the forge's
+events and finishes the landing, so no follower is started.
+
 State is one directory: request windows and pacing (`http.json`), the journal
-of one-shot effects (`journal.json`) and follower logs. A request state lock
+of one-shot effects (`journal.json`), hook output (`hooks.log`), work clones
+(`work/`) and follower logs. A request state lock
 whose owner process is gone is cleared; a recorded uncertain write is resolved
 by reading the pull request back.
 

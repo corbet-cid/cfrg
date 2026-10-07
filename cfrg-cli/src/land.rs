@@ -7,7 +7,7 @@
 //! until the queue is settled; `--step` runs a single pass for a timer or for
 //! `cfrg serve` later. No agent is involved after the push.
 use cfrg::{
-    land::{self, Entry, Hooks, Journal, Policy, Report},
+    land::{self, Entry, Follow, Hooks, Journal, Policy, Report},
     model::Forge,
     native::http::{Http, Pacing},
     process::Runner,
@@ -126,6 +126,12 @@ pub fn run(options: Options) -> Result<()> {
         return follow(&policy, &state_dir, repository);
     }
     let branch = options.branch.as_deref().ok_or("Give the branch to land")?;
+    if policy.follow == Follow::Serve {
+        // `cfrg serve` owns the queue: enqueue, schedule the native merge, go.
+        let report = hand_over(&policy, &state_dir, repository, branch)?;
+        print_report(repository, &report);
+        return Ok(());
+    }
     let report = pass(&policy, &state_dir, repository, Some(branch))?;
     print_report(repository, &report);
     if report.waiting && !options.no_follow {
@@ -134,17 +140,33 @@ pub fn run(options: Options) -> Result<()> {
     Ok(())
 }
 
+fn hand_over(policy: &Policy, state_dir: &Path, repository: &str, branch: &str) -> Result<Report> {
+    let mut http = open_http(state_dir, true)?;
+    let journal_path = state_dir.join("journal.json");
+    let mut journal = Journal::load(&journal_path)?;
+    let result = (|| {
+        let mut target = cfgj::land::Land::new(&policy.endpoint, repository, &mut http)?;
+        land::enqueue(&mut target, &mut journal, repository, branch)
+    })();
+    journal.save(&journal_path)?;
+    result
+}
+
 pub fn capabilities() -> Value {
-    let row = |land: cfrg::land::Capability, release: cfrg::land::Capability| json!({"land": land, "release": release});
+    let row = |land: cfrg::land::Capability,
+               release: cfrg::land::Capability,
+               serve: cfrg::land::Capability| {
+        json!({"land": land, "release": release, "serve": serve})
+    };
     json!({
-        "forgejo": row(cfgj::land::LAND, cfgj::land::RELEASE),
-        "gitlab": row(cglb::LAND, cglb::RELEASE),
-        "bitbucket": row(cbkt::LAND, cbkt::RELEASE),
-        "github": row(cghb::LAND, cghb::RELEASE),
+        "forgejo": row(cfgj::land::LAND, cfgj::land::RELEASE, cfgj::hooks::SERVE),
+        "gitlab": row(cglb::LAND, cglb::RELEASE, cglb::SERVE),
+        "bitbucket": row(cbkt::LAND, cbkt::RELEASE, cbkt::SERVE),
+        "github": row(cghb::LAND, cghb::RELEASE, cghb::SERVE),
     })
 }
 
-fn require_land(forge: Forge) -> Result<()> {
+pub(crate) fn require_land(forge: Forge) -> Result<()> {
     let capability = match forge {
         Forge::Forgejo => return Ok(()),
         Forge::Gitlab => cglb::LAND,
@@ -158,7 +180,7 @@ fn require_land(forge: Forge) -> Result<()> {
     .into())
 }
 
-fn print_report(repository: &str, report: &Report) {
+pub(crate) fn print_report(repository: &str, report: &Report) {
     for event in &report.events {
         println!("{event}");
     }
@@ -170,7 +192,7 @@ fn print_report(repository: &str, report: &Report) {
 
 /// Open the request state, waiting for a concurrent pass and clearing a lock
 /// whose owner no longer exists.
-fn open_http(state_dir: &Path, apply: bool) -> Result<Http> {
+pub(crate) fn open_http(state_dir: &Path, apply: bool) -> Result<Http> {
     let path = state_dir.join("http.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -232,7 +254,8 @@ impl Hook {
                 format!("Authorization: token {token}").into(),
             );
         }
-        Runner::new(cwd.to_path_buf(), env, HOOK_TIMEOUT)
+        // Command events go to stderr so stdout stays one JSON event per line.
+        Ok(Runner::new(cwd.to_path_buf(), env, HOOK_TIMEOUT)?.with_stderr_events())
     }
 
     /// A persistent work clone of the repository, at exactly the entry head.
@@ -321,7 +344,7 @@ fn detach(_command: Command) -> Result<std::process::Child> {
 
 /// Run `f` against the repository's forge target with the journal loaded and
 /// saved around it. The request state is held only for the duration of `f`.
-fn pass(
+pub(crate) fn pass(
     policy: &Policy,
     state_dir: &Path,
     repository: &str,

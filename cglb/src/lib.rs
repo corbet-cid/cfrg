@@ -16,6 +16,7 @@ pub mod native;
 /// `unsupported` means the procedure is not implemented here.
 pub const LAND: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented. GitLab Free has auto_merge (PUT merge_requests/:iid/merge), merge_method ff and a rebase API natively (MATRIX P1); merge trains need Premium, so a serial queue would be cfrg-side");
 pub const RELEASE: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented. GitLab has release links and a generic package registry natively (MATRIX P3); a release adapter would publish to the registry and link it");
+pub const SERVE: cfrg::land::Capability = cfrg::land::Capability::unsupported("not implemented. GitLab Free has project webhooks natively (push, merge request events, token or signing token); no group hooks, so a reconcile sweep stays needed (MATRIX P4)");
 
 use cfrg::{
     access::{Call, Grants, RoleMap},

@@ -4,7 +4,10 @@ use cfrg::{
 };
 use clap::{Args, ValueEnum};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Args)]
 pub struct Options {
@@ -35,6 +38,39 @@ enum Operation {
 }
 
 pub fn run(options: Options) -> Result<()> {
+    let (report, incomplete, result) = execute(&options)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({"complete":!incomplete && result.is_ok(), "repositories":report})
+        )?
+    );
+    result?;
+    if incomplete && options.apply {
+        return Err("Native placement contains incomplete destinations or exceptions".into());
+    }
+    Ok(())
+}
+
+/// Read-only verification of the declared push mirrors of one repository (or
+/// all): source identity and the state of every mirror, nothing changed. Used
+/// by `cfrg serve`.
+pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Result<Value> {
+    let options = Options {
+        placement: placement.into(),
+        state: state.into(),
+        repository: repository.map(String::from),
+        provider: None,
+        existing_only: false,
+        operation: Operation::Status,
+        apply: false,
+    };
+    let (report, incomplete, result) = execute(&options)?;
+    result?;
+    Ok(json!({"complete": !incomplete, "repositories": report}))
+}
+
+fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     let placement: Placement = serde_json::from_slice(&fs::read(&options.placement)?)?;
     placement.validate()?;
     if options.apply && matches!(options.operation, Operation::Plan | Operation::Status) {
@@ -282,17 +318,7 @@ pub fn run(options: Options) -> Result<()> {
         }
         Ok(())
     })();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(
-            &json!({"complete":!incomplete && result.is_ok(), "repositories":report})
-        )?
-    );
-    result?;
-    if incomplete && options.apply {
-        return Err("Native placement contains incomplete destinations or exceptions".into());
-    }
-    Ok(())
+    Ok((report, incomplete, result))
 }
 
 fn all_mirrors_managed(mirrors: &[Value], managed: &[Value]) -> bool {

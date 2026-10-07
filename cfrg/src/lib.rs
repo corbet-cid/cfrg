@@ -36,6 +36,7 @@ pub mod placement;
 pub mod process;
 pub mod profile;
 pub mod release;
+pub mod serve;
 pub mod status;
 pub mod sync;
 

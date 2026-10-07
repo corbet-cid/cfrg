@@ -400,6 +400,27 @@ fn request_retest(
     Ok(())
 }
 
+/// Put `branch` in the queue and schedule the native merge, nothing more:
+/// `cfrg serve` reacts to the pull request event and finishes the landing.
+pub fn enqueue(
+    target: &mut dyn LandTarget,
+    journal: &mut Journal,
+    repository: &str,
+    branch: &str,
+) -> Result<Report> {
+    let entry = target.enqueue(branch)?;
+    if journal.schedule(repository, &entry) {
+        target.schedule(&entry)?;
+    }
+    Ok(Report {
+        events: vec![
+            json!({"event":"enqueued","number":entry.number,"branch":entry.branch,"head":entry.head}),
+            json!({"event":"handed-to-serve","number":entry.number}),
+        ],
+        waiting: true,
+    })
+}
+
 /// Put `branch` in the queue and run one pass, so a branch that is already
 /// green and current lands immediately and everything else is scheduled.
 pub fn request(
@@ -450,6 +471,18 @@ pub fn commit_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Who finishes a landing after the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Follow {
+    /// A detached follower process started by `cfrg land` on the same host.
+    #[default]
+    Detached,
+    /// `cfrg serve` owns every queue: the request only enqueues, the forge's
+    /// own events and the serve sweep do the rest.
+    Serve,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Enforcement {
@@ -471,6 +504,10 @@ pub struct Policy {
     pub contexts: Vec<String>,
     #[serde(default)]
     pub enforcement: Enforcement,
+    #[serde(default)]
+    pub follow: Follow,
+    /// The long-running mode (`cfrg serve`).
+    pub serve: Option<crate::serve::ServePolicy>,
     /// Seconds between passes of the unattended follower.
     #[serde(default = "default_interval")]
     pub interval_seconds: u64,
@@ -525,6 +562,12 @@ impl Policy {
         patterns(&self.contexts)?;
         command(&self.retest)?;
         command(&self.landed)?;
+        if let Some(serve) = &self.serve {
+            serve.validate()?;
+        }
+        if self.follow == Follow::Serve && self.serve.is_none() {
+            return Err(failure("follow = serve needs a serve block"));
+        }
         if !(5..=3600).contains(&self.interval_seconds)
             || !(60..=172_800).contains(&self.follow_seconds)
         {
@@ -899,6 +942,36 @@ mod tests {
         assert_eq!(fake.log, ["merge 2@h2"]);
         assert!(report.events.iter().any(|e| e["event"] == "failed"));
         assert!(!report.waiting);
+    }
+
+    #[test]
+    fn handing_over_only_enqueues_and_schedules_once() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        let mut journal = Journal::default();
+        let report = enqueue(&mut fake, &mut journal, "o/r", "b1").unwrap();
+        enqueue(&mut fake, &mut journal, "o/r", "b1").unwrap();
+        assert_eq!(fake.log, ["enqueue b1", "schedule 1@h1", "enqueue b1"]);
+        assert!(report.waiting);
+        assert_eq!(report.events[1]["event"], "handed-to-serve");
+    }
+
+    #[test]
+    fn follow_serve_needs_a_serve_block() {
+        let base = json!({
+            "schema":1,"forge":"forgejo",
+            "endpoint":{"origin":"https://forge.example","token_env":"TOKEN"},
+            "follow":"serve"
+        });
+        let policy: Policy = serde_json::from_value(base.clone()).unwrap();
+        assert!(policy.validate().is_err());
+        let mut with = base;
+        with["serve"] = json!({"listen":"127.0.0.1:8080","secret_env":"SECRET"});
+        let policy: Policy = serde_json::from_value(with).unwrap();
+        policy.validate().unwrap();
+        assert_eq!(policy.follow, Follow::Serve);
     }
 
     #[test]

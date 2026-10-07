@@ -25,6 +25,7 @@ mod land;
 mod native;
 mod release;
 mod resolve;
+mod serve;
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +45,8 @@ enum Action {
     Land(land::Options),
     /// Publish a build artifact for an exact commit; consumers fetch it by URL and hash.
     Release(release::Options),
+    /// Long-running mode: signed webhooks and a periodic reconcile drive landing and mirror verification.
+    Serve(serve::Options),
     /// Validate all placements, costs, primary CI/forge relationships and rules.
     Validate {
         #[arg(long)]
@@ -387,6 +390,7 @@ fn run(action: Action) -> Result<()> {
         Action::Native(options) => native::run(options)?,
         Action::Land(options) => land::run(options)?,
         Action::Release(options) => release::run(options)?,
+        Action::Serve(options) => serve::run(options)?,
         Action::Validate { policy } => {
             let policy = read(policy)?;
             println!(

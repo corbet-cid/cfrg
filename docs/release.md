@@ -44,3 +44,17 @@ pkgs.fetchurl { url = "<url>"; hash = "sha256-..."; executable = true; }
 
 The token needs package write for the owner. Other forges answer `unsupported`
 (`cfrg land --capabilities` prints the declared support).
+
+## Automatic publication
+
+* The repository declares a `release` job in `.ci/ccid.toml` whose check runs
+  `cfrg release publish --self` on the freshly built binary (cfrg itself does
+  this; see its manifest).
+* After a commit lands, the landing policy's `landed` command starts that job
+  for the exact landed commit (`docs/land.md`).
+* The job needs `CFRG_RELEASE_TOKEN` in the trusted scheduler environment: a
+  token that can only write packages for the owner. It must never reach a
+  contributed workflow file.
+* Consumers that run `cfrg` or `ccid` fetch the printed URL by hash instead of
+  a manual install under `/workspaces/ci-tools`.
+

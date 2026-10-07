@@ -21,7 +21,7 @@ cfrg access plan --identities identities.toml --baseline state.json \
 ```
 
 See [repository placement](docs/repository-policy.md),
-[reconciliation](docs/forge-sync.md), [native statuses](docs/native-status.md), [landing](docs/land.md), [release](docs/release.md),
+[reconciliation](docs/forge-sync.md), [native statuses](docs/native-status.md), [landing](docs/land.md), [serve](docs/serve.md), [release](docs/release.md),
 [contribution bridge](docs/pr-bridge.md), [evidence collection](docs/collect.md)
 and [access mirroring](docs/access-sync.md).
 

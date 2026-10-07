@@ -18,6 +18,8 @@ pub const LAND: cfrg::land::Capability =
     cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind");
 pub const RELEASE: cfrg::land::Capability =
     cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind");
+pub const SERVE: cfrg::land::Capability =
+    cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind");
 
 use cfrg::{
     access::{Call, Grants, RoleMap},
