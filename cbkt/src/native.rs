@@ -8,7 +8,7 @@ use cfrg::{
 };
 use serde_json::{json, Value};
 
-fn call(
+pub(crate) fn call(
     io: &mut dyn Transport,
     dest: &Destination,
     method: &'static str,
@@ -89,7 +89,7 @@ pub fn ensure_destination_repo(
     Ok(Some(verify(value, repo, dest)?))
 }
 
-fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
+pub(crate) fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     for page in 1..=20 {
         let value = expect(
@@ -121,6 +121,12 @@ fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
 }
 
 pub fn exclusive_rules(values: &[Value], user: &str) -> bool {
+    exclusive_for(values, &[user])
+}
+
+/// Exactly two rules over every branch: pushes only for `users` (nobody when
+/// empty), merges for nobody.
+pub fn exclusive_for(values: &[Value], users: &[&str]) -> bool {
     if values.len() != 2 {
         return false;
     }
@@ -132,7 +138,8 @@ pub fn exclusive_rules(values: &[Value], user: &str) -> bool {
                 && r["groups"].as_array().is_some_and(Vec::is_empty)
                 && r["users"].as_array().is_some_and(|a| {
                     if *kind == "push" {
-                        a.len() == 1 && a[0]["uuid"] == user
+                        a.len() == users.len()
+                            && users.iter().all(|u| a.iter().any(|x| x["uuid"] == *u))
                     } else {
                         a.is_empty()
                     }
@@ -144,10 +151,25 @@ pub fn exclusive_rules(values: &[Value], user: &str) -> bool {
 }
 
 pub fn protect(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<bool> {
-    let pipelines = expect(
-        call(io, dest, "GET", "/pipelines_config", None, false)?,
-        &[200],
-    )?;
+    restrict(io, dest, apply, &[dest.mirror_user.as_str()])
+}
+
+/// Lock every branch: pushes only for `users` (nobody when empty), merges for
+/// nobody. Pipelines are switched off first.
+pub fn restrict(
+    io: &mut dyn Transport,
+    dest: &Destination,
+    apply: bool,
+    users: &[&str],
+) -> Result<bool> {
+    // A repository without a single commit has no pipelines configuration yet
+    // (404): there is nothing to switch off.
+    let response = call(io, dest, "GET", "/pipelines_config", None, false)?;
+    let pipelines = if response.status == 404 {
+        json!({"enabled": false})
+    } else {
+        expect(response, &[200])?
+    };
     if pipelines["enabled"] != false {
         if !apply {
             return Ok(false);
@@ -168,7 +190,7 @@ pub fn protect(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Resul
         }
     }
     let current = rules(io, dest)?;
-    if exclusive_rules(&current, &dest.mirror_user) {
+    if exclusive_for(&current, users) {
         return Ok(true);
     }
     if !apply {
@@ -187,7 +209,7 @@ pub fn protect(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Resul
             return Err("Duplicate Bitbucket restriction".into());
         }
         let payload = json!({"kind":kind, "branch_match_kind":"glob", "pattern":"*", "groups":[],
-            "users": if kind == "push" { vec![json!({"uuid":dest.mirror_user})] } else { vec![] }});
+            "users": if kind == "push" { users.iter().map(|u| json!({"uuid":u})).collect() } else { vec![] }});
         let (method, suffix) = match matches.first() {
             Some(rule) => (
                 "PUT",
@@ -203,7 +225,7 @@ pub fn protect(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Resul
             &[200, 201],
         )?;
     }
-    if !exclusive_rules(&rules(io, dest)?, &dest.mirror_user) {
+    if !exclusive_for(&rules(io, dest)?, users) {
         return Err("Bitbucket exclusive protection verification failed".into());
     }
     Ok(true)
@@ -259,6 +281,18 @@ pub fn finalize_default_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_freeze_is_a_push_rule_without_users_and_a_named_user_still_locks() {
+        let push = |users: Value| json!({"kind":"push","branch_match_kind":"glob","pattern":"*","groups":[],"users":users});
+        let merge = json!({"kind":"restrict_merges","branch_match_kind":"glob","pattern":"*","groups":[],"users":[]});
+        assert!(exclusive_for(&[push(json!([])), merge.clone()], &[]));
+        assert!(!exclusive_for(
+            &[push(json!([{"uuid":"{a}"}])), merge.clone()],
+            &[]
+        ));
+        assert!(!exclusive_for(&[push(json!([])), merge], &["{a}"]));
+    }
+
     #[test]
     fn mirror_principal_only_and_force_delete_holds() {
         let push = json!({"kind":"push","branch_match_kind":"glob","pattern":"*","groups":[],"users":[{"uuid":"{mirror}"}]});

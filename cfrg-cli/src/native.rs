@@ -71,7 +71,7 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
 }
 
 fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
-    let placement: Placement = serde_json::from_slice(&fs::read(&options.placement)?)?;
+    let placement = Placement::from_document(&fs::read(&options.placement)?)?;
     placement.validate()?;
     if options.apply && matches!(options.operation, Operation::Plan | Operation::Status) {
         return Err("Plan and status cannot apply changes".into());
@@ -93,6 +93,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 .as_ref()
                 .is_some_and(|path| *path != repo.path)
             {
+                continue;
+            }
+            if placement.primary_of(&repo.path) != placement.source.origin.trim_end_matches('/') {
+                // The placement moved this repository's primary elsewhere: Forgejo
+                // is a receiver now, and `cfrg switch` owns its mirrors.
+                report.push(json!({"source":repo.path, "state":"primary-elsewhere"}));
                 continue;
             }
             let source_held = repo.hold.is_some()

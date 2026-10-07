@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "generator": "ccid render v1",
-  "tool_revision": "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58",
-  "manifest_sha256": "d2cb188cd0fca585734743eb5eb734178a888f9f95dba20e7c1ee65f57471b92",
+  "tool_revision": "78a4e05b4e1cb25aaeba3966951564d74277bcbd",
+  "manifest_sha256": "562d9bbee84ae0c91022fc6a5728b5954a1240446bcc34c32fad53d1a30abfbb",
   "jobs": {
     "build": {
       "job": "build",
@@ -26,6 +26,9 @@
       "command": [
         "bash",
         ".ci/run-job.sh"
+      ],
+      "secrets": [
+        "CFRG_RELEASE_TOKEN"
       ]
     },
     "verify": {

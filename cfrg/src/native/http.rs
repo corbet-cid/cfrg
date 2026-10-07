@@ -349,6 +349,20 @@ impl Transport for Http {
     }
 }
 
+impl crate::replicate::Ledger for Http {
+    fn owned(&self, key: &str) -> Option<String> {
+        self.state.owned.get(key).cloned()
+    }
+    fn record(&mut self, key: &str, value: &str) -> Result<()> {
+        self.state.owned.insert(key.into(), value.into());
+        self.save()
+    }
+    fn forget(&mut self, key: &str) -> Result<()> {
+        self.state.owned.remove(key);
+        self.save()
+    }
+}
+
 pub fn expect(response: Response, statuses: &[u16]) -> Result<Value> {
     if !statuses.contains(&response.status) {
         return Err(failure(format!(

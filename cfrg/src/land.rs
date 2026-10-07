@@ -93,6 +93,14 @@ pub trait LandTarget {
     /// Native "merge when checks succeed" with fast-forward-only for the exact
     /// head. It fires on the next success status only; it is not a promise.
     fn schedule(&mut self, entry: &Entry) -> Result<()>;
+    /// Whether the forge itself refuses to merge a pull request into the
+    /// default branch unless every one of these status contexts succeeded.
+    /// Only then is the native merge scheduling safe: on a branch without such
+    /// protection the forge treats "no required checks" as success and merges
+    /// a head that has no status at all.
+    fn gated(&mut self, contexts: &[String]) -> Result<bool>;
+    /// Cancel a natively scheduled merge of the entry (none scheduled is fine).
+    fn unschedule(&mut self, entry: &Entry) -> Result<()>;
     /// Native rebase of the entry branch onto the default branch. `None`
     /// means the rebase conflicts and nothing changed.
     fn rebase(&mut self, entry: &Entry) -> Result<Option<Entry>>;
@@ -126,6 +134,10 @@ pub struct Journal {
     pub scheduled: BTreeMap<String, String>,
     #[serde(default)]
     pub retests: BTreeMap<String, u32>,
+    /// Pull requests (`repo#number`) whose native merge scheduling has been
+    /// settled: cancelled where the branch is not status-gated.
+    #[serde(default)]
+    pub settled: BTreeSet<String>,
 }
 
 /// A retest is requested at most this often for the same exact commit.
@@ -180,7 +192,19 @@ impl Journal {
         });
         self.retests
             .retain(|k, _| !k.starts_with(&prefix) || live.contains(k));
+        let numbers: BTreeSet<String> = queue
+            .iter()
+            .map(|e| format!("{prefix}{}", e.number))
+            .collect();
+        self.settled
+            .retain(|k| !k.starts_with(&prefix) || numbers.contains(k));
         gone
+    }
+
+    /// True the first time a pull request is seen.
+    fn settle(&mut self, repository: &str, entry: &Entry) -> bool {
+        self.settled
+            .insert(format!("{repository}#{}", entry.number))
     }
 
     fn schedule(&mut self, repository: &str, entry: &Entry) -> bool {
@@ -267,6 +291,7 @@ pub fn step(
 ) -> Result<Report> {
     const ROUNDS: usize = 16;
     let mut events = Vec::new();
+    let mut gate = None;
     for _ in 0..ROUNDS {
         let queue = target.queue()?;
         for gone in journal.departed(repository, &queue) {
@@ -278,6 +303,15 @@ pub fn step(
                     "forge",
                     &mut events,
                 );
+            }
+        }
+        // A merge the forge scheduled on its own is only allowed where the
+        // forge also enforces the gate; everywhere else cancel it, once per
+        // pull request, so that cfrg alone decides after it saw the status.
+        for entry in &queue {
+            if journal.settle(repository, entry) && !is_gated(target, settings, &mut gate)? {
+                target.unschedule(entry)?;
+                events.push(json!({"event":"native-merge-cancelled","number":entry.number}));
             }
         }
         let mut line: Option<(Entry, State, bool)> = None;
@@ -314,9 +348,8 @@ pub fn step(
                 }
                 Some(fresh) => {
                     events.push(json!({"event":"rebased","number":fresh.number,"branch":fresh.branch,"from":entry.head,"to":fresh.head}));
-                    target.schedule(&fresh)?;
                     journal.unschedule(repository, &entry);
-                    journal.schedule(repository, &fresh);
+                    arm(target, settings, journal, &mut gate, repository, &fresh)?;
                     request_retest(hooks, journal, repository, &fresh, &mut events)?;
                     return Ok(Report {
                         events,
@@ -344,9 +377,7 @@ pub fn step(
                 waiting: true,
             });
         }
-        if journal.schedule(repository, &entry) {
-            target.schedule(&entry)?;
-        }
+        arm(target, settings, journal, &mut gate, repository, &entry)?;
         if no_statuses {
             request_retest(hooks, journal, repository, &entry, &mut events)?;
         }
@@ -360,6 +391,35 @@ pub fn step(
         events,
         waiting: true,
     })
+}
+
+fn is_gated(
+    target: &mut dyn LandTarget,
+    settings: &Settings,
+    cache: &mut Option<bool>,
+) -> Result<bool> {
+    if let Some(known) = *cache {
+        return Ok(known);
+    }
+    let known = target.gated(&settings.contexts)?;
+    *cache = Some(known);
+    Ok(known)
+}
+
+/// Schedule the forge's own merge once per head, but only where the forge
+/// gates the branch on the declared contexts.
+fn arm(
+    target: &mut dyn LandTarget,
+    settings: &Settings,
+    journal: &mut Journal,
+    gate: &mut Option<bool>,
+    repository: &str,
+    entry: &Entry,
+) -> Result<()> {
+    if journal.schedule(repository, entry) && is_gated(target, settings, gate)? {
+        target.schedule(entry)?;
+    }
+    Ok(())
 }
 
 fn announce_landed(
@@ -400,18 +460,22 @@ fn request_retest(
     Ok(())
 }
 
-/// Put `branch` in the queue and schedule the native merge, nothing more:
+/// Put `branch` in the queue and, where the forge gates the branch, schedule
+/// the native merge; nothing more:
 /// `cfrg serve` reacts to the pull request event and finishes the landing.
 pub fn enqueue(
     target: &mut dyn LandTarget,
+    settings: &Settings,
     journal: &mut Journal,
     repository: &str,
     branch: &str,
 ) -> Result<Report> {
     let entry = target.enqueue(branch)?;
-    if journal.schedule(repository, &entry) {
-        target.schedule(&entry)?;
+    let mut gate = None;
+    if journal.settle(repository, &entry) && !is_gated(target, settings, &mut gate)? {
+        target.unschedule(&entry)?;
     }
+    arm(target, settings, journal, &mut gate, repository, &entry)?;
     Ok(Report {
         events: vec![
             json!({"event":"enqueued","number":entry.number,"branch":entry.branch,"head":entry.head}),
@@ -691,6 +755,10 @@ mod tests {
         conflicts: BTreeSet<u64>,
         /// Entries the forge merged on its own, with the landed commit.
         merged: BTreeMap<u64, String>,
+        /// The default branch has no status-gated protection.
+        ungated: bool,
+        /// The branch head moves between verification and merge.
+        moved: bool,
         log: Vec<String>,
         tip: String,
     }
@@ -727,6 +795,13 @@ mod tests {
                 .push(format!("schedule {}@{}", entry.number, entry.head));
             Ok(())
         }
+        fn gated(&mut self, _contexts: &[String]) -> Result<bool> {
+            Ok(!self.ungated)
+        }
+        fn unschedule(&mut self, entry: &Entry) -> Result<()> {
+            self.log.push(format!("unschedule {}", entry.number));
+            Ok(())
+        }
         fn rebase(&mut self, entry: &Entry) -> Result<Option<Entry>> {
             if self.conflicts.contains(&entry.number) {
                 return Ok(None);
@@ -746,6 +821,9 @@ mod tests {
             Ok(Some(fresh))
         }
         fn merge(&mut self, entry: &Entry) -> Result<Merge> {
+            if self.moved {
+                return Ok(Merge::HeadMoved);
+            }
             self.log
                 .push(format!("merge {}@{}", entry.number, entry.head));
             self.queue.retain(|e| e.number != entry.number);
@@ -951,8 +1029,8 @@ mod tests {
             ..Fake::default()
         };
         let mut journal = Journal::default();
-        let report = enqueue(&mut fake, &mut journal, "o/r", "b1").unwrap();
-        enqueue(&mut fake, &mut journal, "o/r", "b1").unwrap();
+        let report = enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
+        enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
         assert_eq!(fake.log, ["enqueue b1", "schedule 1@h1", "enqueue b1"]);
         assert!(report.waiting);
         assert_eq!(report.events[1]["event"], "handed-to-serve");
@@ -1114,5 +1192,108 @@ mod tests {
         closed.queue.clear();
         step(&mut closed, &mut hook, &settings(), &mut journal, "o/r").unwrap();
         assert!(hook.landed.is_empty());
+    }
+
+    fn ungated(queue: Vec<Entry>) -> Fake {
+        Fake {
+            queue,
+            ungated: true,
+            ..Fake::default()
+        }
+    }
+
+    #[test]
+    fn without_a_forge_gate_a_head_with_no_status_is_never_merged_or_scheduled() {
+        let mut fake = ungated(vec![entry(1, "h1")]);
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        for _ in 0..4 {
+            let report = step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+            assert!(report.waiting);
+        }
+        // The native merge is cancelled once and never scheduled; nothing merged.
+        assert_eq!(fake.log, ["unschedule 1"]);
+        assert_eq!(hook.landed, Vec::<String>::new());
+    }
+
+    #[test]
+    fn without_a_forge_gate_pending_waits_and_only_success_on_the_head_lands() {
+        let mut fake = ungated(vec![entry(1, "h1")]);
+        fake.statuses
+            .insert("h1".into(), vec![("ci/crow/x".into(), State::Pending)]);
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        let report = step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert!(report.waiting);
+        assert_eq!(fake.log, ["unschedule 1"]);
+        // A failure on the head is never merged either.
+        fake.statuses
+            .insert("h1".into(), vec![("ci/crow/x".into(), State::Failure)]);
+        step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert_eq!(fake.log, ["unschedule 1"]);
+        // Success on the exact head: cfrg itself merges it.
+        fake.statuses.extend([green("h1")]);
+        let report = step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert_eq!(fake.log, ["unschedule 1", "merge 1@h1"]);
+        assert!(!report.waiting);
+        assert_eq!(hook.landed, ["h1"]);
+    }
+
+    #[test]
+    fn a_push_after_the_status_resets_the_wait_for_the_new_head() {
+        let mut fake = ungated(vec![entry(1, "h1")]);
+        fake.statuses.extend([green("h1")]);
+        fake.moved = true;
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        // The head moves between verification and merge: nothing is merged.
+        let report = step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert!(report.waiting);
+        assert!(report.events.iter().any(|e| e["reason"] == "head-moved"));
+        assert!(!fake.log.iter().any(|l| l.starts_with("merge")));
+        // The branch now carries a new commit that has no status: wait.
+        fake.moved = false;
+        fake.queue[0].head = "h2".into();
+        let report = step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert!(report.waiting);
+        assert!(!fake.log.iter().any(|l| l.starts_with("merge")));
+        // Green on the OLD head still does not count for the new one.
+        step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert!(!fake.log.iter().any(|l| l.starts_with("merge")));
+        fake.statuses.extend([green("h2")]);
+        step(&mut fake, &mut hook, &settings(), &mut journal, "o/r").unwrap();
+        assert_eq!(fake.log.last().unwrap(), "merge 1@h2");
+    }
+
+    #[test]
+    fn an_ungated_branch_cancels_every_queued_native_merge_once() {
+        let mut fake = ungated(vec![entry(1, "h1"), entry(2, "h2")]);
+        let mut journal = Journal::default();
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &settings(),
+            &mut journal,
+            "o/r",
+        )
+        .unwrap();
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &settings(),
+            &mut journal,
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["unschedule 1", "unschedule 2"]);
+    }
+
+    #[test]
+    fn handing_over_to_serve_does_not_schedule_where_the_forge_does_not_gate() {
+        let mut fake = ungated(vec![entry(1, "h1")]);
+        let mut journal = Journal::default();
+        enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
+        enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
+        assert_eq!(fake.log, ["enqueue b1", "unschedule 1", "enqueue b1"]);
     }
 }

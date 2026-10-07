@@ -204,7 +204,7 @@ fn run_server(policy: Policy, serve_policy: ServePolicy, state_dir: PathBuf) -> 
     let mut mirror_repositories = BTreeSet::new();
     let mut mirror_delay = 0;
     if let Some(sweep) = &serve_policy.mirrors {
-        let placement: Placement = serde_json::from_slice(&fs::read(&sweep.placement)?)?;
+        let placement = Placement::from_document(&fs::read(&sweep.placement)?)?;
         placement.validate()?;
         let lane = Lane::new("mirror");
         mirror_repositories = placement

@@ -28,6 +28,7 @@ mod observe;
 mod release;
 mod resolve;
 mod serve;
+mod switch;
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +48,8 @@ enum Action {
     Land(land::Options),
     /// Publish a build artifact for an exact commit; consumers fetch it by URL and hash.
     Release(release::Options),
+    /// Switch the primary of one repository to the forge the placement now names; plan by default.
+    Switch(switch::Options),
     /// Long-running mode: signed webhooks and a periodic reconcile drive landing and mirror verification.
     Serve(serve::Options),
     /// Validate all placements, costs, primary CI/forge relationships and rules.
@@ -399,6 +402,7 @@ fn run(action: Action) -> Result<()> {
         Action::Release(options) => release::run(options)?,
         Action::Observe(options) => observe::run(options)?,
         Action::Serve(options) => serve::run(options)?,
+        Action::Switch(options) => switch::run(options)?,
         Action::Validate { policy } => {
             let policy = read(policy)?;
             println!(

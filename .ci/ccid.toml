@@ -2,7 +2,8 @@ schema = 1
 project = "cfrg"
 
 [render]
-tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+tool_revision = "78a4e05b4e1cb25aaeba3966951564d74277bcbd"
+secret_environment = { CFRG_RELEASE_TOKEN = "cfrg_release_token" }
 
 # Locked: Cargo.lock is worker-resolved (see S-split/CI-NOTES.md); the
 # pinned tool passes --locked to every cargo invocation.
@@ -31,6 +32,9 @@ command = ["bash", ".ci/run-job.sh"]
 # Needs CFRG_RELEASE_TOKEN in the trusted scheduler environment.
 [checks.publish]
 kind = "commands"
+# Never cached: a release must run, and only an uncached check receives the job's
+# CI_COMMIT_SHA (the build embeds it) and the declared secret environment.
+cache = false
 commands = [["cargo", "run", "--release", "--locked", "-p", "cfrg-cli", "--", "release", "--config", ".ci/release.json", "publish", "--self"]]
 
 [jobs.release]
@@ -38,3 +42,5 @@ scheduler = "crow"
 checks = ["publish"]
 workflow = "repository-jobs"
 command = ["bash", ".ci/run-job.sh"]
+# The registry token reaches this job only (Crow secret, manual events).
+secrets = ["CFRG_RELEASE_TOKEN"]

@@ -146,7 +146,13 @@ fn hand_over(policy: &Policy, state_dir: &Path, repository: &str, branch: &str) 
     let mut journal = Journal::load(&journal_path)?;
     let result = (|| {
         let mut target = cfgj::land::Land::new(&policy.endpoint, repository, &mut http)?;
-        land::enqueue(&mut target, &mut journal, repository, branch)
+        land::enqueue(
+            &mut target,
+            &policy.settings(repository),
+            &mut journal,
+            repository,
+            branch,
+        )
     })();
     journal.save(&journal_path)?;
     result

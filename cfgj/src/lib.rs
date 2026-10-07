@@ -14,6 +14,7 @@ pub mod contents;
 pub mod hooks;
 pub mod land;
 pub mod native;
+pub mod replica;
 
 use cfrg::{
     access::{Call, Grants, RoleMap},

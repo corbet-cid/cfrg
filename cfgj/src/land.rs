@@ -30,6 +30,7 @@ use cfrg::{
     Result,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 pub const LAND: Capability = Capability {
     support: Support::NativeFill,
@@ -304,6 +305,39 @@ impl LandTarget for Land<'_> {
         Ok(())
     }
 
+    fn gated(&mut self, contexts: &[String]) -> Result<bool> {
+        let default = self.default_branch()?;
+        let response = self.call("GET", &format!("/branch_protections/{default}"), None)?;
+        if response.status == 404 {
+            return Ok(false);
+        }
+        let rule = expect(response, &[200])?;
+        if rule["enable_status_check"] != true {
+            return Ok(false);
+        }
+        let have: BTreeSet<&str> = rule["status_check_contexts"]
+            .as_array()
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // Every declared context must be required by the forge, otherwise its
+        // own merge could succeed without the status cfrg waits for. A rule under
+        // another name or pattern is not recognised: cfrg then gates itself.
+        Ok(contexts.iter().all(|c| have.contains(c.as_str())))
+    }
+
+    fn unschedule(&mut self, entry: &Entry) -> Result<()> {
+        let response = self.call("DELETE", &format!("/pulls/{}/merge", entry.number), None)?;
+        // 204 cancelled, 404 nothing was scheduled.
+        if ![200, 204, 404].contains(&response.status) {
+            return Err(format!(
+                "Forgejo refused to cancel the scheduled merge (HTTP {})",
+                response.status
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn rebase(&mut self, entry: &Entry) -> Result<Option<Entry>> {
         let outcome = self.call(
             "POST",
@@ -333,6 +367,13 @@ impl LandTarget for Land<'_> {
     }
 
     fn merge(&mut self, entry: &Entry) -> Result<Merge> {
+        // The head must still be exactly the commit whose status was observed.
+        // The merge below also names it (`head_commit_id`); this read makes the
+        // refusal explicit and keeps a stale decision from reaching the forge.
+        let pull = self.get(&format!("/pulls/{}", entry.number))?;
+        if pull["head"]["sha"] != entry.head.as_str() {
+            return Ok(Merge::HeadMoved);
+        }
         let outcome = self.call(
             "POST",
             &format!("/pulls/{}/merge", entry.number),
@@ -715,7 +756,10 @@ mod tests {
             (405, Merge::NotReady),
             (409, Merge::HeadMoved),
         ] {
-            let mut io = script(vec![("POST", "/pulls/1/merge", status, Value::Null)]);
+            let mut io = script(vec![
+                ("GET", "/pulls/1", 200, pull(1, "ci/one", 'a', MARKER)),
+                ("POST", "/pulls/1/merge", status, Value::Null),
+            ]);
             assert_eq!(
                 Land::new(&endpoint, "o/r", &mut io)
                     .unwrap()
@@ -724,6 +768,21 @@ mod tests {
                 want
             );
         }
+        // A head that moved since the status was observed is never merged: no
+        // merge request is even sent.
+        let mut io = script(vec![(
+            "GET",
+            "/pulls/1",
+            200,
+            pull(1, "ci/one", 'b', MARKER),
+        )]);
+        assert_eq!(
+            Land::new(&endpoint, "o/r", &mut io)
+                .unwrap()
+                .merge(&entry)
+                .unwrap(),
+            Merge::HeadMoved
+        );
         let mut io = script(vec![(
             "POST",
             "/pulls/1/update?style=rebase",
@@ -745,6 +804,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fresh.head, "c".repeat(40));
+    }
+
+    #[test]
+    fn native_merge_scheduling_is_only_trusted_behind_a_matching_status_gate() {
+        let endpoint = endpoint();
+        let contexts = vec!["ci/crow/*".to_string()];
+        let default = (
+            "GET",
+            "/api/v1/repos/o/r",
+            200,
+            json!({"default_branch": "main"}),
+        );
+        for (status, rule, want) in [
+            (404, Value::Null, false),
+            (
+                200,
+                json!({"enable_status_check": false, "status_check_contexts": ["ci/crow/*"]}),
+                false,
+            ),
+            (
+                200,
+                json!({"enable_status_check": true, "status_check_contexts": []}),
+                false,
+            ),
+            (
+                200,
+                json!({"enable_status_check": true, "status_check_contexts": ["ci/other"]}),
+                false,
+            ),
+            (
+                200,
+                json!({"enable_status_check": true, "status_check_contexts": ["ci/crow/*"]}),
+                true,
+            ),
+            (
+                200,
+                json!({"enable_status_check": true, "status_check_contexts": ["a", "ci/crow/*"]}),
+                true,
+            ),
+        ] {
+            let mut io = script(vec![
+                default.clone(),
+                ("GET", "/branch_protections/main", status, rule),
+            ]);
+            assert_eq!(
+                Land::new(&endpoint, "o/r", &mut io)
+                    .unwrap()
+                    .gated(&contexts)
+                    .unwrap(),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheduled_merge_is_cancelled_and_nothing_scheduled_is_fine() {
+        let endpoint = endpoint();
+        let entry = entry(&pull(1, "ci/one", 'a', MARKER)).unwrap();
+        for status in [204, 404] {
+            let mut io = script(vec![("DELETE", "/pulls/1/merge", status, Value::Null)]);
+            Land::new(&endpoint, "o/r", &mut io)
+                .unwrap()
+                .unschedule(&entry)
+                .unwrap();
+        }
+        let mut io = script(vec![("DELETE", "/pulls/1/merge", 422, Value::Null)]);
+        assert!(Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .unschedule(&entry)
+            .is_err());
     }
 
     #[test]

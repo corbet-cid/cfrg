@@ -27,6 +27,25 @@ pub const OBSERVE: cfrg::land::Capability = cfrg::land::Capability::unsupported(
     "unsupported: GitHub is frozen, no consumer observes GitHub repositories through cfrg",
 );
 
+/// Replication: GitHub is frozen. As a sender it can only be `cfrg sync`
+/// (adapter-only: reads, never a write to GitHub); it takes no part in a switch.
+pub const REPLICATION: cfrg::replicate::Capabilities = cfrg::replicate::Capabilities {
+    forge: cfrg::model::Forge::Github,
+    push_mirror: cfrg::land::Capability {
+        support: cfrg::land::Support::AdapterOnly,
+        note: "no native push mirror on any GitHub tier: as a sender it is cfrg sync; GitHub is frozen, so it is read only",
+    },
+    mirror_key: false,
+    pull_mirror: cfrg::land::Capability::unsupported(
+        "unsupported: the importer is one-shot and the source-import API is retired",
+    ),
+    pull_mirror_converts_existing: false,
+    receiver_lock: cfrg::land::Capability::unsupported(
+        "unsupported: GitHub is frozen, no writes of any kind (private repositories on Free have no protection API anyway)",
+    ),
+    switch: cfrg::land::Capability::unsupported("unsupported: GitHub is frozen, no writes of any kind"),
+};
+
 use cfrg::{
     access::{Call, Grants, RoleMap},
     collect::{self, EvidenceSource, Transport},

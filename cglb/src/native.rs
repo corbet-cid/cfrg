@@ -9,7 +9,7 @@ use cfrg::{
 };
 use serde_json::{json, Value};
 
-fn call(
+pub(crate) fn call(
     io: &mut dyn Transport,
     dest: &Destination,
     method: &'static str,
@@ -175,7 +175,7 @@ fn exclusive_principal(values: &[Value], field: &str, id: u64) -> bool {
     })
 }
 
-fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
+pub(crate) fn rules(io: &mut dyn Transport, dest: &Destination) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     for page in 1..=20 {
         let value = expect(

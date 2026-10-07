@@ -1,7 +1,7 @@
 //! Declarative native replication control plane. No Git data transfer here.
 use crate::{failure, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod http;
 
@@ -10,7 +10,25 @@ pub mod http;
 pub struct Placement {
     pub schema: u32,
     pub source: Endpoint,
+    /// How a sender writes into the Forgejo source once it is a receiver.
+    #[serde(default)]
+    pub receiver: Option<Receiver>,
+    /// Base URL of the default primary (the git-pointer view of the placement).
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Lowercase `owner/repo` to the base URL of its primary, exceptions only.
+    #[serde(default)]
+    pub primaries: BTreeMap<String, String>,
     pub repositories: Vec<Repository>,
+}
+
+/// The identity senders write as when Forgejo is a receiver, and the
+/// environment reference holding its (narrowly scoped) credential.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receiver {
+    pub mirror_user: String,
+    pub password_env: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -20,7 +38,7 @@ pub struct Endpoint {
     pub token_env: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repository {
     pub path: String,
@@ -33,7 +51,7 @@ pub struct Repository {
     pub destinations: Vec<Destination>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Destination {
     pub provider: Provider,
@@ -73,11 +91,56 @@ pub enum Content {
 }
 
 impl Placement {
+    /// Read the placement from either view of the one declared file: the
+    /// native view itself, or the whole `lib/placement.json` (its `native`
+    /// object plus the top-level `default` and `primaries`).
+    pub fn from_document(bytes: &[u8]) -> Result<Self> {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+        if let Some(mut native) = value.get_mut("native").map(serde_json::Value::take) {
+            for key in ["default", "primaries"] {
+                if let (Some(top), Some(object)) = (value.get(key), native.as_object_mut()) {
+                    object.entry(key).or_insert_with(|| top.clone());
+                }
+            }
+            value = native;
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Base URL of the primary of `path`: its exception, else the declared
+    /// default, else the Forgejo source (every repository before a switch).
+    pub fn primary_of(&self, path: &str) -> String {
+        let url = self
+            .primaries
+            .get(&path.to_ascii_lowercase())
+            .or(self.default.as_ref())
+            .unwrap_or(&self.source.origin);
+        url.trim_end_matches('/').to_string()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema != 1 {
             return Err(failure("Unsupported native placement schema"));
         }
         self.source.validate()?;
+        for url in self.primaries.values().chain(self.default.iter()) {
+            Endpoint {
+                origin: url.clone(),
+                token_env: "UNUSED".into(),
+            }
+            .validate()?;
+        }
+        if let Some(receiver) = &self.receiver {
+            env_name(&receiver.password_env)?;
+            if receiver.mirror_user.is_empty()
+                || receiver.mirror_user.contains('@')
+                || receiver.mirror_user.chars().any(char::is_control)
+            {
+                return Err(failure(
+                    "Mirror principal must be an ID/login, never an email",
+                ));
+            }
+        }
         let mut sources = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for repo in &self.repositories {
@@ -191,6 +254,19 @@ pub fn encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn both_views_of_the_one_placement_file_load_and_name_the_primary() {
+        let native = r#"{"schema":1,"source":{"origin":"https://forge.example","token_env":"T"},"repositories":[]}"#;
+        let whole = r#"{"version":1,"default":"https://forge.example","primaries":{"team/probe":"https://gitlab.example"},
+            "native":{"schema":1,"source":{"origin":"https://forge.example","token_env":"T"},"repositories":[]}}"#;
+        let plain = Placement::from_document(native.as_bytes()).unwrap();
+        assert_eq!(plain.primary_of("any/repo"), "https://forge.example");
+        let placement = Placement::from_document(whole.as_bytes()).unwrap();
+        placement.validate().unwrap();
+        assert_eq!(placement.primary_of("Team/Probe"), "https://gitlab.example");
+        assert_eq!(placement.primary_of("team/other"), "https://forge.example");
+    }
+
     #[test]
     fn identities_cannot_change_request_authority() {
         for bad in ["a/../b", "a/x?token=x", "a/%2fsecret", "a/b#c", "a/b\\c"] {

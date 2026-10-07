@@ -38,8 +38,10 @@ pub mod placement;
 pub mod process;
 pub mod profile;
 pub mod release;
+pub mod replicate;
 pub mod serve;
 pub mod status;
+pub mod switch;
 pub mod sync;
 
 pub(crate) fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {

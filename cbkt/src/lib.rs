@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod native;
+pub mod replica;
 
 /// Declared landing and release capability of this adapter. Never guessed:
 /// `unsupported` means the procedure is not implemented here.
