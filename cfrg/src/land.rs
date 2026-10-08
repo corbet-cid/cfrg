@@ -123,6 +123,13 @@ pub trait Hooks {
     /// An exact commit just reached the default branch (for example: publish
     /// its release).
     fn landed(&mut self, repository: &str, entry: &Entry) -> Result<bool>;
+    /// Seconds since the Unix epoch; a hook so tests can move time.
+    fn now(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 }
 
 /// One-shot side effects already done, so a pass is safe to repeat.
@@ -138,6 +145,13 @@ pub struct Journal {
     /// settled: cancelled where the branch is not status-gated.
     #[serde(default)]
     pub settled: BTreeSet<String>,
+    /// Exact heads (`repo#number@head`) first seen lacking a required
+    /// context, with the time. Starts the gate timeout.
+    #[serde(default)]
+    pub missing_since: BTreeMap<String, u64>,
+    /// Exact heads reported blocked and moved out of the queue.
+    #[serde(default)]
+    pub blocked: BTreeSet<String>,
 }
 
 /// A retest is requested at most this often for the same exact commit.
@@ -192,6 +206,10 @@ impl Journal {
         });
         self.retests
             .retain(|k, _| !k.starts_with(&prefix) || live.contains(k));
+        self.missing_since
+            .retain(|k, _| !k.starts_with(&prefix) || live.contains(k));
+        self.blocked
+            .retain(|k| !k.starts_with(&prefix) || live.contains(k));
         let numbers: BTreeSet<String> = queue
             .iter()
             .map(|e| format!("{prefix}{}", e.number))
@@ -222,6 +240,9 @@ impl Journal {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub contexts: Vec<String>,
+    /// A head lacking a required context this long after it was first seen is
+    /// reported blocked and moved out of the queue.
+    pub gate_timeout_seconds: u64,
 }
 
 /// `*` matches any run of characters; everything else is literal.
@@ -250,6 +271,15 @@ pub fn matches(pattern: &str, text: &str) -> bool {
     rest.ends_with(*last)
 }
 
+/// Required context patterns no status matches.
+pub fn missing(statuses: &[(String, State)], contexts: &[String]) -> Vec<String> {
+    contexts
+        .iter()
+        .filter(|p| !statuses.iter().any(|(c, _)| matches(p, c)))
+        .cloned()
+        .collect()
+}
+
 /// One verdict for a commit: every required context pattern must match at
 /// least one status, any matching failure fails, anything missing or
 /// unfinished is pending.
@@ -273,6 +303,9 @@ pub fn verdict(statuses: &[(String, State)], contexts: &[String]) -> State {
         State::Success
     }
 }
+
+/// Head-of-line entry, its verdict and the statuses it was computed from.
+type HeadOfLine = (Entry, State, Vec<(String, State)>);
 
 pub struct Report {
     pub events: Vec<Value>,
@@ -314,10 +347,14 @@ pub fn step(
                 events.push(json!({"event":"native-merge-cancelled","number":entry.number}));
             }
         }
-        let mut line: Option<(Entry, State, bool)> = None;
+        let mut line: Option<HeadOfLine> = None;
         for entry in &queue {
             if line.is_some() {
                 events.push(json!({"event":"queued","number":entry.number,"branch":entry.branch}));
+                continue;
+            }
+            if journal.blocked.contains(&Journal::key(repository, entry)) {
+                events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head}));
                 continue;
             }
             let statuses = target.statuses(&entry.head)?;
@@ -326,9 +363,9 @@ pub fn step(
                 events.push(json!({"event":"failed","number":entry.number,"branch":entry.branch,"head":entry.head}));
                 continue;
             }
-            line = Some((entry.clone(), state, statuses.is_empty()));
+            line = Some((entry.clone(), state, statuses));
         }
-        let Some((entry, state, no_statuses)) = line else {
+        let Some((entry, state, statuses_of_line)) = line else {
             return Ok(Report {
                 events,
                 waiting: false,
@@ -350,7 +387,14 @@ pub fn step(
                     events.push(json!({"event":"rebased","number":fresh.number,"branch":fresh.branch,"from":entry.head,"to":fresh.head}));
                     journal.unschedule(repository, &entry);
                     arm(target, settings, journal, &mut gate, repository, &fresh)?;
-                    request_retest(hooks, journal, repository, &fresh, &mut events)?;
+                    request_retest(
+                        hooks,
+                        journal,
+                        repository,
+                        &fresh,
+                        RETEST_ATTEMPTS,
+                        &mut events,
+                    )?;
                     return Ok(Report {
                         events,
                         waiting: true,
@@ -378,8 +422,38 @@ pub fn step(
             });
         }
         arm(target, settings, journal, &mut gate, repository, &entry)?;
-        if no_statuses {
-            request_retest(hooks, journal, repository, &entry, &mut events)?;
+        let no_statuses = statuses_of_line.is_empty();
+        let absent = missing(&statuses_of_line, &settings.contexts);
+        if !absent.is_empty() {
+            let key = Journal::key(repository, &entry);
+            let now = hooks.now();
+            let since = *journal.missing_since.entry(key.clone()).or_insert(now);
+            if now.saturating_sub(since) >= settings.gate_timeout_seconds {
+                let reason = format!(
+                    "cfrg land: blocked. The required status context(s) {} never appeared on the exact head {} within {} seconds, although the gating run was requested. The entry is removed from the queue so the next one can land; nothing was merged. Fix the gate (or the policy) and land the branch again.",
+                    absent.join(", "),
+                    entry.head,
+                    settings.gate_timeout_seconds
+                );
+                journal.blocked.insert(key);
+                journal.unschedule(repository, &entry);
+                target.unschedule(&entry)?;
+                let comment = target.abandon(&entry, &reason);
+                events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head,"missing":absent,"reason":"required-context-missing-after-timeout","commented":comment.is_ok()}));
+                continue;
+            }
+            request_retest(
+                hooks,
+                journal,
+                repository,
+                &entry,
+                if no_statuses { RETEST_ATTEMPTS } else { 1 },
+                &mut events,
+            )?;
+        } else {
+            journal
+                .missing_since
+                .remove(&Journal::key(repository, &entry));
         }
         events.push(json!({"event":"waiting","number":entry.number,"head":entry.head,"reason":"checks-pending"}));
         return Ok(Report {
@@ -442,13 +516,14 @@ fn request_retest(
     journal: &mut Journal,
     repository: &str,
     entry: &Entry,
+    limit: u32,
     events: &mut Vec<Value>,
 ) -> Result<()> {
     let attempts = journal
         .retests
         .entry(Journal::key(repository, entry))
         .or_insert(0);
-    if *attempts >= RETEST_ATTEMPTS {
+    if *attempts >= limit {
         return Ok(());
     }
     *attempts += 1;
@@ -572,6 +647,10 @@ pub struct Policy {
     pub follow: Follow,
     /// The long-running mode (`cfrg serve`).
     pub serve: Option<crate::serve::ServePolicy>,
+    /// A queued head still lacking a required context this long after it was
+    /// first seen is reported blocked and removed from the queue.
+    #[serde(default = "default_gate_timeout")]
+    pub gate_timeout_seconds: u64,
     /// Seconds between passes of the unattended follower.
     #[serde(default = "default_interval")]
     pub interval_seconds: u64,
@@ -599,10 +678,15 @@ pub struct RepositoryPolicy {
     pub contexts: Option<Vec<String>>,
     pub retest: Option<Vec<String>>,
     pub landed: Option<Vec<String>>,
+    /// Overrides the policy-wide gate timeout.
+    pub gate_timeout_seconds: Option<u64>,
 }
 
 fn default_contexts() -> Vec<String> {
     vec!["ci/*".into()]
+}
+fn default_gate_timeout() -> u64 {
+    45 * 60
 }
 fn default_interval() -> u64 {
     30
@@ -631,6 +715,15 @@ impl Policy {
         }
         if self.follow == Follow::Serve && self.serve.is_none() {
             return Err(failure("follow = serve needs a serve block"));
+        }
+        let timeout_ok = |t: u64| (60..=86_400).contains(&t);
+        if !timeout_ok(self.gate_timeout_seconds)
+            || self
+                .repositories
+                .iter()
+                .any(|r| r.gate_timeout_seconds.is_some_and(|t| !timeout_ok(t)))
+        {
+            return Err(failure("Land gate timeout out of range"));
         }
         if !(5..=3600).contains(&self.interval_seconds)
             || !(60..=172_800).contains(&self.follow_seconds)
@@ -666,6 +759,12 @@ impl Policy {
             .unwrap_or_else(|| self.contexts.clone())
     }
 
+    pub fn gate_timeout(&self, path: &str) -> u64 {
+        self.repository(path)
+            .and_then(|r| r.gate_timeout_seconds)
+            .unwrap_or(self.gate_timeout_seconds)
+    }
+
     pub fn retest(&self, path: &str) -> Vec<String> {
         self.repository(path)
             .and_then(|r| r.retest.clone())
@@ -681,6 +780,7 @@ impl Policy {
     pub fn settings(&self, path: &str) -> Settings {
         Settings {
             contexts: self.contexts(path),
+            gate_timeout_seconds: self.gate_timeout(path),
         }
     }
 }
@@ -845,8 +945,12 @@ mod tests {
     struct Hook {
         retests: Vec<String>,
         landed: Vec<String>,
+        clock: u64,
     }
     impl Hooks for Hook {
+        fn now(&self) -> u64 {
+            self.clock
+        }
         fn retest(&mut self, _repository: &str, entry: &Entry) -> Result<bool> {
             self.retests.push(entry.head.clone());
             Ok(true)
@@ -863,6 +967,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             contexts: vec!["ci/*".into()],
+            gate_timeout_seconds: 2700,
         }
     }
 
@@ -913,6 +1018,88 @@ mod tests {
         assert_eq!(fake.log, ["merge 1@h1"]);
         assert!(!report.waiting);
         assert!(hook.retests.is_empty());
+    }
+
+    fn gate_settings() -> Settings {
+        Settings {
+            contexts: vec!["ci/crow/*".into(), "ci/gate".into()],
+            gate_timeout_seconds: 100,
+        }
+    }
+
+    #[test]
+    fn missing_context_is_submitted_once_per_head() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.statuses
+            .insert("h1".into(), vec![("ci/crow/x".into(), State::Success)]);
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        for t in [0, 10, 20, 30] {
+            hook.clock = t;
+            let report = step(&mut fake, &mut hook, &gate_settings(), &mut journal, "o/r").unwrap();
+            assert!(report.waiting);
+        }
+        assert_eq!(hook.retests, ["h1"]);
+        assert!(!fake.log.iter().any(|l| l.starts_with("merge")));
+    }
+
+    #[test]
+    fn missing_context_after_timeout_is_reported_and_skipped() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1"), entry(2, "h2")],
+            ..Fake::default()
+        };
+        fake.statuses
+            .insert("h1".into(), vec![("ci/crow/x".into(), State::Success)]);
+        fake.statuses.insert(
+            "h2".into(),
+            vec![
+                ("ci/crow/x".into(), State::Success),
+                ("ci/gate".into(), State::Success),
+            ],
+        );
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        step(&mut fake, &mut hook, &gate_settings(), &mut journal, "o/r").unwrap();
+        assert_eq!(hook.retests, ["h1"]);
+        hook.clock = 100;
+        let report = step(&mut fake, &mut hook, &gate_settings(), &mut journal, "o/r").unwrap();
+        assert!(report
+            .events
+            .iter()
+            .any(|e| e["event"] == "blocked" && e["number"] == 1 && e["missing"][0] == "ci/gate"));
+        assert_eq!(
+            fake.log,
+            ["schedule 1@h1", "unschedule 1", "abandon 1", "merge 2@h2"]
+        );
+        assert_eq!(hook.retests, ["h1"]);
+    }
+
+    #[test]
+    fn missing_context_that_turns_green_lands() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.statuses
+            .insert("h1".into(), vec![("ci/crow/x".into(), State::Success)]);
+        let mut hook = Hook::default();
+        let mut journal = Journal::default();
+        step(&mut fake, &mut hook, &gate_settings(), &mut journal, "o/r").unwrap();
+        fake.statuses.insert(
+            "h1".into(),
+            vec![
+                ("ci/crow/x".into(), State::Success),
+                ("ci/gate".into(), State::Success),
+            ],
+        );
+        hook.clock = 99;
+        step(&mut fake, &mut hook, &gate_settings(), &mut journal, "o/r").unwrap();
+        assert!(fake.log.contains(&"merge 1@h1".to_string()));
+        assert_eq!(hook.retests, ["h1"]);
     }
 
     #[test]

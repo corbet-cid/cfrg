@@ -170,3 +170,34 @@ fn reject_github_credentials_in_urls_and_untrusted_token_names() {
     assert!(validate_credential_name("HOME").is_err());
     assert!(validate_credential_name("CFRG_STATUS_TOKEN").is_ok());
 }
+
+#[test]
+fn concurrent_reporters_wait_for_the_journal_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let root = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let journal = Journal::open(root).unwrap();
+                let n: u64 = journal.load("counter").unwrap().unwrap_or_default();
+                std::thread::sleep(Duration::from_millis(30));
+                journal.save("counter", &(n + 1)).unwrap();
+                i
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let journal = Journal::open(dir.path().into()).unwrap();
+    assert_eq!(journal.load::<u64>("counter").unwrap(), Some(8));
+}
+
+#[test]
+fn busy_journal_fails_only_after_the_bounded_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = Journal::open(dir.path().into()).unwrap();
+    let started = Instant::now();
+    assert!(Journal::open_waiting(dir.path().into(), Duration::from_millis(200)).is_err());
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}

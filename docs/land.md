@@ -21,6 +21,7 @@ same pass every `interval_seconds` until the queue is settled; `cfrg land
 | Only the exact green commit lands | cfrg merges (fast-forward-only, naming `head_commit_id`) only a head it saw succeed for every declared context, re-reads the pull request right before the merge and refuses when the head moved; a new push resets the wait |
 | One queue per repository | the open pull requests carrying the cfrg marker, oldest first; only the head-of-line entry may land or be rebased |
 | Base moved | the forge rebases the branch (`pulls/{n}/update?style=rebase`), the merge is scheduled again for the new head and a retest is requested; it lands only after the new head is green |
+| Required context missing | the head-of-line entry whose head lacks a required context gets the `retest` command once (the policy's own gate; twice when it has no status at all). If the context is still missing after `gate_timeout_seconds` (default 2700, per repository override) the entry is commented with the reason, closed and skipped so the queue continues; nothing is merged without the gating contexts green on the exact head |
 | Conflict | the entry is closed with an explanation; push a rebased branch and land again |
 | Red head | skipped, never blocks the queue; a new push to the branch makes it live again |
 | No agent after the push | the follower needs only the policy file and the token variable |

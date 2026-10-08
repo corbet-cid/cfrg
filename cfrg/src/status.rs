@@ -161,12 +161,20 @@ struct Posted {
     state: State,
 }
 
+/// Longest a reporter waits for another reporter's journal lock.
+const LOCK_WAIT: Duration = Duration::from_secs(60);
+
 struct Journal {
     root: PathBuf,
     _lock: File,
 }
 impl Journal {
+    /// Wait up to `LOCK_WAIT` for the journal; concurrent reporters queue
+    /// instead of failing after their real work already passed.
     fn open(root: PathBuf) -> Result<Self> {
+        Self::open_waiting(root, LOCK_WAIT)
+    }
+    fn open_waiting(root: PathBuf, wait: Duration) -> Result<Self> {
         fs::create_dir_all(&root)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -174,8 +182,15 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(root.join("lock"))?;
-        lock.try_lock()
-            .map_err(|_| failure("Status reporter busy; retry from scheduler"))?;
+        let deadline = Instant::now() + wait;
+        let mut pause = Duration::from_millis(20);
+        while lock.try_lock().is_err() {
+            if Instant::now() >= deadline {
+                return Err(failure("Status reporter busy; retry from scheduler"));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(500));
+        }
         Ok(Self { root, _lock: lock })
     }
     fn save(&self, key: &str, value: &impl Serialize) -> Result<()> {
