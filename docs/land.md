@@ -101,3 +101,39 @@ by reading the pull request back.
 
 Only Forgejo is implemented; every other adapter answers `unsupported` rather
 than guessing (see `--capabilities`).
+
+## Forbidden ancestors (history rewrites)
+
+After a history rewrite, a branch based on the old history must never be
+rebased onto the new default branch (the forge would replay the whole old
+history). The land policy therefore declares commits no head may contain, data
+only:
+
+```json
+{
+  "forbidden_ancestors": ["<40 hex old root>"],
+  "forbidden_ancestors_file": "/etc/cfrg/forbidden-ancestors.json",
+  "repositories": [{"path": "org/repo", "forbidden_ancestors": ["<40 hex>"]}]
+}
+```
+
+The optional file is re-read on every pass (no restart, no code change):
+
+```json
+{"schema": 1, "forbidden_ancestors": {"org/repo": ["<40 hex>"], "*": ["<40 hex>"]}}
+```
+
+`*` applies to every repository. The three sources are merged. An unreadable
+or malformed file stops all landing (fail closed). With no commits declared
+the guard does nothing and makes no request.
+
+The check runs when the request is enqueued, for every queued head before its
+statuses are read (so before any scheduling or rebase), and again right before
+the merge. A head whose history contains a forbidden commit is refused: the
+scheduled native merge is cancelled, the pull request gets a comment ("based
+on pre-rewrite history; translate the branch with the published map") and is
+closed, the event `blocked` with `reason: forbidden-ancestor` is reported, and
+the queue moves on. On Forgejo the ancestry test is
+`GET commits?sha=<forbidden>&not=<head>&limit=1`: an empty list means the
+forbidden commit is the head or its ancestor; a 404 (the forge no longer has
+that commit) means no head it holds can contain it.

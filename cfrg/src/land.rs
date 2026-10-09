@@ -104,6 +104,10 @@ pub trait LandTarget {
     /// Native rebase of the entry branch onto the default branch. `None`
     /// means the rebase conflicts and nothing changed.
     fn rebase(&mut self, entry: &Entry) -> Result<Option<Entry>>;
+    /// The first of `forbidden` that is `head` itself or one of its ancestors,
+    /// if any. A forbidden commit the forge does not have cannot be in the
+    /// history of any head it holds, so that answers `None`.
+    fn forbidden_ancestor(&mut self, head: &str, forbidden: &[String]) -> Result<Option<String>>;
     /// Fast-forward-only merge of exactly `entry.head`.
     fn merge(&mut self, entry: &Entry) -> Result<Merge>;
     /// Remove the entry from the queue, with an explanation for the author.
@@ -243,7 +247,16 @@ pub struct Settings {
     /// A head lacking a required context this long after it was first seen is
     /// reported blocked and moved out of the queue.
     pub gate_timeout_seconds: u64,
+    /// Commits no landed head may contain (see [`Policy::forbidden_ancestors`]).
+    /// Empty: the guard does nothing.
+    pub forbidden_ancestors: Vec<String>,
+    /// The declared list could not be read: nothing lands until it can.
+    pub guard_error: Option<String>,
 }
+
+/// Reason given to the author of a head that carries a forbidden commit.
+pub const PRE_REWRITE: &str =
+    "based on pre-rewrite history; translate the branch with the published map";
 
 /// `*` matches any run of characters; everything else is literal.
 pub fn matches(pattern: &str, text: &str) -> bool {
@@ -357,6 +370,17 @@ pub fn step(
                 events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head}));
                 continue;
             }
+            if refuse_forbidden(
+                target,
+                settings,
+                journal,
+                repository,
+                entry,
+                "queue",
+                &mut events,
+            )? {
+                continue;
+            }
             let statuses = target.statuses(&entry.head)?;
             let state = verdict(&statuses, &settings.contexts);
             if state == State::Failure {
@@ -403,6 +427,17 @@ pub fn step(
             }
         }
         if state == State::Success {
+            if refuse_forbidden(
+                target,
+                settings,
+                journal,
+                repository,
+                &entry,
+                "merge",
+                &mut events,
+            )? {
+                continue;
+            }
             match target.merge(&entry)? {
                 Merge::Merged => {
                     journal.unschedule(repository, &entry);
@@ -465,6 +500,39 @@ pub fn step(
         events,
         waiting: true,
     })
+}
+
+/// Refuse a head whose history contains a forbidden commit: no schedule, no
+/// rebase, no merge; the entry is commented, closed and remembered as blocked.
+/// Returns whether the entry was refused.
+fn refuse_forbidden(
+    target: &mut dyn LandTarget,
+    settings: &Settings,
+    journal: &mut Journal,
+    repository: &str,
+    entry: &Entry,
+    stage: &str,
+    events: &mut Vec<Value>,
+) -> Result<bool> {
+    if let Some(error) = &settings.guard_error {
+        return Err(failure(format!("Land guard list unusable: {error}")));
+    }
+    if settings.forbidden_ancestors.is_empty() {
+        return Ok(false);
+    }
+    let Some(found) = target.forbidden_ancestor(&entry.head, &settings.forbidden_ancestors)? else {
+        return Ok(false);
+    };
+    let reason = format!(
+        "cfrg land: refused. The head {} contains the forbidden commit {found}: {PRE_REWRITE}. Nothing was rebased or merged.",
+        entry.head
+    );
+    journal.blocked.insert(Journal::key(repository, entry));
+    journal.unschedule(repository, entry);
+    let cancelled = target.unschedule(entry);
+    let comment = target.abandon(entry, &reason);
+    events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head,"forbidden":found,"reason":"forbidden-ancestor","stage":stage,"cancelled":cancelled.is_ok(),"commented":comment.is_ok()}));
+    Ok(true)
 }
 
 fn is_gated(
@@ -546,6 +614,25 @@ pub fn enqueue(
     branch: &str,
 ) -> Result<Report> {
     let entry = target.enqueue(branch)?;
+    let mut events = Vec::new();
+    if refuse_forbidden(
+        target,
+        settings,
+        journal,
+        repository,
+        &entry,
+        "enqueue",
+        &mut events,
+    )? {
+        events.insert(
+            0,
+            json!({"event":"enqueued","number":entry.number,"branch":entry.branch,"head":entry.head}),
+        );
+        return Ok(Report {
+            events,
+            waiting: false,
+        });
+    }
     let mut gate = None;
     if journal.settle(repository, &entry) && !is_gated(target, settings, &mut gate)? {
         target.unschedule(&entry)?;
@@ -667,8 +754,28 @@ pub struct Policy {
     /// (same placeholders), for example to publish its release.
     #[serde(default)]
     pub landed: Vec<String>,
+    /// Commits that no landed head may contain, for every repository: the
+    /// old root commits of rewritten histories. A head whose ancestry holds
+    /// one is refused (never rebased, never merged).
+    #[serde(default)]
+    pub forbidden_ancestors: Vec<String>,
+    /// Optional JSON file with more forbidden commits, re-read on every pass
+    /// so a published old-to-new map can be dropped in without a code change
+    /// or a restart: `{"schema":1,"forbidden_ancestors":{"<org>/<repo>":
+    /// ["<40 hex>", ...], "*": ["<40 hex>", ...]}}` (`*` applies to every
+    /// repository). Unreadable or malformed: nothing lands (fail closed).
+    #[serde(default)]
+    pub forbidden_ancestors_file: Option<String>,
     #[serde(default)]
     pub repositories: Vec<RepositoryPolicy>,
+}
+
+/// Shape of [`Policy::forbidden_ancestors_file`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForbiddenFile {
+    schema: u32,
+    forbidden_ancestors: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -680,6 +787,9 @@ pub struct RepositoryPolicy {
     pub landed: Option<Vec<String>>,
     /// Overrides the policy-wide gate timeout.
     pub gate_timeout_seconds: Option<u64>,
+    /// Forbidden commits for this repository, added to the policy-wide ones.
+    #[serde(default)]
+    pub forbidden_ancestors: Vec<String>,
 }
 
 fn default_contexts() -> Vec<String> {
@@ -715,6 +825,15 @@ impl Policy {
         }
         if self.follow == Follow::Serve && self.serve.is_none() {
             return Err(failure("follow = serve needs a serve block"));
+        }
+        commits(&self.forbidden_ancestors)?;
+        if let Some(file) = &self.forbidden_ancestors_file {
+            if file.is_empty() || file.contains('\0') {
+                return Err(failure("Invalid forbidden ancestors file path"));
+            }
+        }
+        for repo in &self.repositories {
+            commits(&repo.forbidden_ancestors)?;
         }
         let timeout_ok = |t: u64| (60..=86_400).contains(&t);
         if !timeout_ok(self.gate_timeout_seconds)
@@ -777,12 +896,46 @@ impl Policy {
             .unwrap_or_else(|| self.landed.clone())
     }
 
+    /// Forbidden commits for one repository: policy-wide, per-repository and
+    /// the optional file (read now). Deduplicated.
+    pub fn forbidden(&self, path: &str) -> Result<Vec<String>> {
+        let mut all: BTreeSet<String> = self.forbidden_ancestors.iter().cloned().collect();
+        if let Some(repo) = self.repository(path) {
+            all.extend(repo.forbidden_ancestors.iter().cloned());
+        }
+        if let Some(file) = &self.forbidden_ancestors_file {
+            let parsed: ForbiddenFile = serde_json::from_slice(&fs::read(file)?)?;
+            if parsed.schema != 1 {
+                return Err(failure("Unsupported forbidden ancestors schema"));
+            }
+            for list in parsed.forbidden_ancestors.values() {
+                commits(list)?;
+            }
+            for key in ["*", path] {
+                if let Some(list) = parsed.forbidden_ancestors.get(key) {
+                    all.extend(list.iter().cloned());
+                }
+            }
+        }
+        Ok(all.into_iter().collect())
+    }
+
     pub fn settings(&self, path: &str) -> Settings {
+        let (forbidden_ancestors, guard_error) = match self.forbidden(path) {
+            Ok(list) => (list, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
         Settings {
             contexts: self.contexts(path),
             gate_timeout_seconds: self.gate_timeout(path),
+            forbidden_ancestors,
+            guard_error,
         }
     }
+}
+
+fn commits(values: &[String]) -> Result<()> {
+    values.iter().try_for_each(|v| commit_id(v))
 }
 
 fn patterns(values: &[String]) -> Result<()> {
@@ -861,6 +1014,8 @@ mod tests {
         moved: bool,
         log: Vec<String>,
         tip: String,
+        /// Commits in each head's history, by head.
+        history: BTreeMap<String, Vec<String>>,
     }
 
     fn entry(number: u64, head: &str) -> Entry {
@@ -920,6 +1075,15 @@ mod tests {
             self.log.push(format!("rebase {}", entry.number));
             Ok(Some(fresh))
         }
+        fn forbidden_ancestor(
+            &mut self,
+            head: &str,
+            forbidden: &[String],
+        ) -> Result<Option<String>> {
+            self.log.push(format!("ancestry {head}"));
+            let history = self.history.get(head).cloned().unwrap_or_default();
+            Ok(forbidden.iter().find(|f| history.contains(f)).cloned())
+        }
         fn merge(&mut self, entry: &Entry) -> Result<Merge> {
             if self.moved {
                 return Ok(Merge::HeadMoved);
@@ -968,7 +1132,164 @@ mod tests {
         Settings {
             contexts: vec!["ci/*".into()],
             gate_timeout_seconds: 2700,
+            forbidden_ancestors: Vec::new(),
+            guard_error: None,
         }
+    }
+
+    const OLD_ROOT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn guarded() -> Settings {
+        Settings {
+            forbidden_ancestors: vec![OLD_ROOT.into()],
+            ..settings()
+        }
+    }
+
+    #[test]
+    fn head_with_a_forbidden_ancestor_is_refused_before_any_rebase_or_merge() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            behind: BTreeSet::from([1]),
+            ..Fake::default()
+        };
+        fake.statuses.extend([green("h1")]);
+        fake.history.insert("h1".into(), vec![OLD_ROOT.into()]);
+        let mut journal = Journal::default();
+        let report = step(
+            &mut fake,
+            &mut Hook::default(),
+            &guarded(),
+            &mut journal,
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["ancestry h1", "unschedule 1", "abandon 1"]);
+        assert!(report.events.iter().any(|e| e["event"] == "blocked"
+            && e["reason"] == "forbidden-ancestor"
+            && e["forbidden"] == OLD_ROOT));
+        assert!(!report.waiting);
+    }
+
+    #[test]
+    fn refused_enqueue_schedules_nothing() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.history.insert("h1".into(), vec![OLD_ROOT.into()]);
+        enqueue(&mut fake, &guarded(), &mut Journal::default(), "o/r", "b1").unwrap();
+        assert!(!fake.log.iter().any(|l| l.starts_with("schedule")));
+        assert!(fake.log.contains(&"abandon 1".to_string()));
+    }
+
+    #[test]
+    fn refusal_does_not_block_the_clean_entry_behind_it() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1"), entry(2, "h2")],
+            ..Fake::default()
+        };
+        fake.statuses.extend([green("h1"), green("h2")]);
+        fake.history.insert("h1".into(), vec![OLD_ROOT.into()]);
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &guarded(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert!(fake.log.contains(&"merge 2@h2".to_string()));
+        assert!(!fake.log.iter().any(|l| l.starts_with("merge 1")));
+    }
+
+    #[test]
+    fn clean_head_and_empty_list_are_unaffected() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.statuses.extend([green("h1")]);
+        fake.history.insert("h1".into(), vec!["other".into()]);
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &guarded(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["ancestry h1", "ancestry h1", "merge 1@h1"]);
+        // Empty list: no ancestry query at all, even for a poisoned history.
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.statuses.extend([green("h1")]);
+        fake.history.insert("h1".into(), vec![OLD_ROOT.into()]);
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &settings(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["merge 1@h1"]);
+    }
+
+    #[test]
+    fn an_unreadable_list_fails_closed() {
+        let mut fake = Fake {
+            queue: vec![entry(1, "h1")],
+            ..Fake::default()
+        };
+        fake.statuses.extend([green("h1")]);
+        let broken = Settings {
+            guard_error: Some("no such file".into()),
+            ..settings()
+        };
+        assert!(step(
+            &mut fake,
+            &mut Hook::default(),
+            &broken,
+            &mut Journal::default(),
+            "o/r"
+        )
+        .is_err());
+        assert!(fake.log.is_empty());
+    }
+
+    #[test]
+    fn policy_collects_inline_per_repository_and_file_lists() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        let dir = std::env::temp_dir().join(format!("cfrg-forbidden-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("map.json");
+        fs::write(
+            &file,
+            format!(r#"{{"schema":1,"forbidden_ancestors":{{"*":["{c}"],"o/r":["{b}"],"o/other":["{a}"]}}}}"#),
+        )
+        .unwrap();
+        let policy: Policy = serde_json::from_value(json!({
+            "schema":1,"forge":"forgejo",
+            "endpoint":{"origin":"https://forge.example","token_env":"T"},
+            "forbidden_ancestors":[a],
+            "forbidden_ancestors_file": file.to_str().unwrap(),
+            "repositories":[{"path":"o/r","forbidden_ancestors":[b]}]
+        }))
+        .unwrap();
+        policy.validate().unwrap();
+        assert_eq!(
+            policy.forbidden("o/r").unwrap(),
+            [a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(policy.forbidden("o/x").unwrap(), [a.clone(), c.clone()]);
+        fs::write(&file, "not json").unwrap();
+        assert!(policy.settings("o/r").guard_error.is_some());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1024,6 +1345,8 @@ mod tests {
         Settings {
             contexts: vec!["ci/crow/*".into(), "ci/gate".into()],
             gate_timeout_seconds: 100,
+            forbidden_ancestors: Vec::new(),
+            guard_error: None,
         }
     }
 

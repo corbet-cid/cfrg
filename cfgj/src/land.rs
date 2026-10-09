@@ -366,6 +366,37 @@ impl LandTarget for Land<'_> {
         Ok(Some(self::entry(&pull)?))
     }
 
+    fn forbidden_ancestor(&mut self, head: &str, forbidden: &[String]) -> Result<Option<String>> {
+        commit_id(head)?;
+        for candidate in forbidden {
+            commit_id(candidate)?;
+            // Commits reachable from the candidate but not from the head: none
+            // means the candidate is the head or one of its ancestors. A
+            // candidate the forge does not have (404) cannot be in the history
+            // of a head the forge holds.
+            let response = self.call(
+                "GET",
+                &format!(
+                    "/commits?sha={candidate}&not={head}&limit=1&stat=false&verification=false&files=false"
+                ),
+                None,
+            )?;
+            match response.status {
+                404 => continue,
+                200 => {
+                    let list = response.body.as_array().ok_or("Malformed commit list")?;
+                    if list.is_empty() {
+                        return Ok(Some(candidate.clone()));
+                    }
+                }
+                other => {
+                    return Err(format!("Forgejo refused the ancestry check (HTTP {other})").into());
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn merge(&mut self, entry: &Entry) -> Result<Merge> {
         // The head must still be exactly the commit whose status was observed.
         // The merge below also names it (`head_commit_id`); this read makes the
@@ -676,6 +707,35 @@ mod tests {
         assert!(Land::new(&endpoint, "o/r", &mut io)
             .unwrap()
             .enqueue("bad branch")
+            .is_err());
+    }
+
+    #[test]
+    fn forbidden_ancestor_means_an_empty_exclusive_commit_list() {
+        let endpoint = endpoint();
+        let head = "a".repeat(40);
+        let (old, gone, other) = ("1".repeat(40), "2".repeat(40), "3".repeat(40));
+        let list = |c: &str| format!("/commits?sha={c}&not={head}&limit=1");
+        let mut io = script(vec![
+            ("GET", &list(&gone), 404, json!(null)),
+            ("GET", &list(&other), 200, json!([{"sha": other}])),
+            ("GET", &list(&old), 200, json!([])),
+        ]);
+        let found = Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .forbidden_ancestor(&head, &[gone, other, old.clone()])
+            .unwrap();
+        assert_eq!(found, Some(old));
+        let mut io = script(vec![]);
+        let none = Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .forbidden_ancestor(&head, &[])
+            .unwrap();
+        assert_eq!(none, None);
+        let mut io = script(vec![("GET", "/commits?sha=", 500, json!(null))]);
+        assert!(Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .forbidden_ancestor(&head, &["4".repeat(40)])
             .is_err());
     }
 
