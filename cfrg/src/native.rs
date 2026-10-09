@@ -87,6 +87,12 @@ pub struct Destination {
     pub absent: bool,
     /// Explicit ownership claim, also needed for declarative deletion.
     pub remote_name: Option<String>,
+    /// Declared exception: the receiver cannot be locked on this destination
+    /// (GitHub Free has no rulesets on private repositories). The value is the
+    /// reason. Only a private GitHub destination may declare it; the mirror is
+    /// then configured without the receiver lock and the pass reports `lock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_exception: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -277,6 +283,17 @@ impl Placement {
                     {
                         return Err(failure(
                             "GitHub destinations use https://api.github.com and name their owner as namespace",
+                        ));
+                    }
+                }
+                if let Some(reason) = &dest.lock_exception {
+                    if dest.provider != Provider::Github
+                        || !repo.private
+                        || reason.trim().is_empty()
+                        || reason.chars().any(char::is_control)
+                    {
+                        return Err(failure(
+                            "A lock exception needs a private GitHub destination and a plain-text reason",
                         ));
                     }
                 }
@@ -481,6 +498,39 @@ mod tests {
         for bad in [
             document("https://github.com", "team"),
             document("https://api.github.com", "other"),
+        ] {
+            let placement = Placement::from_document(bad.as_bytes()).unwrap();
+            assert!(placement.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_lock_exception_is_only_for_private_github_destinations_with_a_reason() {
+        let document = |provider: &str, private: bool, extra: &str| {
+            let (origin, namespace) = if provider == "github" {
+                ("https://api.github.com", "team")
+            } else {
+                ("https://gitlab.example", "2")
+            };
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[
+                {{"path":"team/repo","source_id":1,"private":{private},"default_branch":"main","content":"native-git","hold":null,"destinations":[
+                  {{"provider":"{provider}","endpoint":{{"origin":"{origin}","token_env":"G"}},"namespace":"{namespace}","repository_id":"7","mirror_user":"bot","password_env":"G","interval_seconds":3600,"hold":null,"remote_name":null{extra}}}
+                ]}}]}}"#
+            )
+        };
+        let reason = r#","lock_exception":"GitHub Free cannot lock private repositories""#;
+        let good = Placement::from_document(document("github", true, reason).as_bytes()).unwrap();
+        good.validate().unwrap();
+        assert!(good.repositories[0].destinations[0].lock_exception.is_some());
+        let none = Placement::from_document(document("github", true, "").as_bytes()).unwrap();
+        none.validate().unwrap();
+        assert!(none.repositories[0].destinations[0].lock_exception.is_none());
+        for bad in [
+            document("github", false, reason),
+            document("gitlab", true, reason),
+            document("github", true, r#","lock_exception":"  ""#),
+            document("github", true, r#","lock_exception":"bad\u0007""#),
         ] {
             let placement = Placement::from_document(bad.as_bytes()).unwrap();
             assert!(placement.validate().is_err());

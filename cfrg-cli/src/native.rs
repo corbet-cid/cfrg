@@ -379,7 +379,13 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     mirrors.push(value.clone());
                     mirror = Some(value);
                 }
-                let protected = if target.is_some() {
+                let lock_exempt = dest.lock_exception.is_some()
+                    && dest.provider == Provider::Github
+                    && repo.private;
+                let protected = if target.is_some() && lock_exempt {
+                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"lock-exception", "lock":"unavailable", "reason":dest.lock_exception}));
+                    true
+                } else if target.is_some() {
                     match dest.provider {
                         Provider::Gitlab if dest.use_ssh => match &mirror {
                             Some(value) => cglb::native::protect_ssh(

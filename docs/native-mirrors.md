@@ -132,7 +132,10 @@ API credential (`token_env`) and the mirror credential (`password_env`). Reconci
   creation window) and switches GitHub Actions off on it.
 * Locks it as above. GitHub Free has rulesets for public repositories only: a
   private destination in a free organisation cannot be locked and is reported as
-  `destination-or-protection-required`, never mirrored unprotected. The API
+  `destination-or-protection-required`, never mirrored unprotected, unless the
+  destination declares `"lock_exception": "<reason>"` (private GitHub repositories
+  only): the mirror is then configured without the receiver lock and every pass
+  reports `state: lock-exception, lock: unavailable`. The API
   credential must be the declared mirror principal and an organisation owner.
 * Owns the Forgejo mirror like any other (`remote_name` in the placement, or the
   state's record). A rename of the GitHub repository is reported
