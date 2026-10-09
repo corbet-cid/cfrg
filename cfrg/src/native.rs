@@ -522,10 +522,14 @@ mod tests {
         let reason = r#","lock_exception":"GitHub Free cannot lock private repositories""#;
         let good = Placement::from_document(document("github", true, reason).as_bytes()).unwrap();
         good.validate().unwrap();
-        assert!(good.repositories[0].destinations[0].lock_exception.is_some());
+        assert!(good.repositories[0].destinations[0]
+            .lock_exception
+            .is_some());
         let none = Placement::from_document(document("github", true, "").as_bytes()).unwrap();
         none.validate().unwrap();
-        assert!(none.repositories[0].destinations[0].lock_exception.is_none());
+        assert!(none.repositories[0].destinations[0]
+            .lock_exception
+            .is_none());
         for bad in [
             document("github", false, reason),
             document("gitlab", true, reason),
