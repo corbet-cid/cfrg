@@ -137,3 +137,33 @@ the queue moves on. On Forgejo the ancestry test is
 `GET commits?sha=<forbidden>&not=<head>&limit=1`: an empty list means the
 forbidden commit is the head or its ancestor; a 404 (the forge no longer has
 that commit) means no head it holds can contain it.
+
+## Signed heads: fast-forward landings only
+
+A rebase or re-commit destroys commit signatures. A repository that needs the
+author's signature to survive declares, per repository, data only:
+
+```json
+{"repositories": [
+  {"path": "org/repo", "rebase": "never"},
+  {"path": "org/other", "no_rebase_paths": ["secrets/"]}
+]}
+```
+
+`rebase: "never"` covers every head of the repository; `no_rebase_paths`
+(files, or directory prefixes matched by path component, so `secrets/` does not
+match `secrets-x/` or `docs/secrets/`) covers only heads that touch one of the
+paths. Absent: unchanged behaviour (the forge rebases a head whose base moved).
+
+A covered head lands only as a pure fast-forward of the default branch: cfrg
+merges with `Do=fast-forward-only` (the forge moves the ref, no new commit, no
+merge commit, no squash; every landing path in cfrg uses this style). If the
+base moved, cfrg never calls the forge's rebase: it cancels the scheduled
+merge, comments "this repository requires signed fast-forward landings: rebase
+locally, re-sign, push again", closes the pull request, reports `blocked` with
+`reason: rebase-forbidden`, and the queue moves on. Whether a head touches a
+path is read from `GET commits?sha=<head>&not=<default>&files=true` (every
+commit's own file list, so a later revert does not hide a signed change) plus
+the net `pulls/<n>/files`; an incomplete answer counts as touching (fail
+closed). Heads not touching the paths still rebase normally.
+

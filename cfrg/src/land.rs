@@ -108,6 +108,10 @@ pub trait LandTarget {
     /// if any. A forbidden commit the forge does not have cannot be in the
     /// history of any head it holds, so that answers `None`.
     fn forbidden_ancestor(&mut self, head: &str, forbidden: &[String]) -> Result<Option<String>>;
+    /// Whether any commit the entry head adds beyond the default branch (or
+    /// its net change) touches one of `paths` (see [`path_matches`]). Must
+    /// fail closed: an answer that cannot be complete is `true`.
+    fn touches_paths(&mut self, entry: &Entry, paths: &[String]) -> Result<bool>;
     /// Fast-forward-only merge of exactly `entry.head`.
     fn merge(&mut self, entry: &Entry) -> Result<Merge>;
     /// Remove the entry from the queue, with an explanation for the author.
@@ -252,7 +256,40 @@ pub struct Settings {
     pub forbidden_ancestors: Vec<String>,
     /// The declared list could not be read: nothing lands until it can.
     pub guard_error: Option<String>,
+    /// Never rebase or re-commit any head of this repository: it lands as a
+    /// pure fast-forward or it is refused (signed commits must stay intact).
+    pub rebase_never: bool,
+    /// Heads touching one of these paths are never rebased (same rule).
+    pub no_rebase_paths: Vec<String>,
 }
+
+impl Settings {
+    /// Whether a rebase of this entry would be forbidden.
+    fn rebase_forbidden(&self, target: &mut dyn LandTarget, entry: &Entry) -> Result<bool> {
+        if self.rebase_never {
+            return Ok(true);
+        }
+        if self.no_rebase_paths.is_empty() {
+            return Ok(false);
+        }
+        target.touches_paths(entry, &self.no_rebase_paths)
+    }
+}
+
+/// Whether a changed file path falls under a declared protected path: the
+/// path itself, or anything below it when it names a directory (a trailing
+/// slash is optional).
+pub fn path_matches(changed: &str, protected: &str) -> bool {
+    let protected = protected.trim_end_matches('/');
+    changed == protected
+        || changed
+            .strip_prefix(protected)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Reason given when a base that moved would require a rebase.
+pub const SIGNED_FF_ONLY: &str =
+    "this repository requires signed fast-forward landings: rebase locally, re-sign, push again";
 
 /// Reason given to the author of a head that carries a forbidden commit.
 pub const PRE_REWRITE: &str =
@@ -396,6 +433,10 @@ pub fn step(
             });
         };
         if !target.contains_tip(&entry)? {
+            if settings.rebase_forbidden(target, &entry)? {
+                refuse_rebase(target, journal, repository, &entry, &mut events);
+                continue;
+            }
             match target.rebase(&entry)? {
                 None => {
                     target.abandon(
@@ -533,6 +574,26 @@ fn refuse_forbidden(
     let comment = target.abandon(entry, &reason);
     events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head,"forbidden":found,"reason":"forbidden-ancestor","stage":stage,"cancelled":cancelled.is_ok(),"commented":comment.is_ok()}));
     Ok(true)
+}
+
+/// Refuse an entry whose base moved where a rebase is not allowed: no
+/// rebase, no merge; the entry is commented, closed and remembered as blocked.
+fn refuse_rebase(
+    target: &mut dyn LandTarget,
+    journal: &mut Journal,
+    repository: &str,
+    entry: &Entry,
+    events: &mut Vec<Value>,
+) {
+    let reason = format!(
+        "cfrg land: refused. The head {} is not a fast-forward of the default branch and {SIGNED_FF_ONLY}. Nothing was rebased or merged.",
+        entry.head
+    );
+    journal.blocked.insert(Journal::key(repository, entry));
+    journal.unschedule(repository, entry);
+    let cancelled = target.unschedule(entry);
+    let comment = target.abandon(entry, &reason);
+    events.push(json!({"event":"blocked","number":entry.number,"branch":entry.branch,"head":entry.head,"reason":"rebase-forbidden","cancelled":cancelled.is_ok(),"commented":comment.is_ok()}));
 }
 
 fn is_gated(
@@ -790,6 +851,22 @@ pub struct RepositoryPolicy {
     /// Forbidden commits for this repository, added to the policy-wide ones.
     #[serde(default)]
     pub forbidden_ancestors: Vec<String>,
+    /// `"never"`: no head of this repository is ever rebased or re-committed;
+    /// it lands as a pure fast-forward or is refused. `"allow"` (default).
+    #[serde(default)]
+    pub rebase: RebaseMode,
+    /// Heads touching one of these paths (file, or directory prefix) are never
+    /// rebased, same rule as `rebase = "never"`; other heads still rebase.
+    #[serde(default)]
+    pub no_rebase_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebaseMode {
+    #[default]
+    Allow,
+    Never,
 }
 
 fn default_contexts() -> Vec<String> {
@@ -834,6 +911,18 @@ impl Policy {
         }
         for repo in &self.repositories {
             commits(&repo.forbidden_ancestors)?;
+            for p in &repo.no_rebase_paths {
+                let bare = p.trim_end_matches('/');
+                if bare.is_empty()
+                    || p.starts_with('/')
+                    || p.contains('\0')
+                    || bare
+                        .split('/')
+                        .any(|c| c.is_empty() || c == "." || c == "..")
+                {
+                    return Err(failure("Invalid no_rebase_paths entry"));
+                }
+            }
         }
         let timeout_ok = |t: u64| (60..=86_400).contains(&t);
         if !timeout_ok(self.gate_timeout_seconds)
@@ -930,6 +1019,13 @@ impl Policy {
             gate_timeout_seconds: self.gate_timeout(path),
             forbidden_ancestors,
             guard_error,
+            rebase_never: self
+                .repository(path)
+                .is_some_and(|r| r.rebase == RebaseMode::Never),
+            no_rebase_paths: self
+                .repository(path)
+                .map(|r| r.no_rebase_paths.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1016,6 +1112,8 @@ mod tests {
         tip: String,
         /// Commits in each head's history, by head.
         history: BTreeMap<String, Vec<String>>,
+        /// Files changed by each head, by head.
+        files: BTreeMap<String, Vec<String>>,
     }
 
     fn entry(number: u64, head: &str) -> Entry {
@@ -1084,6 +1182,13 @@ mod tests {
             let history = self.history.get(head).cloned().unwrap_or_default();
             Ok(forbidden.iter().find(|f| history.contains(f)).cloned())
         }
+        fn touches_paths(&mut self, entry: &Entry, paths: &[String]) -> Result<bool> {
+            self.log.push(format!("paths {}", entry.head));
+            let files = self.files.get(&entry.head).cloned().unwrap_or_default();
+            Ok(files
+                .iter()
+                .any(|f| paths.iter().any(|p| path_matches(f, p))))
+        }
         fn merge(&mut self, entry: &Entry) -> Result<Merge> {
             if self.moved {
                 return Ok(Merge::HeadMoved);
@@ -1134,6 +1239,8 @@ mod tests {
             gate_timeout_seconds: 2700,
             forbidden_ancestors: Vec::new(),
             guard_error: None,
+            rebase_never: false,
+            no_rebase_paths: Vec::new(),
         }
     }
 
@@ -1347,6 +1454,8 @@ mod tests {
             gate_timeout_seconds: 100,
             forbidden_ancestors: Vec::new(),
             guard_error: None,
+            rebase_never: false,
+            no_rebase_paths: Vec::new(),
         }
     }
 
@@ -1805,5 +1914,160 @@ mod tests {
         enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
         enqueue(&mut fake, &settings(), &mut journal, "o/r", "b1").unwrap();
         assert_eq!(fake.log, ["enqueue b1", "unschedule 1", "enqueue b1"]);
+    }
+
+    fn no_rebase_paths() -> Settings {
+        Settings {
+            no_rebase_paths: vec!["secrets/".into()],
+            ..settings()
+        }
+    }
+
+    fn behind_fake(head: &str, files: &[&str]) -> Fake {
+        let mut fake = Fake {
+            queue: vec![entry(1, head)],
+            behind: BTreeSet::from([1]),
+            tip: "tip2".into(),
+            ..Fake::default()
+        };
+        fake.statuses.extend([green(head)]);
+        fake.files
+            .insert(head.into(), files.iter().map(|f| f.to_string()).collect());
+        fake
+    }
+
+    #[test]
+    fn fast_forward_head_lands_unchanged_under_every_no_rebase_option() {
+        for options in [
+            Settings {
+                rebase_never: true,
+                ..settings()
+            },
+            no_rebase_paths(),
+        ] {
+            let mut fake = Fake {
+                queue: vec![entry(1, "h1")],
+                ..Fake::default()
+            };
+            fake.statuses.extend([green("h1")]);
+            fake.files.insert("h1".into(), vec!["secrets/a".into()]);
+            let report = step(
+                &mut fake,
+                &mut Hook::default(),
+                &options,
+                &mut Journal::default(),
+                "o/r",
+            )
+            .unwrap();
+            assert_eq!(fake.log, ["merge 1@h1"]);
+            assert!(!report.waiting);
+        }
+    }
+
+    #[test]
+    fn behind_head_touching_a_protected_path_is_refused_without_rebase() {
+        let mut fake = behind_fake("h1", &["README.md", "secrets/x.yml"]);
+        let report = step(
+            &mut fake,
+            &mut Hook::default(),
+            &no_rebase_paths(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["paths h1", "unschedule 1", "abandon 1"]);
+        assert!(report
+            .events
+            .iter()
+            .any(|e| e["event"] == "blocked" && e["reason"] == "rebase-forbidden"));
+        assert!(!report.waiting);
+    }
+
+    #[test]
+    fn behind_head_is_refused_when_the_whole_repository_never_rebases() {
+        let mut fake = behind_fake("h1", &["README.md"]);
+        let options = Settings {
+            rebase_never: true,
+            ..settings()
+        };
+        step(
+            &mut fake,
+            &mut Hook::default(),
+            &options,
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["unschedule 1", "abandon 1"]);
+    }
+
+    #[test]
+    fn behind_head_not_touching_protected_paths_still_rebases() {
+        let mut fake = behind_fake("h1", &["secrets-notes.md", "docs/secrets/x"]);
+        let mut hook = Hook::default();
+        let report = step(
+            &mut fake,
+            &mut hook,
+            &no_rebase_paths(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert_eq!(fake.log, ["paths h1", "rebase 1", "schedule 1@h1r"]);
+        assert!(report.waiting);
+    }
+
+    #[test]
+    fn refused_entry_does_not_block_the_next_one() {
+        let mut fake = behind_fake("h1", &["secrets/x"]);
+        fake.queue.push(entry(2, "h2"));
+        fake.statuses.extend([green("h2")]);
+        let report = step(
+            &mut fake,
+            &mut Hook::default(),
+            &no_rebase_paths(),
+            &mut Journal::default(),
+            "o/r",
+        )
+        .unwrap();
+        assert!(fake.log.contains(&"merge 2@h2".to_string()));
+        assert!(!report.waiting);
+    }
+
+    #[test]
+    fn absent_options_leave_the_policy_unchanged() {
+        let policy: Policy = serde_json::from_str(
+            r#"{"schema":1,"forge":"forgejo","endpoint":{"origin":"https://f.example","token_env":"T"},"repositories":[{"path":"o/r"}]}"#,
+        )
+        .unwrap();
+        let s = policy.settings("o/r");
+        assert!(!s.rebase_never && s.no_rebase_paths.is_empty());
+    }
+
+    #[test]
+    fn policy_options_parse_validate_and_reach_the_settings() {
+        let text = |paths: &str| {
+            format!(
+                r#"{{"schema":1,"forge":"forgejo","endpoint":{{"origin":"https://f.example","token_env":"T"}},"repositories":[{{"path":"o/r","rebase":"never","no_rebase_paths":{paths}}}]}}"#
+            )
+        };
+        let policy: Policy = serde_json::from_str(&text(r#"["secrets/"]"#)).unwrap();
+        policy.validate().unwrap();
+        let s = policy.settings("o/r");
+        assert!(s.rebase_never && s.no_rebase_paths == ["secrets/"]);
+        for bad in [r#"[""]"#, r#"["/etc"]"#, r#"["a/../b"]"#, r#"["/"]"#] {
+            let policy: Policy = serde_json::from_str(&text(bad)).unwrap();
+            assert!(policy.validate().is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Policy>(&text("[]").replace("never", "sometimes")).is_err());
+    }
+
+    #[test]
+    fn protected_path_matching_is_by_component() {
+        assert!(path_matches("secrets/a/b", "secrets/"));
+        assert!(path_matches("secrets/a", "secrets"));
+        assert!(path_matches("a.yml", "a.yml"));
+        assert!(!path_matches("secrets-x/a", "secrets/"));
+        assert!(!path_matches("docs/secrets/a", "secrets/"));
     }
 }

@@ -18,7 +18,9 @@
 //!   download anonymously from public owners; the files listing carries the
 //!   SHA-256 the forge computed.
 use cfrg::{
-    land::{branch_name, commit_id, Capability, Entry, LandTarget, Merge, Support, MARKER},
+    land::{
+        branch_name, commit_id, path_matches, Capability, Entry, LandTarget, Merge, Support, MARKER,
+    },
     native::{
         encode,
         http::{expect, Auth, Request, Response, Transport},
@@ -397,6 +399,65 @@ impl LandTarget for Land<'_> {
         Ok(None)
     }
 
+    fn touches_paths(&mut self, entry: &Entry, paths: &[String]) -> Result<bool> {
+        commit_id(&entry.head)?;
+        let default = self.default_branch()?;
+        let hit =
+            |name: Option<&str>| name.is_some_and(|n| paths.iter().any(|p| path_matches(n, p)));
+        // Every commit the head adds beyond the default branch, with its own
+        // file list: a change that a later commit reverts still counts, since
+        // a rebase would destroy that commit's signature too. Anything that
+        // cannot be read completely answers `true` (fail closed).
+        const PAGE: usize = 50;
+        const PAGES: usize = 6;
+        for page in 1..=PAGES {
+            let list = self.get(&format!(
+                "/commits?sha={}&not={}&limit={PAGE}&page={page}&stat=false&verification=false&files=true",
+                entry.head,
+                encode(&default)
+            ))?;
+            let commits = list.as_array().ok_or("Malformed commit list")?;
+            for commit in commits {
+                let Some(files) = commit["files"].as_array() else {
+                    return Ok(true);
+                };
+                if files.is_empty() && commit["parents"].as_array().is_none_or(|p| p.len() > 1) {
+                    return Ok(true);
+                }
+                if files
+                    .iter()
+                    .any(|f| hit(f["filename"].as_str()) || hit(f["previous_filename"].as_str()))
+                {
+                    return Ok(true);
+                }
+            }
+            if commits.len() < PAGE {
+                break;
+            }
+            if page == PAGES {
+                return Ok(true);
+            }
+        }
+        // The net change of the pull request as a second opinion.
+        for page in 1..=PAGES {
+            let list = self.get(&format!(
+                "/pulls/{}/files?limit={PAGE}&page={page}",
+                entry.number
+            ))?;
+            let files = list.as_array().ok_or("Malformed file list")?;
+            if files
+                .iter()
+                .any(|f| hit(f["filename"].as_str()) || hit(f["previous_filename"].as_str()))
+            {
+                return Ok(true);
+            }
+            if files.len() < PAGE {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn merge(&mut self, entry: &Entry) -> Result<Merge> {
         // The head must still be exactly the commit whose status was observed.
         // The merge below also names it (`head_commit_id`); this read makes the
@@ -737,6 +798,81 @@ mod tests {
             .unwrap()
             .forbidden_ancestor(&head, &["4".repeat(40)])
             .is_err());
+    }
+
+    #[test]
+    fn touches_paths_reads_every_commit_file_list_and_fails_closed() {
+        let endpoint = endpoint();
+        let e = entry(&pull(3, "ci/s", 'a', MARKER)).unwrap();
+        let paths = vec!["secrets/".to_string()];
+        let default = json!({"default_branch": "main"});
+        let commit = |names: &[&str]| {
+            json!({"sha": "1", "parents": [{"sha": "0"}],
+                "files": names.iter().map(|n| json!({"filename": n})).collect::<Vec<_>>()})
+        };
+        // A touching commit answers yes without reading the net diff.
+        let mut io = script(vec![
+            ("GET", "/api/v1/repos/o/r", 200, default.clone()),
+            (
+                "GET",
+                "/commits?sha=",
+                200,
+                json!([commit(&["a"]), commit(&["secrets/x.yml"])]),
+            ),
+        ]);
+        assert!(Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .touches_paths(&e, &paths)
+            .unwrap());
+        // Nothing touching in commits or net diff: no.
+        let mut io = script(vec![
+            ("GET", "/api/v1/repos/o/r", 200, default.clone()),
+            (
+                "GET",
+                "/commits?sha=",
+                200,
+                json!([commit(&["docs/secrets/a", "secrets-x"])]),
+            ),
+            (
+                "GET",
+                "/pulls/3/files",
+                200,
+                json!([{"filename": "docs/secrets/a"}]),
+            ),
+        ]);
+        assert!(!Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .touches_paths(&e, &paths)
+            .unwrap());
+        // A commit without a file list cannot be vouched for: yes.
+        let mut io = script(vec![
+            ("GET", "/api/v1/repos/o/r", 200, default.clone()),
+            (
+                "GET",
+                "/commits?sha=",
+                200,
+                json!([{"sha": "1", "parents": [{"sha": "0"}]}]),
+            ),
+        ]);
+        assert!(Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .touches_paths(&e, &paths)
+            .unwrap());
+        // Only the net diff sees it (a rename source): yes.
+        let mut io = script(vec![
+            ("GET", "/api/v1/repos/o/r", 200, default),
+            ("GET", "/commits?sha=", 200, json!([commit(&["x"])])),
+            (
+                "GET",
+                "/pulls/3/files",
+                200,
+                json!([{"filename": "y", "previous_filename": "secrets/z"}]),
+            ),
+        ]);
+        assert!(Land::new(&endpoint, "o/r", &mut io)
+            .unwrap()
+            .touches_paths(&e, &paths)
+            .unwrap());
     }
 
     #[test]
