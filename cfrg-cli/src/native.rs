@@ -520,9 +520,10 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
             (Operation::Plan | Operation::Status | Operation::Reconcile, false) => false,
             _ => return Ok(()),
         };
-        // Our own forge: no provider spacing, only a short gap between writes.
+        // Our own forge, reached inside the cluster: one read a second (the guard in front of Forgejo
+        // limits browsing per address), a short gap between writes, no creation spacing of a provider.
         io.set_pacing(Pacing {
-            read: 0,
+            read: 1,
             write: 2,
             creation: 0,
         });
