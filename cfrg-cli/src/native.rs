@@ -1,6 +1,8 @@
+mod copy;
+
 use cfrg::{
     native::{
-        http::{Http, Transport},
+        http::{Http, Pacing, Transport},
         Content, Destination, Naming, Placement, Provider, Repository,
     },
     Result,
@@ -23,7 +25,7 @@ pub struct Options {
     #[arg(long)]
     repository: Option<String>,
     /// Reconcile one provider without changing other declared destinations.
-    #[arg(long, value_parser = ["gitlab", "bitbucket", "github"])]
+    #[arg(long, value_parser = ["gitlab", "bitbucket", "github", "copy"])]
     provider: Option<String>,
     /// Existing projects still reconcile; missing repositories are only reported.
     #[arg(long)]
@@ -119,8 +121,13 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     let mut io = Http::open(&options.state, options.apply)?;
     let mut report = Vec::new();
     let mut incomplete = false;
+    // `--provider copy` runs the copy pass alone.
+    let copy_only = options.provider.as_deref() == Some("copy");
+    if copy_only && placement.copy.is_none() {
+        return Err("The placement declares no copy".into());
+    }
     let result = (|| -> Result<()> {
-        for declared in &placement.repositories {
+        for declared in placement.repositories.iter().filter(|_| !copy_only) {
             if options
                 .repository
                 .as_ref()
@@ -488,7 +495,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
             if options.operation == Operation::SyncNow {
                 // This Forgejo endpoint synchronizes every remote; never trigger
                 // undeclared, held, absent or unprotected destinations as a side effect.
-                if !all_mirrors_managed(&mirrors, &managed) {
+                let unmanaged: Vec<Value> = mirrors
+                    .iter()
+                    .filter(|m| !copy::is_copy_mirror(placement.copy.as_ref(), m))
+                    .cloned()
+                    .collect();
+                if !all_mirrors_managed(&unmanaged, &managed) {
                     return Err("Sync-now would include an unmanaged or unready mirror".into());
                 }
                 if options.apply && !mirrors.is_empty() {
@@ -498,6 +510,35 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
         }
         Ok(())
     })();
+    let result = result.and_then(|()| {
+        let wanted = options.provider.is_none() || copy_only;
+        let Some(copy) = placement.copy.as_ref().filter(|_| wanted) else {
+            return Ok(());
+        };
+        let write = match (options.operation, options.apply) {
+            (Operation::Reconcile, true) => true,
+            (Operation::Plan | Operation::Status | Operation::Reconcile, false) => false,
+            _ => return Ok(()),
+        };
+        // Our own forge: no provider spacing, only a short gap between writes.
+        io.set_pacing(Pacing {
+            read: 0,
+            write: 2,
+            creation: 0,
+        });
+        let mut ssh;
+        let mut none = copy::NoReceiver;
+        let receiver: &mut dyn copy::Receiver = if write {
+            ssh = copy::Ssh::open(copy)?;
+            &mut ssh
+        } else {
+            &mut none
+        };
+        let (rows, open) = copy::reconcile(copy, &placement.source, &mut io, receiver, write)?;
+        report.extend(rows);
+        incomplete |= open;
+        Ok(())
+    });
     Ok((report, incomplete, result))
 }
 

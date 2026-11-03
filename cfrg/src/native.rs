@@ -20,6 +20,28 @@ pub struct Placement {
     #[serde(default)]
     pub primaries: BTreeMap<String, String>,
     pub repositories: Vec<Repository>,
+    /// A plain git host over SSH that receives EVERY repository the source lists
+    /// (and its wiki): a policy over the forge's own listing, not a list of
+    /// repositories, so a new repository is covered without a placement edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<Copy>,
+}
+
+/// The receiver of the copy. Forgejo's own SSH push mirrors do the transfer; cfrg
+/// provisions the bare repositories and admits each mirror's public key through
+/// the receiver's admin channel (docs/native-mirrors.md, "The copy").
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Copy {
+    /// `host` or `host:port` of the receiver's SSH server, as the forge reaches it.
+    pub host: String,
+    /// Login of the receiving account, never an email.
+    pub user: String,
+    /// Environment reference naming a file with cfrg's private key for the admin channel.
+    pub admin_key_env: String,
+    /// Environment reference naming the known_hosts file that pins the receiver's host key.
+    pub known_hosts_env: String,
+    pub interval_seconds: u64,
 }
 
 /// The identity senders write as when Forgejo is a receiver, and the
@@ -244,6 +266,9 @@ impl Placement {
                 ));
             }
         }
+        if let Some(copy) = &self.copy {
+            copy.validate()?;
+        }
         let mut sources = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for repo in &self.repositories {
@@ -317,6 +342,52 @@ impl Placement {
             }
         }
         Ok(())
+    }
+}
+
+impl Copy {
+    pub fn validate(&self) -> Result<()> {
+        env_name(&self.admin_key_env)?;
+        env_name(&self.known_hosts_env)?;
+        let (host, port) = self.host_and_port();
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+            || port.is_some_and(|p| p.is_empty() || p.parse::<u16>().is_err())
+        {
+            return Err(failure(
+                "Copy host must be a plain host name or address with an optional port",
+            ));
+        }
+        if self.user.is_empty()
+            || !self
+                .user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(failure("Copy user must be a login, never an email"));
+        }
+        if self.interval_seconds < 600 {
+            return Err(failure("Copy interval below ten minutes"));
+        }
+        Ok(())
+    }
+    /// The host and the optional port text of `host[:port]`.
+    pub fn host_and_port(&self) -> (&str, Option<&str>) {
+        match self.host.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (&self.host, None),
+        }
+    }
+    /// The address of a repository on the receiver as the API reports it (the
+    /// account is sanitized away). `path` is `<owner>/<repo>`, lowercase.
+    pub fn address(&self, path: &str) -> String {
+        format!("ssh://{}/{path}.git", self.host)
+    }
+    /// The address handed to Forgejo when the mirror is created.
+    pub fn push_address(&self, path: &str) -> String {
+        format!("ssh://{}@{}/{path}.git", self.user, self.host)
     }
 }
 
@@ -539,6 +610,46 @@ mod tests {
             let placement = Placement::from_document(bad.as_bytes()).unwrap();
             assert!(placement.validate().is_err());
         }
+    }
+
+    #[test]
+    fn the_copy_is_one_policy_with_a_plain_host_a_login_and_a_floor_interval() {
+        let document = |copy: &str| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[],"copy":{copy}}}"#
+            )
+        };
+        let good = r#"{"host":"10.0.42.6","user":"richc","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#;
+        let placement = Placement::from_document(document(good).as_bytes()).unwrap();
+        placement.validate().unwrap();
+        let copy = placement.copy.unwrap();
+        assert_eq!(copy.address("org/repo"), "ssh://10.0.42.6/org/repo.git");
+        assert_eq!(
+            copy.push_address("org/repo"),
+            "ssh://richc@10.0.42.6/org/repo.git"
+        );
+        for bad in [
+            good.replace("10.0.42.6", "srv/evil"),
+            good.replace("10.0.42.6", "srv:"),
+            good.replace("10.0.42.6", "srv:99999"),
+            good.replace("richc", "a@b"),
+            good.replace("600", "599"),
+            good.replace("\"K\"", "\"k\""),
+            good.replace("}", ",\"extra\":1}"),
+        ] {
+            let result = Placement::from_document(document(&bad).as_bytes());
+            assert!(
+                result.is_err() || result.unwrap().validate().is_err(),
+                "{bad}"
+            );
+        }
+        let with_port = good.replace("10.0.42.6", "10.0.42.6:2222");
+        let placement = Placement::from_document(document(&with_port).as_bytes()).unwrap();
+        placement.validate().unwrap();
+        assert_eq!(
+            placement.copy.unwrap().host_and_port(),
+            ("10.0.42.6", Some("2222"))
+        );
     }
 
     #[test]

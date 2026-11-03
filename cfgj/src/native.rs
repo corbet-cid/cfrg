@@ -9,6 +9,87 @@ use cfrg::{
 };
 use serde_json::{json, Value};
 
+/// A repository of the source as the copy sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub id: u64,
+    /// `owner/repo`, lowercase: the name the copy carries.
+    pub path: String,
+    pub default_branch: String,
+    pub archived: bool,
+    pub has_wiki: bool,
+}
+
+/// Every repository the token sees, in id order. The listing is the declaration of
+/// what the copy covers, so a repository nobody wrote down is covered all the same.
+pub fn list_repositories(io: &mut dyn Transport, endpoint: &Endpoint) -> Result<Vec<Listed>> {
+    let mut all = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for page in 1..=100 {
+        let value = expect(
+            io.send(Request {
+                endpoint: endpoint.clone(),
+                auth: Auth::Token,
+                method: "GET",
+                path: format!("/api/v1/repos/search?limit=50&page={page}&sort=id&order=asc"),
+                body: None,
+                scope: format!("{}/api", endpoint.origin),
+                creation: false,
+            })?,
+            &[200],
+        )?;
+        let data = value["data"]
+            .as_array()
+            .ok_or("Malformed Forgejo repository search")?;
+        if data.is_empty() {
+            return Ok(all);
+        }
+        for item in data {
+            let id = item["id"].as_u64().ok_or("Missing repository id")?;
+            if !seen.insert(id) {
+                return Err("Repeated repository page".into());
+            }
+            let path = item["full_name"]
+                .as_str()
+                .ok_or("Missing repository name")?
+                .to_ascii_lowercase();
+            cfrg::native::path(&path, false)?;
+            all.push(Listed {
+                id,
+                path,
+                default_branch: item["default_branch"]
+                    .as_str()
+                    .ok_or("Missing default branch")?
+                    .to_string(),
+                archived: item["archived"] == true,
+                has_wiki: item["has_wiki"] == true,
+            });
+        }
+    }
+    Err("Forgejo repository pagination bound exceeded".into())
+}
+
+/// Whether the repository has a wiki to copy: the pages list answers 404 while the
+/// wiki git repository does not exist, however the wiki unit is set.
+pub fn wiki_exists(io: &mut dyn Transport, endpoint: &Endpoint, path: &str) -> Result<bool> {
+    cfrg::native::path(path, false)?;
+    let response = io.send(Request {
+        endpoint: endpoint.clone(),
+        auth: Auth::Token,
+        method: "GET",
+        path: format!("/api/v1/repos/{path}/wiki/pages?limit=1"),
+        body: None,
+        scope: format!("{}/api", endpoint.origin),
+        creation: false,
+    })?;
+    if response.status == 404 {
+        return Ok(false);
+    }
+    Ok(expect(response, &[200])?
+        .as_array()
+        .is_some_and(|pages| !pages.is_empty()))
+}
+
 pub struct Mirrors<'a> {
     pub endpoint: &'a Endpoint,
     pub repository: &'a Repository,
@@ -144,6 +225,21 @@ impl Mirrors<'_> {
         }
         self.call(io, "POST", "/push_mirrors", Some(body), &[200, 201])
     }
+    /// An SSH push mirror to a plain git host: Forgejo generates the key pair and
+    /// reports the public half; nothing else is passed.
+    pub fn create_ssh(
+        &self,
+        io: &mut dyn Transport,
+        remote_address: &str,
+        interval_seconds: u64,
+    ) -> Result<Value> {
+        let body = json!({
+            "remote_address": remote_address, "use_ssh": true,
+            "interval": format!("{interval_seconds}s"),
+            "sync_on_commit": true, "branch_filter": "",
+        });
+        self.call(io, "POST", "/push_mirrors", Some(body), &[200, 201])
+    }
     /// Forgejo's API enqueues ALL mirrors on this repository, not one remote.
     /// The reconciler must verify that every listed mirror is authorized first.
     pub fn sync_now(&self, io: &mut dyn Transport) -> Result<()> {
@@ -199,7 +295,8 @@ pub fn address_matches(mirror: &Value, url: &str) -> bool {
     clean.as_deref() == Some(url)
 }
 
-fn duration_seconds(value: &str) -> Option<u64> {
+/// Forgejo reports an interval as a Go duration (`10m0s`, `1h0m0s`).
+pub fn duration_seconds(value: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut number = String::new();
     for c in value.chars() {

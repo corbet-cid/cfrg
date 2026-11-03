@@ -145,6 +145,11 @@ impl Http {
         self.pacing = pacing;
         self
     }
+    /// Change the request spacing in the middle of a run (the copy pass talks to
+    /// our own forge only and needs no provider spacing).
+    pub fn set_pacing(&mut self, pacing: Pacing) {
+        self.pacing = pacing;
+    }
     pub fn save(&self) -> Result<()> {
         let parent = self
             .state_path

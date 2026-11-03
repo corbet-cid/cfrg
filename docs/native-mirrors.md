@@ -117,6 +117,38 @@ Bitbucket restricts branch pushes to the declared account, denies merges and
 refuses existing force/delete restrictions that would prevent native mirroring.
 Administrative changes and destination tags are outside these branch checks.
 
+## The copy: every repository and wiki on one plain git host
+
+`"copy"` in the placement is a POLICY over the forge's own repository listing, not a list of repositories:
+`cfrg native --operation reconcile --provider copy --apply` (no `--provider` runs it after the providers) gives
+every repository the source lists an SSH push mirror to one plain git host, so a repository nobody wrote down is
+covered too. Forgejo does the transfer (sync on commit, plus the interval as a safety net); cfrg provisions.
+
+```json
+"copy": {"host": "10.0.42.6", "user": "richc", "admin_key_env": "CFRG_COPY_KEY",
+         "known_hosts_env": "CFRG_COPY_KNOWN_HOSTS", "interval_seconds": 600}
+```
+
+`host` is `host` or `host:port`, `user` a login, both `*_env` references name FILES (the private key of the
+receiver's admin channel and a known_hosts file that pins the host key; ssh runs with `StrictHostKeyChecking=yes`,
+`BatchMode` and `IdentitiesOnly`). Each pass, per repository: `ensure <path> <default-branch> <wiki 0|1>` creates the
+bare repository (and the wiki twin) and sets HEAD; then the push mirror is created if missing (or replaced when its
+address, interval, SSH key or sync-on-commit differ, which also follows a renamed repository); finally
+`admit <path> <ssh-ed25519 key>` hands Forgejo's generated public key to the receiver, for every mirror on every
+pass (idempotent, heals a lost keys file). Commands go over the admin channel one per line on stdin and are answered
+by one line each (`ok`, `ok wiki-created`, or `err ...`); the receiver never deletes a repository.
+
+| Fact (verified on Forgejo 17.0.1) | Consequence |
+|---|---|
+| A new push mirror pushes nothing until the next commit or the interval | seed the receiver, or wait one interval |
+| The wiki is pushed only if `git ls-remote <address>.wiki.git` succeeds when the mirror is CREATED, as the Forgejo process, without the mirror's key | the forge process needs a read-only probe key (`GIT_SSH_COMMAND`), and the twin must exist before the mirror; `ok wiki-created` on a repository that already has a mirror replaces the mirror |
+| A wiki-only edit does not trigger sync on commit | a wiki follows within one interval (or with the next push to the repository) |
+| Branches and tags are pushed, `refs/pull/*` are not | the copy has no pull request head refs |
+| Archived repositories refuse a new push mirror | reported `archived`; seed them once (they cannot change) |
+| Destinations on a private address are refused unless `[migrations] ALLOWED_DOMAINS` names them | `external,<host>` on the forge |
+
+A read-only pass (`plan`, `status`, or `reconcile` without `--apply`) writes nothing and needs no receiver.
+
 ## GitHub as a destination
 
 `"provider": "github"` declares a GitHub repository as a destination of Forgejo's
