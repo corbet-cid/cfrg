@@ -30,6 +30,7 @@ pub mod access;
 pub mod bridge;
 pub mod collect;
 pub mod contents;
+pub mod gate;
 pub mod land;
 pub mod model;
 pub mod native;

@@ -22,6 +22,7 @@ use std::{
 };
 
 mod contents;
+mod gate;
 mod land;
 mod native;
 mod observe;
@@ -44,6 +45,8 @@ struct Cli {
 enum Action {
     /// Reconcile Forgejo native push mirrors from repository-owned placement.
     Native(native::Options),
+    /// The GitHub write gate: budgets, queue, coalescing, priority lane, kill switch.
+    Gate(gate::Options),
     /// Land a pushed branch: only the exact green commit reaches the default branch.
     Land(land::Options),
     /// Publish a build artifact for an exact commit; consumers fetch it by URL and hash.
@@ -398,6 +401,7 @@ fn observed_world(
 fn run(action: Action) -> Result<()> {
     match action {
         Action::Native(options) => native::run(options)?,
+        Action::Gate(options) => gate::run(options)?,
         Action::Land(options) => land::run(options)?,
         Action::Release(options) => release::run(options)?,
         Action::Observe(options) => observe::run(options)?,
