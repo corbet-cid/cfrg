@@ -215,7 +215,7 @@ impl Mirrors<'_> {
                 cfrg::native::Provider::Github => destination.mirror_user.as_str(),
             },
             "remote_password": password, "interval": format!("{}s", destination.interval_seconds),
-            "sync_on_commit": true, "branch_filter": destination.branch_filter,
+            "sync_on_commit": destination.sync_on_commit, "branch_filter": destination.branch_filter,
         });
         if destination.use_ssh {
             let fields = body.as_object_mut().ok_or("Invalid mirror body")?;
@@ -270,7 +270,7 @@ pub fn status(mirror: &Value) -> Value {
 pub fn matches(mirror: &Value, destination: &Destination, url: &str) -> bool {
     address_matches(mirror, url)
         && destination.use_ssh == mirror["public_key"].as_str().is_some_and(|s| !s.is_empty())
-        && mirror["sync_on_commit"] == true
+        && mirror["sync_on_commit"] == destination.sync_on_commit
         && mirror["branch_filter"].as_str().unwrap_or("") == destination.branch_filter
         && duration_seconds(mirror["interval"].as_str().unwrap_or(""))
             == Some(destination.interval_seconds)
@@ -346,6 +346,35 @@ mod tests {
             &mirror,
             "ssh://git@gitlab.example/team/other.git"
         ));
+    }
+
+    fn github_destination(extra: Value) -> Destination {
+        let mut value = json!({"provider":"github","endpoint":{"origin":"https://api.github.com","token_env":"G"},"path":"org/repo","namespace":"org","repository_id":"7","mirror_user":"u","password_env":"G","interval_seconds":3600});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_destination_pushes_on_commit_unless_it_says_otherwise() {
+        let url = "https://github.com/org/repo.git";
+        let mirror = |on_commit: bool| json!({"remote_address": url, "interval": "1h0m0s", "sync_on_commit": on_commit, "branch_filter": ""});
+        let default = github_destination(json!({}));
+        assert!(default.sync_on_commit);
+        assert!(matches(&mirror(true), &default, url));
+        assert!(
+            !matches(&mirror(false), &default, url),
+            "a mirror that does not push on commit drifts from the default"
+        );
+        let paced = github_destination(json!({"sync_on_commit": false}));
+        assert!(!paced.sync_on_commit);
+        assert!(matches(&mirror(false), &paced, url));
+        assert!(
+            !matches(&mirror(true), &paced, url),
+            "a mirror that pushes on every commit drifts from a paced destination"
+        );
     }
 
     struct SshCreate;

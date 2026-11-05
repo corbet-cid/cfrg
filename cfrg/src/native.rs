@@ -102,6 +102,10 @@ pub struct Destination {
     #[serde(default)]
     pub use_ssh: bool,
     pub interval_seconds: u64,
+    /// Whether Forgejo pushes at every commit (the default) or only at the interval. A destination that is paced
+    /// by a gate (GitHub) sets `false`: the interval coalesces any number of commits into one push.
+    #[serde(default = "sync_on_commit_default")]
+    pub sync_on_commit: bool,
     #[serde(default)]
     pub branch_filter: String,
     pub hold: Option<String>,
@@ -115,6 +119,10 @@ pub struct Destination {
     /// then configured without the receiver lock and the pass reports `lock`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_exception: Option<String>,
+}
+
+fn sync_on_commit_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

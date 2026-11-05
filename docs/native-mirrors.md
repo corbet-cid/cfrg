@@ -5,7 +5,7 @@ Forgejo replication. `--operation reconcile --apply` ensures declared GitLab or
 Bitbucket destinations and reconciles owned Forgejo push mirrors. `--operation
 status` lists redacted status; `--operation sync-now --apply` invokes Forgejo's
 repository-wide sync endpoint only after every remote passes ownership and
-protection checks. API create enables `sync_on_commit` and the declared interval.
+protection checks. API create enables `sync_on_commit` (unless the destination declares `"sync_on_commit": false`: a destination paced by a gate then receives one push per interval, however many commits came in) and the declared interval.
 Changes to mirror options replace the owned remote because Forgejo exposes no
 update operation. Declare `absent: true` and its `remote_name` to delete a mirror;
 this never deletes a destination repository. A declared hold removes owned push
