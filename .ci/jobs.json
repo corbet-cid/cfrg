@@ -1,46 +1,39 @@
 {
   "schema": 1,
   "generator": "ccid render v1",
-  "tool_revision": "78a4e05b4e1cb25aaeba3966951564d74277bcbd",
-  "manifest_sha256": "562d9bbee84ae0c91022fc6a5728b5954a1240446bcc34c32fad53d1a30abfbb",
+  "tool_revision": "bd9aff07073185fb0a3503bab331aedefb6d8fd2",
+  "manifest_sha256": "e45aeefdf74e46afa4da87b0afff651cd7a904bb2fac85664ee422c3c58d0eed",
   "jobs": {
     "build": {
       "job": "build",
-      "scheduler": "crow",
+      "scheduler": "forgejo",
       "checks": [
         "build"
       ],
-      "workflow": "repository-jobs",
-      "command": [
-        "bash",
-        ".ci/run-job.sh"
-      ]
-    },
-    "release": {
-      "job": "release",
-      "scheduler": "crow",
-      "checks": [
-        "publish"
-      ],
-      "workflow": "repository-jobs",
+      "workflow": "build",
       "command": [
         "bash",
         ".ci/run-job.sh"
       ],
-      "secrets": [
-        "CFRG_RELEASE_TOKEN"
+      "runs_on": "heavy",
+      "events": [
+        "manual"
       ]
     },
     "verify": {
       "job": "verify",
-      "scheduler": "crow",
+      "scheduler": "forgejo",
       "checks": [
         "test"
       ],
-      "workflow": "repository-jobs",
+      "workflow": "ci",
       "command": [
         "bash",
         ".ci/run-job.sh"
+      ],
+      "runs_on": "heavy",
+      "events": [
+        "manual"
       ]
     }
   }

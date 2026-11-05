@@ -2,9 +2,8 @@ schema = 1
 project = "cfrg"
 
 [render]
-tool_revision = "78a4e05b4e1cb25aaeba3966951564d74277bcbd"
-secret_environment = { CFRG_RELEASE_TOKEN = "cfrg_release_token" }
-
+tool_revision = "bd9aff07073185fb0a3503bab331aedefb6d8fd2"
+tool_sha256 = "38c0eadf2a2adb406f83c7d4892bc01a0a10b95671e1e671358e43a257bb5d23"
 # Locked: Cargo.lock is worker-resolved (see S-split/CI-NOTES.md); the
 # pinned tool passes --locked to every cargo invocation.
 [checks.test]
@@ -16,16 +15,20 @@ actions = ["build"]
 release = true
 
 [jobs.verify]
-scheduler = "crow"
+scheduler = "forgejo"
+runs_on = "heavy"
 checks = ["test"]
-workflow = "repository-jobs"
+workflow = "ci"
 command = ["bash", ".ci/run-job.sh"]
+events = ["manual"]
 
 [jobs.build]
-scheduler = "crow"
+scheduler = "forgejo"
+runs_on = "heavy"
 checks = ["build"]
-workflow = "repository-jobs"
+workflow = "build"
 command = ["bash", ".ci/run-job.sh"]
+events = ["manual"]
 
 # Publishes the binary built from this exact commit to the forge's package
 # registry (`cfrg release`): immutable per commit, fetched by URL and hash.
@@ -37,10 +40,5 @@ kind = "commands"
 cache = false
 commands = [["cargo", "run", "--release", "--locked", "-p", "cfrg-cli", "--", "release", "--config", ".ci/release.json", "publish", "--self"]]
 
-[jobs.release]
-scheduler = "crow"
-checks = ["publish"]
-workflow = "repository-jobs"
-command = ["bash", ".ci/run-job.sh"]
-# The registry token reaches this job only (Crow secret, manual events).
-secrets = ["CFRG_RELEASE_TOKEN"]
+# The release job (registry token) is retired from the scheduler until a Forgejo-native
+# release flow exists (manual unit with a sealed credential); the check stays declared.
