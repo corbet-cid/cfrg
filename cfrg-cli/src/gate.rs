@@ -59,13 +59,25 @@ enum Action {
         #[arg(long)]
         execute: bool,
     },
+    /// Delete one OLD PRIVATE GitHub repository named in the delete allowlist, if its default-branch head still equals the listed
+    /// commit. Refuses a public repository, an unlisted one and a changed head. A dry run (verifying everything, deleting nothing)
+    /// without --execute.
+    DeleteRepo {
+        /// `org/repo` listed in the allowlist.
+        repository: String,
+        /// Allowlist (JSON): `{"repos": {"org/repo": {"head": "<40-hex commit>"}}}`.
+        #[arg(long)]
+        allowlist: PathBuf,
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
-fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     std::io::Error::other(message.into()).into()
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -104,6 +116,18 @@ pub fn run(options: Options) -> Result<()> {
             &workflow,
             &reference,
             &inputs,
+            execute,
+        )?,
+        Action::DeleteRepo {
+            repository,
+            allowlist,
+            execute,
+        } => crate::delete::delete_repo(
+            &config,
+            &options.token_env,
+            &options.api,
+            &allowlist,
+            &repository,
             execute,
         )?,
     }
@@ -248,7 +272,7 @@ fn dispatch_inputs(inputs: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(result)
 }
 
-fn api_base(api: &str) -> Result<String> {
+pub(crate) fn api_base(api: &str) -> Result<String> {
     let value = api.trim_end_matches('/');
     let authority = value
         .strip_prefix("https://")
@@ -264,9 +288,9 @@ fn api_base(api: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-struct HttpAnswer {
-    status: u16,
-    body: Vec<u8>,
+pub(crate) struct HttpAnswer {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
 }
 
 fn gate_environment(token: &str) -> Environment {
@@ -355,7 +379,7 @@ fn api_request(
     })
 }
 
-fn github(
+pub(crate) fn github(
     config: &Config,
     org: &str,
     api: &str,

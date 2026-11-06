@@ -22,6 +22,7 @@ use std::{
 };
 
 mod contents;
+mod delete;
 mod gate;
 mod land;
 mod native;

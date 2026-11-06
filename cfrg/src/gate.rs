@@ -33,6 +33,9 @@ pub struct Budgets {
     pub new_repos_per_day_org: u64,
     pub new_repos_per_day: u64,
     pub actions_runs_per_day: u64,
+    /// Repository deletions (`cfrg gate delete-repo`): at most this many per day, at least `delete_min_gap_secs` apart overall.
+    pub deletes_per_day: u64,
+    pub delete_min_gap_secs: u64,
     /// Slice of the hourly and daily push budget that only the build lane may use.
     pub build_reserve_per_hour: u64,
     pub build_reserve_per_day: u64,
@@ -48,6 +51,8 @@ impl Default for Budgets {
             new_repos_per_day_org: 3,
             new_repos_per_day: 6,
             actions_runs_per_day: 30,
+            deletes_per_day: 6,
+            delete_min_gap_secs: 600,
             build_reserve_per_hour: 6,
             build_reserve_per_day: 30,
         }
@@ -70,6 +75,8 @@ pub enum Kind {
     Create,
     /// Counted for every push to a repository whose Actions are enabled (lane build): the upper bound of runs our pushes start.
     ActionsRun,
+    /// A repository deleted on GitHub (`cfrg gate delete-repo`).
+    Delete,
 }
 
 /// One mutation (or reservation of one) that the gate has performed.
@@ -144,6 +151,8 @@ pub enum Deny {
     ActionsDaily,
     NewReposOrgDaily,
     NewReposDaily,
+    DeleteGap { wait: u64 },
+    DeleteDaily,
 }
 
 impl Deny {
@@ -161,6 +170,8 @@ impl Deny {
                 "organisation's daily budget of new repositories is used".into()
             }
             Self::NewReposDaily => "overall daily budget of new repositories is used".into(),
+            Self::DeleteGap { wait } => format!("delete pacing: {wait} s to wait"),
+            Self::DeleteDaily => "daily budget of repository deletions is used".into(),
         }
     }
 }
@@ -219,6 +230,26 @@ pub fn decide(
         Kind::ActionsRun => {
             if count(world, DAY, Kind::ActionsRun, None) >= budgets.actions_runs_per_day {
                 return Err(Deny::ActionsDaily);
+            }
+            Ok(())
+        }
+        Kind::Delete => {
+            if count(world, DAY, Kind::Delete, None) >= budgets.deletes_per_day {
+                return Err(Deny::DeleteDaily);
+            }
+            let last = world
+                .ledger
+                .iter()
+                .filter(|e| e.kind == Kind::Delete)
+                .map(|e| e.ts)
+                .max();
+            if let Some(last) = last {
+                let next = last.saturating_add(budgets.delete_min_gap_secs);
+                if world.now < next {
+                    return Err(Deny::DeleteGap {
+                        wait: next - world.now,
+                    });
+                }
             }
             Ok(())
         }
@@ -410,7 +441,7 @@ mod tests {
         let b = Budgets::default();
         let mut w = world(&[]);
         w.kill_switch_set = true;
-        for kind in [Kind::Push, Kind::Create, Kind::ActionsRun] {
+        for kind in [Kind::Push, Kind::Create, Kind::ActionsRun, Kind::Delete] {
             assert_eq!(
                 decide(&b, &w, Lane::Build, "o", "r", kind),
                 Err(Deny::KillSwitch)
@@ -640,5 +671,40 @@ mod tests {
         }];
         save_queue(dir.path(), &queue).unwrap();
         assert_eq!(load_queue(dir.path()).unwrap(), queue);
+    }
+
+    #[test]
+    fn deletions_are_paced_one_slot_apart_and_capped_per_day() {
+        let b = Budgets::default();
+        let entry = |ts| Entry {
+            ts,
+            kind: Kind::Delete,
+            org: "o".into(),
+            repo: "r".into(),
+            lane: Lane::Bulk,
+        };
+        assert_eq!(verdict(&[], Lane::Bulk, "o", "x", Kind::Delete), Ok(()));
+        // A deletion of ANY repository holds the next one back for the gap.
+        let w = World {
+            now: 1_000_000,
+            ledger: &[entry(1_000_000 - 100)],
+            kill_switch_set: false,
+            org_paused: false,
+        };
+        assert_eq!(
+            decide(&b, &w, Lane::Bulk, "p", "y", Kind::Delete),
+            Err(Deny::DeleteGap { wait: 500 })
+        );
+        let spaced: Vec<Entry> = (0..6).map(|i| entry(1_000_000 - 1000 - i * 700)).collect();
+        let w = World {
+            now: 1_000_000,
+            ledger: &spaced,
+            kill_switch_set: false,
+            org_paused: false,
+        };
+        assert_eq!(
+            decide(&b, &w, Lane::Bulk, "p", "y", Kind::Delete),
+            Err(Deny::DeleteDaily)
+        );
     }
 }
