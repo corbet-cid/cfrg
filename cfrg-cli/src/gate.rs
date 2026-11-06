@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
+    io::Write,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,12 +20,15 @@ pub struct Options {
     /// Gate configuration (JSON): budgets, listed repositories with lane and source, state, pause and kill-switch directories.
     #[arg(long, env = "CFRG_GATE_CONFIG")]
     config: PathBuf,
-    /// Environment variable that holds the GitHub write credential (only `flush --execute` reads it).
+    /// Environment variable that holds the GitHub write credential (only `flush --execute` and `dispatch --execute` read it).
     #[arg(long, default_value = "CFRG_GITHUB_TOKEN")]
     token_env: String,
     /// Base of the destination URLs; GitHub's, except in tests.
     #[arg(long, default_value = "https://github.com")]
     origin: String,
+    /// Base of the GitHub API for `dispatch`; must start with `https://`.
+    #[arg(long, default_value = "https://api.github.com")]
+    api: String,
     #[command(subcommand)]
     action: Action,
 }
@@ -37,6 +41,21 @@ enum Action {
     Enqueue { repositories: Vec<String> },
     /// Push the newest state of every queued repository that the budgets allow. A dry run without --execute.
     Flush {
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Start one provider workflow (`workflow_dispatch`) on a build-lane repository. A dry run without --execute.
+    Dispatch {
+        /// Listed `org/repo` whose lane must be `build`.
+        repository: String,
+        /// Workflow file name, for example `ccid-remote.yml`.
+        workflow: String,
+        /// Branch name (no slash, not starting with `.` or `-`).
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// Workflow input as `key=value`; repeat up to ten times.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
         #[arg(long)]
         execute: bool,
     },
@@ -71,6 +90,22 @@ pub fn run(options: Options) -> Result<()> {
             println!("{}", json!({"queued": queue.len()}));
         }
         Action::Flush { execute } => flush(&config, &options.token_env, &options.origin, execute)?,
+        Action::Dispatch {
+            repository,
+            workflow,
+            reference,
+            inputs,
+            execute,
+        } => dispatch(
+            &config,
+            &options.token_env,
+            &options.api,
+            &repository,
+            &workflow,
+            &reference,
+            &inputs,
+            execute,
+        )?,
     }
     Ok(())
 }
@@ -161,6 +196,341 @@ fn blocked(error: &str) -> bool {
     ]
     .iter()
     .any(|m| e.contains(m))
+}
+
+fn workflow_file(value: &str) -> bool {
+    !value.contains('/')
+        && (value.ends_with(".yml") || value.ends_with(".yaml"))
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+fn branch_ref(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('.')
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+fn dispatch_inputs(inputs: &[String]) -> Result<BTreeMap<String, String>> {
+    if inputs.len() > 10 {
+        return Err(failure("At most 10 workflow inputs are allowed"));
+    }
+    let mut result = BTreeMap::new();
+    for input in inputs {
+        let (key, value) = input
+            .split_once('=')
+            .ok_or_else(|| failure(format!("Workflow input must be key=value: {input}")))?;
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            return Err(failure(format!("Invalid workflow input name: {key}")));
+        }
+        if value.chars().count() > 200 {
+            return Err(failure(format!(
+                "Workflow input {key} is longer than 200 characters"
+            )));
+        }
+        if value.chars().any(|c| c.is_control()) {
+            return Err(failure(format!(
+                "Workflow input {key} contains a control character"
+            )));
+        }
+        if result.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(failure(format!("Duplicate workflow input: {key}")));
+        }
+    }
+    Ok(result)
+}
+
+fn api_base(api: &str) -> Result<String> {
+    let value = api.trim_end_matches('/');
+    let authority = value
+        .strip_prefix("https://")
+        .ok_or_else(|| failure("--api must start with https://"))?;
+    if authority.is_empty()
+        || authority.starts_with('/')
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(failure("--api must be an HTTPS base URL"));
+    }
+    Ok(value.to_string())
+}
+
+struct HttpAnswer {
+    status: u16,
+    body: Vec<u8>,
+}
+
+fn gate_environment(token: &str) -> Environment {
+    let mut environment = Environment::new();
+    for key in ["PATH", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            environment.insert(key.into(), value);
+        }
+    }
+    environment.insert("CFRG_GATE_TOKEN".into(), token.into());
+    environment
+}
+
+/// One GitHub API call. The credential enters curl through `--variable`/`--expand-header`, never argv,
+/// files or logs; redirects, ambient proxies and response-body diagnostics stay off.
+fn api_request(
+    api: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<HttpAnswer> {
+    let runner = Runner::new(
+        std::env::current_dir()?,
+        gate_environment(token),
+        Duration::from_secs(45),
+    )?
+    .with_stderr_events()
+    .without_child_stderr();
+    let output = tempfile::NamedTempFile::new()?;
+    let mut input = tempfile::NamedTempFile::new()?;
+    let mut args: Vec<String> = [
+        "curl",
+        "--disable",
+        "--silent",
+        "--globoff",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "4194304",
+        "--proto",
+        "=https",
+        "--variable",
+        "%CFRG_GATE_TOKEN",
+        "--expand-header",
+        "Authorization: token {{CFRG_GATE_TOKEN}}",
+        "--header",
+        "Accept: application/json",
+        "--output",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    args.push(output.path().to_string_lossy().into_owned());
+    args.extend([
+        "--write-out".into(),
+        "%{http_code}".into(),
+        "--request".into(),
+        method.into(),
+        "--url".into(),
+        format!("{api}{path}"),
+    ]);
+    if let Some(body) = body {
+        serde_json::to_writer(&mut input, body)?;
+        input.flush()?;
+        args.extend([
+            "--header".into(),
+            "Content-Type: application/json".into(),
+            "--data-binary".into(),
+            format!("@{}", input.path().display()),
+        ]);
+    }
+    let status: u16 = runner
+        .run(&args, true)?
+        .trim()
+        .parse()
+        .map_err(|_| failure("Unknown HTTP outcome"))?;
+    if status == 0 {
+        return Err(failure("Unknown HTTP outcome"));
+    }
+    Ok(HttpAnswer {
+        status,
+        body: std::fs::read(output.path())?,
+    })
+}
+
+fn github(
+    config: &Config,
+    org: &str,
+    api: &str,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<HttpAnswer> {
+    match api_request(api, token, method, path, body) {
+        Ok(answer) => {
+            if blocked(&format!("HTTP {}", answer.status)) {
+                // The first sign of throttling or abuse pauses the whole organisation until Julian resumes it.
+                std::fs::create_dir_all(config.paused_dir.join(org))?;
+                return Err(failure(format!(
+                    "{org} paused after HTTP {}",
+                    answer.status
+                )));
+            }
+            Ok(answer)
+        }
+        Err(error) => {
+            if blocked(&error.to_string()) {
+                std::fs::create_dir_all(config.paused_dir.join(org))?;
+                return Err(failure(format!("{org} paused after a throttling answer")));
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch(
+    config: &Config,
+    token_env: &str,
+    api: &str,
+    name: &str,
+    workflow: &str,
+    reference: &str,
+    inputs: &[String],
+    execute: bool,
+) -> Result<()> {
+    let (org, repo) = gate::split(name)?;
+    let Some(entry) = config.repos.get(name) else {
+        return Err(failure(format!(
+            "{name} is not listed in the gate configuration"
+        )));
+    };
+    if entry.lane != gate::Lane::Build {
+        return Err(failure(format!(
+            "only build-lane repositories run GitHub Actions: {name}"
+        )));
+    }
+    if !workflow_file(workflow) {
+        return Err(failure(format!("Invalid workflow file name: {workflow}")));
+    }
+    if !branch_ref(reference) {
+        return Err(failure(format!("Invalid ref: {reference}")));
+    }
+    let inputs = dispatch_inputs(inputs)?;
+    let api = api_base(api)?;
+    let now = now();
+    let ledger = Ledger::new(&config.state_dir);
+    let entries = ledger.load(now)?;
+    let world = gate::World {
+        now,
+        ledger: &entries,
+        kill_switch_set: config.kill_switch.exists(),
+        org_paused: config.paused_dir.join(org).exists(),
+    };
+    if let Err(deny) = gate::decide(
+        &config.budgets,
+        &world,
+        gate::Lane::Build,
+        org,
+        repo,
+        Kind::ActionsRun,
+    ) {
+        println!("{}", json!({"repo": name, "verdict": deny.text()}));
+        return Err(failure(deny.text()));
+    }
+    if !execute {
+        println!(
+            "{}",
+            json!({"repo": name, "verdict": "would dispatch", "workflow": workflow, "ref": reference})
+        );
+        return Ok(());
+    }
+    let token = std::env::var(token_env)
+        .map_err(|_| failure(format!("{token_env} is not set; nothing was dispatched")))?;
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(failure("Invalid credential format"));
+    }
+    // Count first: a crash between this line and the calls can only over-count.
+    ledger.append(&Entry {
+        ts: now,
+        kind: Kind::ActionsRun,
+        org: org.into(),
+        repo: repo.into(),
+        lane: gate::Lane::Build,
+    })?;
+
+    let permissions_path = format!("/repos/{org}/{repo}/actions/permissions");
+    let permissions = github(config, org, &api, &token, "GET", &permissions_path, None)?;
+    if permissions.status != 200 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading Actions permissions",
+            permissions.status
+        )));
+    }
+    let permissions: Value = serde_json::from_slice(&permissions.body)
+        .map_err(|_| failure("Malformed GitHub Actions permissions response"))?;
+    let enabled = permissions
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| failure("GitHub Actions permissions response lacks enabled"))?;
+    if !enabled {
+        let enabled_answer = github(
+            config,
+            org,
+            &api,
+            &token,
+            "PUT",
+            &permissions_path,
+            Some(&json!({"enabled": true, "allowed_actions": "selected"})),
+        )?;
+        if enabled_answer.status != 204 {
+            return Err(failure(format!(
+                "GitHub API HTTP {} enabling Actions",
+                enabled_answer.status
+            )));
+        }
+        let selected_path = format!("/repos/{org}/{repo}/actions/permissions/selected-actions");
+        let selected = github(
+            config,
+            org,
+            &api,
+            &token,
+            "PUT",
+            &selected_path,
+            Some(&json!({
+                "github_owned_allowed": true,
+                "verified_allowed": false,
+                "patterns_allowed": []
+            })),
+        )?;
+        if selected.status != 204 {
+            return Err(failure(format!(
+                "GitHub API HTTP {} selecting Actions",
+                selected.status
+            )));
+        }
+        println!("{}", json!({"repo": name, "verdict": "actions enabled"}));
+    }
+
+    let dispatch_path = format!("/repos/{org}/{repo}/actions/workflows/{workflow}/dispatches");
+    let answer = github(
+        config,
+        org,
+        &api,
+        &token,
+        "POST",
+        &dispatch_path,
+        Some(&json!({"ref": reference, "inputs": inputs})),
+    )?;
+    if !matches!(answer.status, 200 | 204) {
+        return Err(failure(format!(
+            "GitHub API HTTP {} dispatching workflow",
+            answer.status
+        )));
+    }
+    println!(
+        "{}",
+        json!({"repo": name, "verdict": "dispatched", "workflow": workflow, "ref": reference})
+    );
+    Ok(())
 }
 
 fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Result<()> {

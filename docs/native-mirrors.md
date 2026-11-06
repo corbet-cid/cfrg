@@ -82,6 +82,9 @@ pipelines before enrollment. No accounts, namespaces or workspaces are created.
 Leading-dot GitLab profiles, declared LFS/profile content, and explicit holds
 remain exceptions. Content classification must come from reviewed source
 inventory; this controller does not inspect Git objects. There is no LFS fallback.
+Declare `"ci": true` on a GitHub or GitLab destination whose provider CI must keep
+running (a remote broker dispatches its workflow): the reconcile leaves GitHub
+Actions or GitLab pipelines as they are instead of switching them off.
 
 ## The receiver lock protects the default branch only
 
@@ -161,7 +164,8 @@ API credential (`token_env`) and the mirror credential (`password_env`). Reconci
 
 * Ensures the repository (a missing one is created in the organisation, private
   as the primary is, with issues, projects and wiki off; creation is paced by the
-  creation window) and switches GitHub Actions off on it.
+  creation window) and switches GitHub Actions off on it unless it declares
+  `"ci": true` (a remote CI broker runs the provider's workflow there).
 * Locks it as above. GitHub Free has rulesets for public repositories only: a
   private destination in a free organisation cannot be locked and is reported as
   `destination-or-protection-required`, never mirrored unprotected, unless the

@@ -86,7 +86,7 @@ pub fn ensure_destination_repo(
     )?;
     if response.status == 200 {
         let mut value = verify(response.body, repo, dest)?;
-        if value["builds_access_level"] != "disabled" && apply {
+        if !dest.ci && value["builds_access_level"] != "disabled" && apply {
             value = verify(
                 expect(
                     call(
@@ -122,19 +122,16 @@ pub fn ensure_destination_repo(
         .parse()
         .map_err(|_| "GitLab namespace ID required")?;
     let name = dest.path.rsplit('/').next().ok_or("Missing GitLab name")?;
+    let mut body = json!({
+        "namespace_id":namespace_id, "name":name, "path":name,
+        "visibility":if repo.private {"private"} else {"public"},
+        "initialize_with_readme":false
+    });
+    if !dest.ci {
+        body["builds_access_level"] = json!("disabled");
+    }
     let value = expect(
-        call(
-            io,
-            dest,
-            "POST",
-            "/projects".into(),
-            Some(json!({
-                "namespace_id":namespace_id, "name":name, "path":name,
-                "visibility":if repo.private {"private"} else {"public"},
-                "initialize_with_readme":false, "builds_access_level":"disabled"
-            })),
-            true,
-        )?,
+        call(io, dest, "POST", "/projects".into(), Some(body), true)?,
         &[201],
     )?;
     Ok(Some(verify(value, repo, dest)?))
@@ -819,6 +816,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_declared_ci_destination_keeps_gitlab_pipelines_enabled() {
+        let repo: Repository = serde_json::from_value(json!({"path":"team/repo","source_id":1,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
+        let mut dest = wanted("team/repo", Some("7"));
+        dest.ci = true;
+        let mut io = Script::new(vec![(
+            200,
+            json!({"id":7,"path_with_namespace":"team/repo","visibility":"private","builds_access_level":"enabled"}),
+        )]);
+        let value = ensure_destination_repo(&mut io, &repo, &dest, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["builds_access_level"], "enabled");
+        assert_eq!(io.asked.len(), 1, "no PUT for a declared CI destination");
+        assert_eq!(io.asked[0].0, "GET");
     }
     /// Plays back canned answers and records what was asked.
     struct Script {

@@ -8,6 +8,8 @@ cfrg gate --config gate.json status
 cfrg gate --config gate.json enqueue org/repo ...
 cfrg gate --config gate.json flush              # dry run: prints what it would push
 CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json flush --execute
+cfrg gate --config gate.json dispatch org/repo ccid-remote.yml main --input job=macos --input sha=<40 hex>   # dry run
+CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json dispatch org/repo ccid-remote.yml main --input k=v --execute
 ```
 
 | Rule | Behaviour |
@@ -19,7 +21,9 @@ CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json flush --execute
 | Pause | `paused_dir/<org>` exists = that organisation is refused (written by a flag probe, or by the gate itself on the first 403, 429, 402 or abuse answer; never removed by the gate) |
 | Kill switch | `kill_switch` directory exists = nothing is written, for every organisation |
 | Creation | a missing destination is reported with whether a creation would pass the budget; creating it is `cfrg native`'s job |
-| Credential | read from the environment variable named by `--token-env` at the last moment and handed to git through `GIT_CONFIG_*` (an `http.extraheader`), never through arguments or files; `--origin` exists for tests |
+| Dispatch | starts one provider workflow (`workflow_dispatch`) on a `lane: "build"` repository only: the daily Actions-run budget, kill switch and paused organisation apply, the ledger entry is written before the first call, Actions are switched on once if they are off, and at most 10 `key=value` inputs are accepted (key `[A-Za-z0-9_-]+`, value at most 200 characters without control characters) |
+| Credential | read from the environment variable named by `--token-env` at the last moment and handed to git through `GIT_CONFIG_*` (an `http.extraheader`) or to curl through `--variable`/`--expand-header` for `dispatch`, never through arguments or files; `--origin`, `--api` exist for tests |
 
 The configuration is JSON: `budgets` (optional), `repos` (`org/repo` to `{lane, source}`; a repository that is not listed is never pushed), `state_dir`, `paused_dir`,
-`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/gate_flush.rs` runs the executor against local bare repositories.
+`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/gate_flush.rs` runs the executor against local bare repositories, and
+`cfrg-cli/tests/gate_dispatch.rs` covers dispatch validation and refusals without network access.

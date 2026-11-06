@@ -119,6 +119,11 @@ pub struct Destination {
     /// then configured without the receiver lock and the pass reports `lock`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_exception: Option<String>,
+    /// Declared: the provider's own CI runs on this destination (a remote CI broker dispatches its
+    /// workflow). The reconcile then leaves the destination's CI switch as it is instead of turning it
+    /// off. Default false: every other mirror keeps CI off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ci: bool,
 }
 
 fn sync_on_commit_default() -> bool {

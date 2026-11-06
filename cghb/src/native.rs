@@ -84,7 +84,8 @@ fn verify(value: Value, repo: &Repository, dest: &Destination) -> Result<Value> 
 
 /// GET first: an existing repository never touches the creation scope. GitHub
 /// Actions is switched off on the destination (a mirror carries workflow files
-/// that must not run there).
+/// that must not run there) unless the destination declares `ci`: then a remote
+/// CI broker runs the provider's workflow and the switch is left as it is.
 pub fn ensure_destination_repo(
     io: &mut dyn Transport,
     repo: &Repository,
@@ -129,7 +130,9 @@ pub fn ensure_destination_repo(
         )?;
         verify(created, repo, dest)?
     };
-    disable_actions(io, dest, apply)?;
+    if !dest.ci {
+        disable_actions(io, dest, apply)?;
+    }
     Ok(Some(value))
 }
 
@@ -676,6 +679,26 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(io.methods(), ["GET"]);
+    }
+
+    #[test]
+    fn a_declared_ci_destination_keeps_actions_as_they_are() {
+        let (repo, mut dest) = dest(false, Some("7"));
+        dest.ci = true;
+        let mut io = Script::new(vec![(
+            200,
+            json!({"id":7,"full_name":"Team/Repo","private":false,"archived":false}),
+        )]);
+        assert!(ensure_destination_repo(&mut io, &repo, &dest, true, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(io.methods(), ["GET"]);
+        assert!(
+            io.asked
+                .iter()
+                .all(|(_, path, _)| !path.contains("actions/permissions")),
+            "a declared CI destination is not switched off"
+        );
     }
 
     fn dest_without_id() -> (Repository, Destination) {
