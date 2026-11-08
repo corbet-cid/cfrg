@@ -75,7 +75,8 @@ fn the_gate_pushes_the_newest_state_once_and_holds_the_next_push() {
             },
             "state_dir": root.join("state"),
             "paused_dir": root.join("paused"),
-            "kill_switch": root.join("kill")
+            "kill_switch": root.join("kill"),
+            "quiet_fill": false
         })
         .to_string(),
     )

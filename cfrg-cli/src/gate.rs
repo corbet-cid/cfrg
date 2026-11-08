@@ -54,6 +54,10 @@ enum Action {
     },
     /// Push the newest state of every queued repository that the budgets allow. A dry run without --execute.
     Flush {
+        /// Create a listed destination that does not exist yet (visibility and description from the configuration), under the
+        /// creation budgets, and fill it in the same run. Without it a missing destination is only reported.
+        #[arg(long)]
+        create: bool,
         #[arg(long)]
         execute: bool,
     },
@@ -128,7 +132,14 @@ pub fn run(options: Options) -> Result<()> {
             &description,
             execute,
         )?,
-        Action::Flush { execute } => flush(&config, &options.token_env, &options.origin, execute)?,
+        Action::Flush { create, execute } => flush(
+            &config,
+            &options.token_env,
+            &options.api,
+            &options.origin,
+            execute,
+            create,
+        )?,
         Action::Dispatch {
             repository,
             workflow,
@@ -200,6 +211,22 @@ fn git_env(extra: &[(&str, String)]) -> Environment {
         environment.insert((*k).into(), v.into());
     }
     environment
+}
+
+/// Git environment that authenticates HTTPS GitHub operations through an extra header, so the credential never enters argv or a file.
+fn auth_environment(token: &str) -> Environment {
+    let header = format!(
+        "AUTHORIZATION: basic {}",
+        base64(format!("x-access-token:{token}").as_bytes())
+    );
+    git_env(&[
+        ("GIT_CONFIG_COUNT", "1".into()),
+        (
+            "GIT_CONFIG_KEY_0",
+            "http.https://github.com/.extraheader".into(),
+        ),
+        ("GIT_CONFIG_VALUE_0", header),
+    ])
 }
 
 /// refname to object name, from `for-each-ref` output or `ls-remote` output (peeled tag lines dropped).
@@ -520,6 +547,47 @@ fn create(
         repo: repo.into(),
         lane: gate::Lane::Bulk,
     })?;
+    let created = create_repository(config, &api, &token, org, repo, private, description)?;
+    println!(
+        "{}",
+        json!({"repo": name, "verdict": "created",
+               "id": created.get("id").cloned().unwrap_or(Value::Null),
+               "private": created.get("private").cloned().unwrap_or(Value::Null)})
+    );
+    Ok(())
+}
+
+/// One `POST /orgs/<org>/repos` after a read that refuses an existing destination. No ledger work: the caller has already counted the creation.
+fn create_repository(
+    config: &Config,
+    api: &str,
+    token: &str,
+    org: &str,
+    repo: &str,
+    private: bool,
+    description: &str,
+) -> Result<Value> {
+    // Read first: never spend a creation on an existing repository (the POST would answer 422).
+    let existing = github(
+        config,
+        org,
+        api,
+        token,
+        "GET",
+        &format!("/repos/{org}/{repo}"),
+        None,
+    )?;
+    if existing.status == 200 {
+        return Err(failure(format!(
+            "{org}/{repo} already exists; visibility is never changed"
+        )));
+    }
+    if existing.status != 404 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading the destination",
+            existing.status
+        )));
+    }
     let body = json!({
         "name": repo,
         "private": private,
@@ -532,8 +600,8 @@ fn create(
     let answer = github(
         config,
         org,
-        &api,
-        &token,
+        api,
+        token,
         "POST",
         &format!("/orgs/{org}/repos"),
         Some(&body),
@@ -546,13 +614,64 @@ fn create(
     }
     let created: Value = serde_json::from_slice(&answer.body)
         .map_err(|_| failure("Malformed GitHub repository response"))?;
-    println!(
-        "{}",
-        json!({"repo": name, "verdict": "created",
-               "id": created.get("id").cloned().unwrap_or(Value::Null),
-               "private": created.get("private").cloned().unwrap_or(Value::Null)})
-    );
+    Ok(created)
+}
+
+/// Switch GitHub Actions at repository level. A fill disables them for the first push, because a new
+/// destination receives every historical branch and tag: those commits still carry the old workflow
+/// files, and a tag push would start release runs. Steady state stays enabled (Julian: regulation lives
+/// in the code, not in a switched-off Actions tab).
+fn set_actions_enabled(
+    config: &Config,
+    org: &str,
+    api: &str,
+    token: &str,
+    repo: &str,
+    enabled: bool,
+) -> Result<()> {
+    let path = format!("/repos/{org}/{repo}/actions/permissions");
+    let answer = github(
+        config,
+        org,
+        api,
+        token,
+        "PUT",
+        &path,
+        Some(&json!({"enabled": enabled})),
+    )?;
+    if !matches!(answer.status, 200 | 204) {
+        return Err(failure(format!(
+            "GitHub API HTTP {} switching Actions {}",
+            answer.status,
+            if enabled { "on" } else { "off" }
+        )));
+    }
     Ok(())
+}
+
+/// Number of workflow runs the destination holds (the STOP signal of a fill: a plain push must start none).
+fn action_run_count(config: &Config, org: &str, api: &str, token: &str, repo: &str) -> Result<u64> {
+    let answer = github(
+        config,
+        org,
+        api,
+        token,
+        "GET",
+        &format!("/repos/{org}/{repo}/actions/runs?per_page=1"),
+        None,
+    )?;
+    if answer.status != 200 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading Actions runs",
+            answer.status
+        )));
+    }
+    let value: Value = serde_json::from_slice(&answer.body)
+        .map_err(|_| failure("Malformed GitHub Actions runs response"))?;
+    value
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| failure("GitHub Actions runs response lacks total_count"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -702,11 +821,35 @@ fn dispatch(
     Ok(())
 }
 
-fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Result<()> {
+fn flush(
+    config: &Config,
+    token_env: &str,
+    api: &str,
+    origin: &str,
+    execute: bool,
+    create_missing: bool,
+) -> Result<()> {
+    let api = api_base(api)?;
     let ledger = Ledger::new(&config.state_dir);
     let mut entries = ledger.load(now())?;
     let mut queue = gate::load_queue(&config.state_dir)?;
     let order = gate::order(config, &queue);
+    // An executing flush reads the credential once: the destination read (ls-remote), every creation and every push use it, so a
+    // fill never falls back to anonymous requests (STOP 7 of ds-ghfill: no anonymous probing of missing destinations).
+    let token = if execute {
+        let value = std::env::var(token_env)
+            .map_err(|_| failure(format!("{token_env} is not set; nothing was pushed")))?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(failure("Invalid credential format"));
+        }
+        Some(value)
+    } else {
+        None
+    };
+    let read_env = match &token {
+        Some(token) => auth_environment(token),
+        None => git_env(&[]),
+    };
     let mut report = Vec::new();
     for Queued { repo: name, .. } in order {
         let (org, repo) = gate::split(&name)?;
@@ -737,21 +880,96 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             report.push(json!({"repo": name, "verdict": "source has no branches yet"}));
             continue;
         }
-        let remote = Runner::new(entry.source.clone(), git_env(&[]), Duration::from_secs(120))?
-            .with_stderr_events()
-            .without_child_stderr()
-            .run(
-                &[
-                    "git".into(),
-                    "ls-remote".into(),
-                    url.clone(),
-                    "refs/heads/*".into(),
-                    "refs/tags/*".into(),
-                ],
-                true,
-            )
-            .ok()
-            .map(|t| refs(&t));
+        let remote = Runner::new(
+            entry.source.clone(),
+            read_env.clone(),
+            Duration::from_secs(120),
+        )?
+        .with_stderr_events()
+        .without_child_stderr()
+        .run(
+            &[
+                "git".into(),
+                "ls-remote".into(),
+                url.clone(),
+                "refs/heads/*".into(),
+                "refs/tags/*".into(),
+            ],
+            true,
+        )
+        .ok()
+        .map(|t| refs(&t));
+        let mut remote = remote;
+        let mut created = false;
+        if remote.is_none() {
+            // The destination does not exist. Creation is its own budgeted mutation; with --create the fill does it here.
+            if !create_missing {
+                let now = now();
+                let world = gate::World {
+                    now,
+                    ledger: &entries,
+                    kill_switch_set: config.kill_switch.exists(),
+                    org_paused: config.paused_dir.join(org).exists(),
+                };
+                let verdict =
+                    gate::decide(&config.budgets, &world, entry.lane, org, repo, Kind::Create);
+                report.push(json!({"repo": name, "verdict": "destination missing: create it first (cfrg gate create)",
+                                   "creation_allowed": verdict.is_ok()}));
+                continue;
+            }
+            let now = now();
+            let world = gate::World {
+                now,
+                ledger: &entries,
+                kill_switch_set: config.kill_switch.exists(),
+                org_paused: config.paused_dir.join(org).exists(),
+            };
+            if let Err(deny) = gate::decide(
+                &config.budgets,
+                &world,
+                gate::Lane::Bulk,
+                org,
+                repo,
+                Kind::Create,
+            ) {
+                report.push(
+                    json!({"repo": name, "verdict": format!("creation held: {}", deny.text())}),
+                );
+                if deny == Deny::KillSwitch {
+                    break;
+                }
+                continue;
+            }
+            if !execute {
+                report.push(json!({"repo": name, "verdict": "would create and fill", "private": entry.private}));
+                continue;
+            }
+            let token = token.as_deref().unwrap_or_default();
+            // Count first: a crash between this line and the POST can only over-count.
+            let creation = Entry {
+                ts: now,
+                kind: Kind::Create,
+                org: org.into(),
+                repo: repo.into(),
+                lane: gate::Lane::Bulk,
+            };
+            ledger.append(&creation)?;
+            entries.push(creation);
+            let created_repo = create_repository(
+                config,
+                &api,
+                token,
+                org,
+                repo,
+                entry.private,
+                &entry.description,
+            )?;
+            created = true;
+            remote = Some(BTreeMap::new());
+            report.push(json!({"repo": name, "verdict": "created",
+                               "id": created_repo.get("id").cloned().unwrap_or(Value::Null),
+                               "private": created_repo.get("private").cloned().unwrap_or(Value::Null)}));
+        }
         if remote.as_ref() == Some(&local) {
             queue.retain(|q| q.repo != name);
             report.push(json!({"repo": name, "verdict": "in sync, dequeued"}));
@@ -764,14 +982,6 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             kill_switch_set: config.kill_switch.exists(),
             org_paused: config.paused_dir.join(org).exists(),
         };
-        if remote.is_none() {
-            // The destination does not exist: creation is its own budgeted mutation, done by `cfrg native` (the provider's ensure), not here.
-            let verdict =
-                gate::decide(&config.budgets, &world, entry.lane, org, repo, Kind::Create);
-            report.push(json!({"repo": name, "verdict": "destination missing: create it first (cfrg gate create)",
-                               "creation_allowed": verdict.is_ok()}));
-            continue;
-        }
         if let Err(deny) = gate::decide(&config.budgets, &world, entry.lane, org, repo, Kind::Push)
         {
             report.push(json!({"repo": name, "verdict": format!("held: {}", deny.text())}));
@@ -788,11 +998,9 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             report.push(json!({"repo": name, "verdict": "would push", "lane": entry.lane, "refs_changed": changed}));
             continue;
         }
-        let Ok(token) = std::env::var(token_env) else {
-            return Err(failure(format!(
-                "{token_env} is not set; nothing was pushed"
-            )));
-        };
+        let token = token
+            .as_deref()
+            .ok_or_else(|| failure("an executing flush needs the credential"))?;
         // Count first: a crash between this line and the push can only over-count.
         let mut mutations = vec![Entry {
             ts: now,
@@ -814,18 +1022,15 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             ledger.append(m)?;
             entries.push(m.clone());
         }
-        let header = format!(
-            "AUTHORIZATION: basic {}",
-            base64(format!("x-access-token:{token}").as_bytes())
-        );
-        let environment = git_env(&[
-            ("GIT_CONFIG_COUNT", "1".into()),
-            (
-                "GIT_CONFIG_KEY_0",
-                "http.https://github.com/.extraheader".into(),
-            ),
-            ("GIT_CONFIG_VALUE_0", header),
-        ]);
+        // A fresh destination receives every historical branch and tag. Those commits still carry the old workflow files, so a tag
+        // push would start release runs and branch pushes could start branch CI. Disable Actions for the initial push only; the
+        // steady state stays enabled (the workflows in the code decide what runs).
+        let initial =
+            config.quiet_fill && (created || remote.as_ref().is_some_and(|r| r.is_empty()));
+        if initial {
+            set_actions_enabled(config, org, &api, token, repo, false)?;
+        }
+        let environment = auth_environment(token);
         let pushed = Runner::new(
             entry.source.clone(),
             environment.clone(),
@@ -892,6 +1097,22 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
         } else {
             Ok(())
         };
+        if initial {
+            // Always restore the steady state, even after a failed push: a disabled Actions tab is not the regulation.
+            set_actions_enabled(config, org, &api, token, repo, true)?;
+            let runs = action_run_count(config, org, &api, token, repo)?;
+            if runs > 0 {
+                std::fs::create_dir_all(config.paused_dir.join(org))?;
+                gate::save_queue(&config.state_dir, &queue)?;
+                println!(
+                    "{}",
+                    json!({"flush": report, "stopped": format!("{org} paused: {runs} Actions runs after the first push to {name}")})
+                );
+                return Err(failure(format!(
+                    "{org} paused: {runs} Actions runs after the first push to {name}"
+                )));
+            }
+        }
         match (pushed, lfs) {
             (Ok(_), Ok(())) => {
                 queue.retain(|q| q.repo != name);

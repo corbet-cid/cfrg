@@ -100,6 +100,12 @@ pub struct RepoConfig {
     pub lane: Lane,
     /// Bare repository whose newest state is pushed (the srv git copy).
     pub source: PathBuf,
+    /// Create the destination private. Copied from the primary; visibility is never changed afterwards.
+    #[serde(default)]
+    pub private: bool,
+    /// Description for a destination the gate creates. Copied from the primary.
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -107,6 +113,10 @@ pub struct RepoConfig {
 pub struct Config {
     #[serde(default)]
     pub budgets: Budgets,
+    /// Disable Actions for the first push into a fresh destination and re-enable them after it, so historical branches and tags
+    /// cannot start runs from the workflow files those old commits still carry. Default true; only a test turns it off.
+    #[serde(default = "quiet_fill_default")]
+    pub quiet_fill: bool,
     /// `org/repo` to its lane and source. A repository that is not listed is never pushed.
     pub repos: BTreeMap<String, RepoConfig>,
     /// Directory with ledger.jsonl and queue.json.
@@ -115,6 +125,10 @@ pub struct Config {
     pub paused_dir: PathBuf,
     /// This directory exists = nothing is written to GitHub at all.
     pub kill_switch: PathBuf,
+}
+
+fn quiet_fill_default() -> bool {
+    true
 }
 
 impl Config {
