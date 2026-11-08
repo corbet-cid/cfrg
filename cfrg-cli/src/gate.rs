@@ -61,6 +61,16 @@ enum Action {
         #[arg(long)]
         execute: bool,
     },
+    /// Switch GitHub Actions on (the steady state) or off for one listed repository. A dry run without --execute.
+    Actions {
+        /// `org/repo` listed in the gate configuration.
+        repository: String,
+        /// Switch Actions off instead of on.
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Start one provider workflow (`workflow_dispatch`) on a build-lane repository. A dry run without --execute.
     Dispatch {
         /// Listed `org/repo` whose lane must be `build`.
@@ -139,6 +149,18 @@ pub fn run(options: Options) -> Result<()> {
             &options.origin,
             execute,
             create,
+        )?,
+        Action::Actions {
+            repository,
+            disable,
+            execute,
+        } => actions(
+            &config,
+            &options.token_env,
+            &options.api,
+            &repository,
+            !disable,
+            execute,
         )?,
         Action::Dispatch {
             repository,
@@ -697,15 +719,33 @@ fn set_actions_enabled(
     Ok(())
 }
 
-/// Number of workflow runs the destination holds (the STOP signal of a fill: a plain push must start none).
-fn action_run_count(config: &Config, org: &str, api: &str, token: &str, repo: &str) -> Result<u64> {
+/// What a fresh destination shows right after its first push. A plain push must start no workflow run. Dependabot's own
+/// version-update jobs are not workflow runs; they are accepted only while they open no pull request (the GitHub copies are
+/// push mirrors, so a Dependabot PR there can never be merged back and is pure bot traffic). Any other run, and any bot pull
+/// request, is a STOP signal.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct InitialScan {
+    offending_runs: u64,
+    dependabot_runs: u64,
+    dependabot_running: u64,
+    bot_pulls: u64,
+}
+
+fn initial_scan(
+    config: &Config,
+    org: &str,
+    api: &str,
+    token: &str,
+    repo: &str,
+) -> Result<InitialScan> {
+    let mut scan = InitialScan::default();
     let answer = github(
         config,
         org,
         api,
         token,
         "GET",
-        &format!("/repos/{org}/{repo}/actions/runs?per_page=1"),
+        &format!("/repos/{org}/{repo}/actions/runs?per_page=100"),
         None,
     )?;
     if answer.status != 200 {
@@ -716,10 +756,113 @@ fn action_run_count(config: &Config, org: &str, api: &str, token: &str, repo: &s
     }
     let value: Value = serde_json::from_slice(&answer.body)
         .map_err(|_| failure("Malformed GitHub Actions runs response"))?;
-    value
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| failure("GitHub Actions runs response lacks total_count"))
+    for run in value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let event = run.get("event").and_then(Value::as_str).unwrap_or_default();
+        let actor = run
+            .get("actor")
+            .and_then(|a| a.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if event == "dynamic" && actor == "dependabot[bot]" {
+            scan.dependabot_runs += 1;
+            if run.get("status").and_then(Value::as_str) != Some("completed") {
+                scan.dependabot_running += 1;
+            }
+        } else {
+            scan.offending_runs += 1;
+        }
+    }
+    let answer = github(
+        config,
+        org,
+        api,
+        token,
+        "GET",
+        &format!("/repos/{org}/{repo}/pulls?state=all&per_page=100"),
+        None,
+    )?;
+    if answer.status != 200 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading pull requests",
+            answer.status
+        )));
+    }
+    let pulls: Value = serde_json::from_slice(&answer.body)
+        .map_err(|_| failure("Malformed GitHub pull request response"))?;
+    for pull in pulls.as_array().into_iter().flatten() {
+        let user = pull.get("user");
+        let kind = user
+            .and_then(|u| u.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let login = user
+            .and_then(|u| u.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind == "Bot" || login.ends_with("[bot]") {
+            scan.bot_pulls += 1;
+        }
+    }
+    Ok(scan)
+}
+
+/// Switch Actions for one listed repository through the gate: the steady state is enabled (Julian: regulation lives in the
+/// code), a first push runs with them off. Refuses while the kill switch is set or the organisation is paused.
+fn actions(
+    config: &Config,
+    token_env: &str,
+    api: &str,
+    name: &str,
+    enabled: bool,
+    execute: bool,
+) -> Result<()> {
+    let (org, repo) = gate::split(name)?;
+    if !config.repos.contains_key(name) {
+        return Err(failure(format!(
+            "{name} is not listed in the gate configuration"
+        )));
+    }
+    if config.kill_switch.exists() {
+        return Err(failure("kill switch is set"));
+    }
+    if config.paused_dir.join(org).exists() {
+        return Err(failure(format!("{org} is paused")));
+    }
+    if !execute {
+        println!(
+            "{}",
+            json!({"repo": name, "verdict": if enabled { "would enable Actions" } else { "would disable Actions" }})
+        );
+        return Ok(());
+    }
+    let token = std::env::var(token_env).map_err(|_| {
+        failure(format!(
+            "the credential environment variable {token_env} is not set"
+        ))
+    })?;
+    if token.is_empty() {
+        return Err(failure(format!(
+            "the credential environment variable {token_env} is empty"
+        )));
+    }
+    let api = api_base(api)?;
+    set_actions_enabled(config, org, &api, &token, repo, enabled)?;
+    if actions_enabled(config, org, &api, &token, repo)? != enabled {
+        return Err(failure(format!(
+            "Actions could not be switched {} at {org}/{repo}",
+            if enabled { "on" } else { "off" }
+        )));
+    }
+    println!(
+        "{}",
+        json!({"repo": name, "verdict": if enabled { "Actions enabled" } else { "Actions disabled" }})
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,26 +1298,40 @@ fn flush(
         if initial {
             // Let the run index catch up before the verdict: a run created by the push appears a few seconds late (the cmeet incident of
             // 2026-11-08 03:45Z: one run started because the disable had not propagated; this check now waits and the push itself only
-            // happens a flush after the verified disable).
-            let mut runs = 0;
+            // happens a flush after the verified disable). Dependabot's own version-update jobs are tolerated only when they close
+            // without opening a pull request; any other run, and any bot pull request, pauses the organisation.
+            let mut scan = InitialScan::default();
             for _ in 0..3 {
                 std::thread::sleep(std::time::Duration::from_secs(10));
-                runs = action_run_count(config, org, &api, token, repo)?;
-                if runs > 0 {
+                scan = initial_scan(config, org, &api, token, repo)?;
+                if scan.offending_runs > 0 || scan.bot_pulls > 0 || scan.dependabot_running > 0 {
                     break;
                 }
             }
-            if runs > 0 {
+            if scan.offending_runs == 0 && scan.bot_pulls == 0 && scan.dependabot_running > 0 {
+                for _ in 0..12 {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    scan = initial_scan(config, org, &api, token, repo)?;
+                    if scan.offending_runs > 0 || scan.bot_pulls > 0 || scan.dependabot_running == 0
+                    {
+                        break;
+                    }
+                }
+            }
+            if scan.offending_runs > 0 || scan.bot_pulls > 0 || scan.dependabot_running > 0 {
                 std::fs::create_dir_all(config.paused_dir.join(org))?;
                 gate::save_queue(&config.state_dir, &queue)?;
-                println!(
-                    "{}",
-                    json!({"flush": report, "stopped": format!("{org} paused: {runs} Actions runs after the first push to {name}")})
+                let reason = format!(
+                    "{org} paused: {} unexpected workflow runs, {} bot pull requests and {} Dependabot runs still open after the first push to {name}",
+                    scan.offending_runs, scan.bot_pulls, scan.dependabot_running
                 );
-                return Err(failure(format!(
-                    "{org} paused: {runs} Actions runs after the first push to {name}"
-                )));
+                println!("{}", json!({"flush": report, "stopped": reason}));
+                return Err(failure(reason));
             }
+            report.push(json!({"repo": name, "verdict": "first push clean",
+                               "workflow_runs": scan.offending_runs,
+                               "dependabot_runs": scan.dependabot_runs,
+                               "bot_pulls": scan.bot_pulls}));
             // Always restore the steady state, even after a failed push: a disabled Actions tab is not the regulation.
             set_actions_enabled(config, org, &api, token, repo, true)?;
             if !actions_enabled(config, org, &api, token, repo)? {
