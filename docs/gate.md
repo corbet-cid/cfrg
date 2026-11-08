@@ -15,7 +15,7 @@ CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json dispatch org/repo ccid-remote
 
 | Rule | Behaviour |
 |---|---|
-| Queue | holds repository names, never commits; queueing twice keeps the first time; a flush pushes the newest state of every branch and tag once (N commits, one push) and skips a repository whose heads already equal GitHub's |
+| Queue | holds repository names, never commits; queueing twice keeps the first time; a flush pushes the newest state of every branch and tag once (N commits, one push), pushes the LFS objects the source references (`git lfs push --object-id`, so the destination is not left with pointers only) and skips a repository whose heads already equal GitHub's |
 | Budgets | defaults: 20 pushes per hour and 120 per day overall, 8 per hour per organisation, 10 minutes between pushes to one repository, 3 new repositories per day per organisation and 6 overall, 30 Actions runs per day. Any of them may be overridden under `budgets` |
 | Lanes | a repository with `lane: "build"` (its GitHub Actions must build current code) goes first, may use the reserved slice (`build_reserve_per_hour` 6, `build_reserve_per_day` 30) that the bulk lane cannot, and every push to it is counted as an Actions run |
 | Ledger | `state_dir/ledger.jsonl`, append-only; a mutation is recorded before it is made, so a crash can only over-count |
@@ -27,5 +27,5 @@ CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json dispatch org/repo ccid-remote
 | Credential | read from the environment variable named by `--token-env` at the last moment and handed to git through `GIT_CONFIG_*` (an `http.extraheader`) or to curl through `--variable`/`--expand-header` for `create` and `dispatch`, never through arguments or files; `--origin`, `--api` exist for tests |
 
 The configuration is JSON: `budgets` (optional), `repos` (`org/repo` to `{lane, source}`; a repository that is not listed is never pushed), `state_dir`, `paused_dir`,
-`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/gate_flush.rs` runs the executor against local bare repositories, `cfrg-cli/tests/gate_create.rs` covers the creation budget, gap and validation without network, and
+`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/gate_flush.rs` runs the executor against local bare repositories (including the empty LFS listing of a repository without LFS), `cfrg-cli/tests/gate_create.rs` covers the creation budget, gap and validation without network, and
 `cfrg-cli/tests/gate_dispatch.rs` covers dispatch validation and refusals without network access; `cfrg-cli/tests/gate_delete.rs` and the unit tests in `cfrg-cli/src/delete.rs` cover the deletion refusals.

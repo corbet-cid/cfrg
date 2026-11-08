@@ -821,29 +821,86 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             ),
             ("GIT_CONFIG_VALUE_0", header),
         ]);
-        let pushed = Runner::new(entry.source.clone(), environment, Duration::from_secs(900))?
+        let pushed = Runner::new(
+            entry.source.clone(),
+            environment.clone(),
+            Duration::from_secs(900),
+        )?
+        .with_stderr_events()
+        .run(
+            &[
+                "git".into(),
+                "push".into(),
+                "--quiet".into(),
+                url.clone(),
+                "refs/heads/*:refs/heads/*".into(),
+                "refs/tags/*:refs/tags/*".into(),
+            ],
+            true,
+        );
+        // LFS objects do not travel with the ref push: without them the destination holds pointers only.
+        let lfs = if pushed.is_ok() {
+            let listed = Runner::new(
+                entry.source.clone(),
+                environment.clone(),
+                Duration::from_secs(300),
+            )?
             .with_stderr_events()
+            .without_child_stderr()
             .run(
                 &[
                     "git".into(),
-                    "push".into(),
-                    "--quiet".into(),
-                    url,
-                    "refs/heads/*:refs/heads/*".into(),
-                    "refs/tags/*:refs/tags/*".into(),
+                    "lfs".into(),
+                    "ls-files".into(),
+                    "--all".into(),
+                    "--long".into(),
                 ],
                 true,
-            );
-        match pushed {
-            Ok(_) => {
+            )?;
+            let objects: Vec<String> = listed
+                .lines()
+                .filter_map(|line| line.split_whitespace().next().map(String::from))
+                .filter(|oid| oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit()))
+                .collect();
+            if objects.is_empty() {
+                Ok(())
+            } else {
+                let mut args: Vec<String> = [
+                    "git".into(),
+                    "lfs".into(),
+                    "push".into(),
+                    "--object-id".into(),
+                    url.clone(),
+                ]
+                .into_iter()
+                .collect();
+                args.extend(objects);
+                Runner::new(
+                    entry.source.clone(),
+                    environment.clone(),
+                    Duration::from_secs(900),
+                )?
+                .with_stderr_events()
+                .run(&args, true)
+                .map(|_| ())
+            }
+        } else {
+            Ok(())
+        };
+        match (pushed, lfs) {
+            (Ok(_), Ok(())) => {
                 queue.retain(|q| q.repo != name);
                 report.push(json!({"repo": name, "verdict": "pushed", "lane": entry.lane, "refs_changed": changed}));
             }
-            Err(error) => {
-                let text = error.to_string();
+            (pushed, lfs) => {
+                let error = pushed
+                    .err()
+                    .or_else(|| lfs.err())
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                let text = error;
                 report.push(json!({"repo": name, "verdict": "push failed"}));
                 if blocked(&text) {
-                    // The first sign of throttling or abuse handling stops the whole organisation until Julian resumes it.
                     std::fs::create_dir_all(config.paused_dir.join(org))?;
                     gate::save_queue(&config.state_dir, &queue)?;
                     println!(
