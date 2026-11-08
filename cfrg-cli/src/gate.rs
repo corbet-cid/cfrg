@@ -715,6 +715,11 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             continue;
         };
         let url = format!("{origin}/{name}.git");
+        if !entry.source.exists() {
+            // The srv git copy follows the primary's renames; a fill may list a repository before its copy arrives.
+            report.push(json!({"repo": name, "verdict": "source missing on this host (git copy not there yet)"}));
+            continue;
+        }
         let local = Runner::new(entry.source.clone(), git_env(&[]), Duration::from_secs(120))?
             .with_stderr_events()
             .run(
