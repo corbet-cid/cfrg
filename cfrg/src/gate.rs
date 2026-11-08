@@ -36,6 +36,8 @@ pub struct Budgets {
     /// Repository deletions (`cfrg gate delete-repo`): at most this many per day, at least `delete_min_gap_secs` apart overall.
     pub deletes_per_day: u64,
     pub delete_min_gap_secs: u64,
+    /// Repository creations (`cfrg gate create`): at least this long between two creations overall.
+    pub create_min_gap_secs: u64,
     /// Slice of the hourly and daily push budget that only the build lane may use.
     pub build_reserve_per_hour: u64,
     pub build_reserve_per_day: u64,
@@ -53,6 +55,7 @@ impl Default for Budgets {
             actions_runs_per_day: 30,
             deletes_per_day: 6,
             delete_min_gap_secs: 600,
+            create_min_gap_secs: 300,
             build_reserve_per_hour: 6,
             build_reserve_per_day: 30,
         }
@@ -153,6 +156,7 @@ pub enum Deny {
     NewReposDaily,
     DeleteGap { wait: u64 },
     DeleteDaily,
+    CreateGap { wait: u64 },
 }
 
 impl Deny {
@@ -172,6 +176,7 @@ impl Deny {
             Self::NewReposDaily => "overall daily budget of new repositories is used".into(),
             Self::DeleteGap { wait } => format!("delete pacing: {wait} s to wait"),
             Self::DeleteDaily => "daily budget of repository deletions is used".into(),
+            Self::CreateGap { wait } => format!("creation gap: {wait} s to wait"),
         }
     }
 }
@@ -224,6 +229,20 @@ pub fn decide(
             }
             if count(world, DAY, Kind::Create, None) >= budgets.new_repos_per_day {
                 return Err(Deny::NewReposDaily);
+            }
+            let last = world
+                .ledger
+                .iter()
+                .filter(|e| e.kind == Kind::Create)
+                .map(|e| e.ts)
+                .max();
+            if let Some(last) = last {
+                let next = last.saturating_add(budgets.create_min_gap_secs);
+                if world.now < next {
+                    return Err(Deny::CreateGap {
+                        wait: next - world.now,
+                    });
+                }
             }
             Ok(())
         }
@@ -549,7 +568,7 @@ mod tests {
             lane: Lane::Bulk,
         };
         let three: Vec<Entry> = (0..3)
-            .map(|i| create(NOW - 100 - i, "o", &format!("r{i}")))
+            .map(|i| create(NOW - 1000 - i, "o", &format!("r{i}")))
             .collect();
         assert_eq!(
             verdict(&three, Lane::Bulk, "o", "n", Kind::Create),
@@ -557,11 +576,30 @@ mod tests {
         );
         assert_eq!(verdict(&three, Lane::Bulk, "p", "n", Kind::Create), Ok(()));
         let six: Vec<Entry> = (0..6)
-            .map(|i| create(NOW - 100 - i, &format!("o{i}"), "r"))
+            .map(|i| create(NOW - 1000 - i, &format!("o{i}"), "r"))
             .collect();
         assert_eq!(
             verdict(&six, Lane::Bulk, "p", "n", Kind::Create),
             Err(Deny::NewReposDaily)
+        );
+    }
+
+    #[test]
+    fn repository_creations_keep_their_gap() {
+        let create = |ts| Entry {
+            ts,
+            kind: Kind::Create,
+            org: "o".into(),
+            repo: "r".into(),
+            lane: Lane::Bulk,
+        };
+        assert_eq!(
+            verdict(&[create(NOW - 100)], Lane::Bulk, "o", "n", Kind::Create),
+            Err(Deny::CreateGap { wait: 200 })
+        );
+        assert_eq!(
+            verdict(&[create(NOW - 400)], Lane::Bulk, "o", "n", Kind::Create),
+            Ok(())
         );
     }
 

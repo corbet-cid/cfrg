@@ -39,6 +39,19 @@ enum Action {
     Status,
     /// Record that repositories have changes (the queue holds names, never commits).
     Enqueue { repositories: Vec<String> },
+    /// Create one listed GitHub repository in its organisation, under the creation budgets and gap. A dry run without --execute.
+    Create {
+        /// `org/repo` listed in the gate configuration.
+        repository: String,
+        /// Create it private (the Forgejo primary's visibility; visibility is never changed later).
+        #[arg(long)]
+        private: bool,
+        /// Description copied from the Forgejo primary.
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        execute: bool,
+    },
     /// Push the newest state of every queued repository that the budgets allow. A dry run without --execute.
     Flush {
         #[arg(long)]
@@ -101,6 +114,20 @@ pub fn run(options: Options) -> Result<()> {
             gate::save_queue(&config.state_dir, &queue)?;
             println!("{}", json!({"queued": queue.len()}));
         }
+        Action::Create {
+            repository,
+            private,
+            description,
+            execute,
+        } => create(
+            &config,
+            &options.token_env,
+            &options.api,
+            &repository,
+            private,
+            &description,
+            execute,
+        )?,
         Action::Flush { execute } => flush(&config, &options.token_env, &options.origin, execute)?,
         Action::Dispatch {
             repository,
@@ -411,6 +438,124 @@ pub(crate) fn github(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn create(
+    config: &Config,
+    token_env: &str,
+    api: &str,
+    name: &str,
+    private: bool,
+    description: &str,
+    execute: bool,
+) -> Result<()> {
+    let (org, repo) = gate::split(name)?;
+    if !config.repos.contains_key(name) {
+        return Err(failure(format!(
+            "{name} is not listed in the gate configuration"
+        )));
+    }
+    if description.chars().count() > 350 || description.chars().any(char::is_control) {
+        return Err(failure(
+            "Description must be at most 350 characters without control characters",
+        ));
+    }
+    let api = api_base(api)?;
+    let now = now();
+    let ledger = Ledger::new(&config.state_dir);
+    let entries = ledger.load(now)?;
+    let world = gate::World {
+        now,
+        ledger: &entries,
+        kill_switch_set: config.kill_switch.exists(),
+        org_paused: config.paused_dir.join(org).exists(),
+    };
+    if let Err(deny) = gate::decide(
+        &config.budgets,
+        &world,
+        gate::Lane::Bulk,
+        org,
+        repo,
+        Kind::Create,
+    ) {
+        println!("{}", json!({"repo": name, "verdict": deny.text()}));
+        return Err(failure(deny.text()));
+    }
+    if !execute {
+        println!(
+            "{}",
+            json!({"repo": name, "verdict": "would create", "private": private})
+        );
+        return Ok(());
+    }
+    let token = std::env::var(token_env)
+        .map_err(|_| failure(format!("{token_env} is not set; nothing was created")))?;
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(failure("Invalid credential format"));
+    }
+    // Read first: never spend a creation on an existing repository (the POST would answer 422).
+    let existing = github(
+        config,
+        org,
+        &api,
+        &token,
+        "GET",
+        &format!("/repos/{org}/{repo}"),
+        None,
+    )?;
+    if existing.status == 200 {
+        return Err(failure(format!(
+            "{name} already exists; visibility is never changed"
+        )));
+    }
+    if existing.status != 404 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading the destination",
+            existing.status
+        )));
+    }
+    // Count first: a crash between this line and the call can only over-count.
+    ledger.append(&Entry {
+        ts: now,
+        kind: Kind::Create,
+        org: org.into(),
+        repo: repo.into(),
+        lane: gate::Lane::Bulk,
+    })?;
+    let body = json!({
+        "name": repo,
+        "private": private,
+        "description": description,
+        "has_issues": false,
+        "has_projects": false,
+        "has_wiki": false,
+        "auto_init": false,
+    });
+    let answer = github(
+        config,
+        org,
+        &api,
+        &token,
+        "POST",
+        &format!("/orgs/{org}/repos"),
+        Some(&body),
+    )?;
+    if answer.status != 201 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} creating the repository",
+            answer.status
+        )));
+    }
+    let created: Value = serde_json::from_slice(&answer.body)
+        .map_err(|_| failure("Malformed GitHub repository response"))?;
+    println!(
+        "{}",
+        json!({"repo": name, "verdict": "created",
+               "id": created.get("id").cloned().unwrap_or(Value::Null),
+               "private": created.get("private").cloned().unwrap_or(Value::Null)})
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     config: &Config,
     token_env: &str,
@@ -618,7 +763,7 @@ fn flush(config: &Config, token_env: &str, origin: &str, execute: bool) -> Resul
             // The destination does not exist: creation is its own budgeted mutation, done by `cfrg native` (the provider's ensure), not here.
             let verdict =
                 gate::decide(&config.budgets, &world, entry.lane, org, repo, Kind::Create);
-            report.push(json!({"repo": name, "verdict": "destination missing: create it first (cfrg native ensure)",
+            report.push(json!({"repo": name, "verdict": "destination missing: create it first (cfrg gate create)",
                                "creation_allowed": verdict.is_ok()}));
             continue;
         }
