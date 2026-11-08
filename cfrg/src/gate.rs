@@ -129,15 +129,21 @@ impl Config {
 
 /// `org/repo` into its two parts; both must be plain names.
 pub fn split(name: &str) -> Result<(&str, &str)> {
+    // A repository part may start with a dot (GitHub's `.github` is one); an organisation part may not.
     let valid = |part: &str| {
         !part.is_empty()
-            && !part.starts_with('.')
+            && part != "."
+            && part != ".."
             && part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
     match name.split_once('/') {
-        Some((org, repo)) if valid(org) && valid(repo) && !repo.contains('/') => Ok((org, repo)),
+        Some((org, repo))
+            if valid(org) && valid(repo) && !repo.contains('/') && !org.starts_with('.') =>
+        {
+            Ok((org, repo))
+        }
         _ => Err(crate::failure(format!("Not an org/repo name: {name}"))),
     }
 }
@@ -667,15 +673,9 @@ mod tests {
     fn names_are_plain() {
         assert!(split("org/repo").is_ok());
         assert!(split("org/repo.git-1_x").is_ok());
+        assert!(split("o/.github").is_ok());
         for bad in [
-            "org",
-            "org/",
-            "/repo",
-            "a/b/c",
-            "../x/y",
-            "o/.hidden",
-            "o/r r",
-            "o/r;x",
+            "org", "org/", "/repo", "a/b/c", "../x/y", "o/.", "o/..", ".o/r", "o/r r", "o/r;x",
         ] {
             assert!(split(bad).is_err(), "{bad}");
         }
