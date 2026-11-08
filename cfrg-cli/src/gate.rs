@@ -621,6 +621,54 @@ fn create_repository(
 /// destination receives every historical branch and tag: those commits still carry the old workflow
 /// files, and a tag push would start release runs. Steady state stays enabled (Julian: regulation lives
 /// in the code, not in a switched-off Actions tab).
+fn actions_enabled(config: &Config, org: &str, api: &str, token: &str, repo: &str) -> Result<bool> {
+    let answer = github(
+        config,
+        org,
+        api,
+        token,
+        "GET",
+        &format!("/repos/{org}/{repo}/actions/permissions"),
+        None,
+    )?;
+    if answer.status != 200 {
+        return Err(failure(format!(
+            "GitHub API HTTP {} reading Actions permissions",
+            answer.status
+        )));
+    }
+    let value: Value = serde_json::from_slice(&answer.body)
+        .map_err(|_| failure("Malformed GitHub Actions permissions response"))?;
+    value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| failure("GitHub Actions permissions response lacks enabled"))
+}
+
+/// Switch Actions off and prove it: the setting is not strongly consistent, so a push sent in the same second still starts runs
+/// from the historical workflow files. The first push of a fresh destination therefore waits for the NEXT flush, and this
+/// function refuses the push when the switch cannot be seen as off.
+fn ensure_actions_disabled(
+    config: &Config,
+    org: &str,
+    api: &str,
+    token: &str,
+    repo: &str,
+) -> Result<()> {
+    for attempt in 0..5 {
+        if !actions_enabled(config, org, api, token, repo)? {
+            return Ok(());
+        }
+        set_actions_enabled(config, org, api, token, repo, false)?;
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    Err(failure(format!(
+        "Actions could not be switched off at {org}/{repo}; nothing was pushed"
+    )))
+}
+
 fn set_actions_enabled(
     config: &Config,
     org: &str,
@@ -969,6 +1017,13 @@ fn flush(
             report.push(json!({"repo": name, "verdict": "created",
                                "id": created_repo.get("id").cloned().unwrap_or(Value::Null),
                                "private": created_repo.get("private").cloned().unwrap_or(Value::Null)}));
+            if config.quiet_fill {
+                // Do not push in the same run: the Actions switch must be seen off first, and GitHub propagates it asynchronously.
+                // The repository stays queued; the next flush pushes it with Actions off and enables them afterwards.
+                ensure_actions_disabled(config, org, &api, token, repo)?;
+                report.push(json!({"repo": name, "verdict": "Actions off and verified; the first push waits for the next flush"}));
+                continue;
+            }
         }
         if remote.as_ref() == Some(&local) {
             queue.retain(|q| q.repo != name);
@@ -1023,12 +1078,12 @@ fn flush(
             entries.push(m.clone());
         }
         // A fresh destination receives every historical branch and tag. Those commits still carry the old workflow files, so a tag
-        // push would start release runs and branch pushes could start branch CI. Disable Actions for the initial push only; the
-        // steady state stays enabled (the workflows in the code decide what runs).
+        // push would start release runs and branch pushes could start branch CI. The first push runs with Actions verifiably off;
+        // they are enabled again afterwards and `actions/runs` must stay empty. The steady state stays enabled.
         let initial =
             config.quiet_fill && (created || remote.as_ref().is_some_and(|r| r.is_empty()));
         if initial {
-            set_actions_enabled(config, org, &api, token, repo, false)?;
+            ensure_actions_disabled(config, org, &api, token, repo)?;
         }
         let environment = auth_environment(token);
         let pushed = Runner::new(
@@ -1098,9 +1153,17 @@ fn flush(
             Ok(())
         };
         if initial {
-            // Always restore the steady state, even after a failed push: a disabled Actions tab is not the regulation.
-            set_actions_enabled(config, org, &api, token, repo, true)?;
-            let runs = action_run_count(config, org, &api, token, repo)?;
+            // Let the run index catch up before the verdict: a run created by the push appears a few seconds late (the cmeet incident of
+            // 2026-11-08 03:45Z: one run started because the disable had not propagated; this check now waits and the push itself only
+            // happens a flush after the verified disable).
+            let mut runs = 0;
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                runs = action_run_count(config, org, &api, token, repo)?;
+                if runs > 0 {
+                    break;
+                }
+            }
             if runs > 0 {
                 std::fs::create_dir_all(config.paused_dir.join(org))?;
                 gate::save_queue(&config.state_dir, &queue)?;
@@ -1110,6 +1173,13 @@ fn flush(
                 );
                 return Err(failure(format!(
                     "{org} paused: {runs} Actions runs after the first push to {name}"
+                )));
+            }
+            // Always restore the steady state, even after a failed push: a disabled Actions tab is not the regulation.
+            set_actions_enabled(config, org, &api, token, repo, true)?;
+            if !actions_enabled(config, org, &api, token, repo)? {
+                return Err(failure(format!(
+                    "Actions could not be switched back on at {org}/{repo}"
                 )));
             }
         }
