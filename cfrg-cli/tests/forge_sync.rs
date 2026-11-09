@@ -450,7 +450,7 @@ fn explicit_per_location_pointer_only_mirror_reports_lfs_pointers_only() {
     assert!(git(&f.replica, &["for-each-ref"]).is_empty());
 
     let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
-    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    policy["repositories"]["widget"]["external_content"] = json!({"replica": "pointers-only"});
     policy["repositories"]["widget"]["locations"]
         .as_object_mut()
         .unwrap()
@@ -488,7 +488,7 @@ fn pointer_only_requires_the_exception_at_every_selected_destination() {
     git(&f.source, &["add", "large"]);
     git(&f.source, &["commit", "-qm", "lfs pointer"]);
     let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
-    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    policy["repositories"]["widget"]["external_content"] = json!({"replica": "pointers-only"});
     fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
     let (output, report) = f.report(&[
         "--all-refs",
@@ -504,7 +504,7 @@ fn pointer_only_requires_the_exception_at_every_selected_destination() {
 }
 
 #[test]
-fn pointer_only_never_promotes_submodules() {
+fn pointer_only_promotes_submodule_gitlinks_without_their_repositories() {
     let f = Fixture::new();
     let first = f.commit("first");
     fs::write(
@@ -526,9 +526,41 @@ fn pointer_only_never_promotes_submodules() {
         ],
     );
     git(&f.source, &["commit", "-qm", "pointer and gitlink"]);
+    let head = git(&f.source, &["rev-parse", "HEAD"]);
     let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
-    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    policy["repositories"]["widget"]["external_content"] = json!({"replica": "pointers-only"});
     fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let (output, report) = f.report(&["--all-refs", "--to", "replica", "--apply"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["content"]["lfs"], "pointers-only");
+    assert_eq!(report["content"]["submodules"], "pointers-only");
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["repository_complete"], false);
+    assert_eq!(git(&f.replica, &["rev-parse", "refs/heads/main"]), head);
+    assert_eq!(
+        git(&f.replica, &["ls-tree", "refs/heads/main", "dependency"]),
+        format!("160000 commit {first}\tdependency")
+    );
+}
+
+#[test]
+fn a_submodule_without_the_exception_stays_blocked() {
+    let f = Fixture::new();
+    let first = f.commit("first");
+    git(
+        &f.source,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{first},dependency"),
+        ],
+    );
+    git(&f.source, &["commit", "-qm", "gitlink only"]);
     let (output, report) = f.report(&["--all-refs", "--to", "replica", "--apply"]);
     assert!(!output.status.success());
     assert_eq!(report["source_reason"], "external-content-unverified");
@@ -537,17 +569,17 @@ fn pointer_only_never_promotes_submodules() {
 }
 
 #[test]
-fn lfs_exception_must_name_a_declared_secondary() {
+fn external_content_exception_must_name_a_declared_secondary() {
     let f = Fixture::new();
     f.commit("first");
     let original: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
     for location in ["source", "missing"] {
         let mut policy = original.clone();
-        policy["repositories"]["widget"]["lfs"] = json!({location: "pointers-only"});
+        policy["repositories"]["widget"]["external_content"] = json!({location: "pointers-only"});
         fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
         let output = f.run(&["--all-refs", "--to", "replica", "--apply"]);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("LFS"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("external content"));
     }
 }
 

@@ -52,12 +52,13 @@ pub struct Repository {
     pub attributes: BTreeMap<String, String>,
     /// Forge declaration -> complete namespace/repository path; nested groups allowed.
     pub locations: BTreeMap<String, String>,
-    /// Forge declaration -> external LFS handling at that location. Absent (or
-    /// `block`) refuses every repository whose history contains LFS pointers;
-    /// `pointers-only` explicitly permits promoting refs and pointer blobs while
-    /// the payloads stay at the primary. Never declared for the primary itself.
+    /// Forge declaration -> external content handling at that location. Absent
+    /// (or `block`) refuses every repository whose history contains LFS pointers
+    /// or submodule gitlinks; `pointers-only` explicitly permits promoting refs
+    /// and those pointer blobs while the payloads and submodule commits stay at
+    /// the primary. Never declared for the primary itself.
     #[serde(default)]
-    pub lfs: BTreeMap<String, Lfs>,
+    pub external_content: BTreeMap<String, ExternalContent>,
     #[serde(default)]
     pub clone_fallbacks: Vec<String>,
     #[serde(default)]
@@ -65,20 +66,21 @@ pub struct Repository {
     pub promotion: Promotion,
 }
 
-/// How one location treats Git LFS pointers found in the source history.
+/// How one location treats external content (LFS payloads, submodule commits)
+/// named by the source history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Lfs {
+pub enum ExternalContent {
     /// Refuse promotion; the payloads cannot be verified at this location (default).
     Block,
-    /// Promote refs and pointer blobs only; LFS payloads stay at the primary.
+    /// Promote refs and pointer blobs only; external payloads stay at the primary.
     PointersOnly,
 }
 
 impl Repository {
     /// Whether this location is explicitly allowed a pointer-only mirror.
-    pub fn lfs_pointers_only(&self, forge: &str) -> bool {
-        self.lfs.get(forge) == Some(&Lfs::PointersOnly)
+    pub fn pointers_only(&self, forge: &str) -> bool {
+        self.external_content.get(forge) == Some(&ExternalContent::PointersOnly)
     }
 }
 
@@ -200,15 +202,15 @@ impl Policy {
                     )));
                 }
             }
-            for forge in repo.lfs.keys() {
+            for forge in repo.external_content.keys() {
                 if !repo.locations.contains_key(forge) {
                     return Err(failure(format!(
-                        "Repository {id} declares LFS handling for an undeclared location {forge}"
+                        "Repository {id} declares external content handling for an undeclared location {forge}"
                     )));
                 }
                 if forge == &primary.forge {
                     return Err(failure(format!(
-                        "Repository {id} cannot declare LFS handling at its primary forge"
+                        "Repository {id} cannot declare external content handling at its primary forge"
                     )));
                 }
             }

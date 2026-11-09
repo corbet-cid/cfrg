@@ -1,6 +1,6 @@
 //! Ref promotion never claims to have copied external source payloads.
 use super::git::{valid_oid, Git};
-use crate::{failure, placement::Lfs, Result};
+use crate::{failure, placement::ExternalContent, Result};
 use serde::Serialize;
 use std::io::Write;
 
@@ -12,8 +12,12 @@ pub struct Content {
     /// every selected destination: refs and pointer blobs were promoted without
     /// the LFS payloads.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lfs: Option<Lfs>,
+    pub lfs: Option<ExternalContent>,
     pub submodules_required: bool,
+    /// The same exception for submodule gitlinks: the commits are named, their
+    /// repositories are not part of the mirror.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<ExternalContent>,
 }
 
 impl Content {
@@ -24,7 +28,8 @@ impl Content {
     /// A pointer-only mirror needs the explicit per-location exception and is
     /// still not verified replication of the source payloads.
     pub fn pointers_only(&self) -> bool {
-        self.lfs == Some(Lfs::PointersOnly)
+        self.lfs == Some(ExternalContent::PointersOnly)
+            || self.submodules == Some(ExternalContent::PointersOnly)
     }
 }
 

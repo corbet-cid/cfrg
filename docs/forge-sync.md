@@ -50,14 +50,15 @@ and blocked or unavailable locations return a failing exit status after the repo
 This first implementation does **not** transfer LFS payloads or submodule
 repositories. It inspects fetched source history, including files removed from the
 current tree, for LFS pointer blobs and Git tree entries naming submodule commits.
-Submodule entries always produce `external-content-unverified` and block all ref
-promotion before writes. An LFS requirement also blocks by default. Only when the
-policy explicitly declares `"lfs": "pointers-only"` for **every** selected
+Both requirements produce `external-content-unverified` and block all ref
+promotion before writes by default. Only when the policy explicitly declares
+`"external_content": {"<forge>": "pointers-only"}` for **every** selected
 destination does promotion proceed: refs and the pointer blobs travel, the LFS
-payloads stay at the primary, the report states `"content": {"lfs":
-"pointers-only", ...}`, and `repository_complete` remains false because the
-replica content is not complete. Without that exact per-location exception the
-report keeps `external-content-unverified` and no ref is written. Large or
+payloads and submodule commits stay at the primary, the report states `"content":
+{"lfs": "pointers-only", "submodules": "pointers-only", ...}` for each external
+kind present, and `repository_complete` remains false because the replica content
+is not complete. Without that exact per-location exception the report keeps
+`external-content-unverified` and no ref is written. Large or
 unreadable object inspections fail closed.
 
 Git authentication failures, server protections and ambiguous transport failures
