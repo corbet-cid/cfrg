@@ -39,6 +39,9 @@ enum Action {
         /// Published file name; defaults to `<package>-<target>` or the file's name.
         #[arg(long)]
         name: Option<String>,
+        /// Print the URL, hash and size that would be published; upload nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print URL, hash and size of a published file.
     Show {
@@ -92,6 +95,7 @@ pub fn run(options: Options) -> Result<()> {
             file,
             version,
             name,
+            dry_run,
         } => {
             let (path, version, default_name) = if this_binary {
                 commit_id(cfrg::SOURCE_REVISION)
@@ -110,15 +114,20 @@ pub fn run(options: Options) -> Result<()> {
                     .to_owned();
                 (path, version.ok_or("Give --commit")?, default)
             };
-            release::publish(
-                &cfgj::land::PACKAGES,
-                &mut http,
-                &mut release::Curl,
-                &config,
-                &version,
-                &name.unwrap_or(default_name),
-                &path,
-            )?
+            let file_name = name.unwrap_or(default_name);
+            if dry_run {
+                release::plan(&cfgj::land::PACKAGES, &config, &version, &file_name, &path)?
+            } else {
+                release::publish(
+                    &cfgj::land::PACKAGES,
+                    &mut http,
+                    &mut release::Curl,
+                    &config,
+                    &version,
+                    &file_name,
+                    &path,
+                )?
+            }
         }
         Action::Show { version, name } => {
             release::show(&cfgj::land::PACKAGES, &mut http, &config, &version, &name)?

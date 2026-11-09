@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::Path,
     time::Duration,
 };
@@ -125,6 +125,108 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
     Ok((digest, size))
 }
 
+/// The program interpreter (`PT_INTERP`) of a Linux ELF64 executable, `None` for a static
+/// binary and for every non-ELF file. Other ELF classes are not judged: the release targets
+/// are x86_64/arm64 Linux (ELF64), macOS (Mach-O) and Windows (PE). A malformed program
+/// header table is an error rather than a silent pass.
+pub fn elf_interpreter(path: &Path) -> Result<Option<String>> {
+    let mut file = File::open(path)?;
+    let mut ident = [0u8; 16];
+    if file.read_exact(&mut ident).is_err() || ident[..4] != b"\x7fELF"[..] {
+        return Ok(None);
+    }
+    if ident[4] != 2 || ident[5] != 1 {
+        return Err(failure(
+            "release: only little-endian ELF64 binaries can be checked against the CI build environment",
+        ));
+    }
+    let mut header = [0u8; 64];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    let phentsize = u16::from_le_bytes(header[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(header[56..58].try_into().unwrap()) as usize;
+    if phnum == 0 {
+        return Ok(None);
+    }
+    if phentsize < 56 {
+        return Err(failure("release: malformed ELF program header table"));
+    }
+    let mut header_bytes = vec![0u8; phentsize];
+    for index in 0..phnum {
+        let at = (index as u64)
+            .checked_mul(phentsize as u64)
+            .and_then(|offset| phoff.checked_add(offset))
+            .ok_or_else(|| failure("release: malformed ELF program header offset"))?;
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut header_bytes)?;
+        if u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()) != 3 {
+            continue;
+        }
+        let offset = u64::from_le_bytes(header_bytes[8..16].try_into().unwrap());
+        let size = u64::from_le_bytes(header_bytes[32..40].try_into().unwrap());
+        if size == 0 || size > 4096 {
+            return Err(failure("release: malformed ELF interpreter path"));
+        }
+        let mut interpreter = vec![0u8; size as usize];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut interpreter)?;
+        let end = interpreter
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(interpreter.len());
+        return Ok(Some(
+            String::from_utf8_lossy(&interpreter[..end]).into_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+/// The build-environment gate of a release: a Linux ELF must name a Nix store program
+/// interpreter. The CI job image and every Nix check-shell build with a Nix loader; a binary
+/// built on a plain host links that host's loader (`/lib64/...`) and may require a newer glibc
+/// than the CI image runs (2026-11-08: such a release stopped every heavy-box job). Static
+/// binaries carry no loader dependency, and non-ELF files are not judged here.
+pub fn require_ci_build(path: &Path) -> Result<()> {
+    if let Some(interpreter) = elf_interpreter(path)? {
+        if !interpreter.starts_with("/nix/store/") {
+            return Err(failure(format!(
+                "{} was built outside the CI image or a Nix check-shell: it links {interpreter}. \
+                 Build the release in the CI environment and publish that file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Print the record `publish` would create, without uploading anything. The build-environment
+/// gate runs here too, so a release dry-run proves the binary would be accepted.
+pub fn plan(
+    target: &dyn ReleaseTarget,
+    config: &Config,
+    version: &str,
+    file_name: &str,
+    file: &Path,
+) -> Result<Value> {
+    commit_id(version)?;
+    name(file_name)?;
+    require_ci_build(file)?;
+    let (sha256, size) = sha256_file(file)?;
+    let artifact = Artifact {
+        owner: config.owner.clone(),
+        package: config.package.clone(),
+        version: version.into(),
+        file: file_name.into(),
+        sha256,
+        size,
+    };
+    let mut record = record(target, config, &artifact, false);
+    record["created"] = Value::Null;
+    record["dry_run"] = json!(true);
+    Ok(record)
+}
+
 /// Publish `file` as `config.package` at `version` (a full commit id). Returns
 /// the consumer-facing record: URL, hash and size.
 pub fn publish(
@@ -138,6 +240,7 @@ pub fn publish(
 ) -> Result<Value> {
     commit_id(version)?;
     name(file_name)?;
+    require_ci_build(file)?;
     let (sha256, size) = sha256_file(file)?;
     let artifact = Artifact {
         owner: config.owner.clone(),
@@ -392,6 +495,72 @@ mod tests {
             out["url"],
             format!("https://forge.example/p/o/pkg/{COMMIT}/cfrg-x")
         );
+        assert_eq!(out["size"], 6);
+    }
+
+    /// A minimal little-endian ELF64 header with an optional PT_INTERP.
+    fn elf(interp: Option<&str>) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        match interp {
+            Some(text) => {
+                bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+                bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+                bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+                let mut header = vec![0u8; 56];
+                header[0..4].copy_from_slice(&3u32.to_le_bytes());
+                header[8..16].copy_from_slice(&(64u64 + 56).to_le_bytes());
+                header[32..40].copy_from_slice(&((text.len() + 1) as u64).to_le_bytes());
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.push(0);
+            }
+            None => {
+                bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn releases_must_come_from_the_ci_build_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let ci = dir.path().join("ci");
+        let interpreter = "/nix/store/abc-glibc-2.42/lib/ld-linux-x86-64.so.2";
+        fs::write(&ci, elf(Some(interpreter))).unwrap();
+        assert_eq!(elf_interpreter(&ci).unwrap().as_deref(), Some(interpreter));
+        require_ci_build(&ci).unwrap();
+
+        let host = dir.path().join("host");
+        fs::write(&host, elf(Some("/lib64/ld-linux-x86-64.so.2"))).unwrap();
+        let err = require_ci_build(&host).unwrap_err().to_string();
+        assert!(err.contains("built outside the CI image"), "{err}");
+
+        let static_binary = dir.path().join("static");
+        fs::write(&static_binary, elf(None)).unwrap();
+        require_ci_build(&static_binary).unwrap();
+
+        let script = dir.path().join("script");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        require_ci_build(&script).unwrap();
+
+        let mut elf32_bytes = elf(Some("/lib/ld-linux.so.2"));
+        elf32_bytes[4] = 1;
+        let elf32 = dir.path().join("elf32");
+        fs::write(&elf32, elf32_bytes).unwrap();
+        assert!(require_ci_build(&elf32).is_err());
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_record_without_uploading() {
+        let (_dir, path, hash) = file(b"binary");
+        let out = plan(&Target, &config(), COMMIT, "pkg-x", &path).unwrap();
+        assert_eq!(out["sha256"], hash.as_str());
+        assert_eq!(out["dry_run"], true);
+        assert!(out["created"].is_null());
         assert_eq!(out["size"], 6);
     }
 

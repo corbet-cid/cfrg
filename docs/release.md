@@ -7,12 +7,27 @@ manual install on a host.
 ```sh
 cfrg release --config .ci/release.json publish --self        # CI: publish this very binary
 cfrg release --config .ci/release.json publish --file out/tool --commit "$SHA"
+cfrg release --config .ci/release.json publish --file out/tool --commit "$SHA" --dry-run
 cfrg release --config .ci/release.json show --commit "$SHA" --name tool-x86_64-unknown-linux-gnu
 ```
 
 `--self` publishes the running executable under the commit it was built from
 (`cfrg source-revision`) as `<package>-<target triple>`: the bytes and the
-commit cannot disagree.
+commit cannot disagree. `--dry-run` prints the same record (`url`, `sha256`,
+`size`) without uploading or reading a token, so a release job can be
+rehearsed before the first real publication.
+
+## Build environment
+
+A release binary must be built by the CI environment: the repository job's
+check-shell or the job image. On Linux, `publish` (both `--self` and `--file`)
+reads the ELF `PT_INTERP` and refuses a binary whose program interpreter is not
+under `/nix/store/`. The CI image and every Nix check-shell build with a Nix
+loader; a binary built on a plain host links that host's loader
+(`/lib64/ld-linux-*.so.*`) and may require a newer glibc than the image runs,
+which fails every consumer. A static binary (no `PT_INTERP`) is accepted; a
+non-ELF file is not judged. The refusal happens before any upload or token
+read, so a mistaken local build costs nothing.
 
 ## Forgejo: generic package registry
 
