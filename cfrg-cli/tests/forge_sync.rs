@@ -1,6 +1,7 @@
 #![cfg(unix)]
 #[path = "support/forge_sync.rs"]
 mod support;
+use serde_json::{json, Value};
 use std::{fs, os::unix::fs::PermissionsExt};
 use support::{git, Fixture};
 
@@ -425,6 +426,129 @@ fn policy_url_and_repository_path_injection_is_refused_before_transport() {
     }
     assert_eq!(git(&f.source, &["rev-parse", "refs/heads/main"]), first);
     assert!(git(&f.replica, &["for-each-ref"]).is_empty());
+}
+
+#[test]
+fn explicit_per_location_pointer_only_mirror_reports_lfs_pointers_only() {
+    let f = Fixture::new();
+    f.commit("first");
+    fs::write(
+        f.source.join("large"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12345\n",
+            "b".repeat(64)
+        ),
+    )
+    .unwrap();
+    git(&f.source, &["add", "large"]);
+    git(&f.source, &["commit", "-qm", "lfs pointer"]);
+    let head = git(&f.source, &["rev-parse", "HEAD"]);
+    let (output, report) = f.report(&["--all-refs", "--to", "replica", "--apply"]);
+    assert!(!output.status.success());
+    assert_eq!(report["content"]["lfs_required"], true);
+    assert_eq!(report["source_reason"], "external-content-unverified");
+    assert!(git(&f.replica, &["for-each-ref"]).is_empty());
+
+    let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
+    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    policy["repositories"]["widget"]["locations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("offline");
+    policy["repositories"]["widget"]["clone_fallbacks"] = json!(["replica"]);
+    fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    let (output, report) = f.report(&["--all-refs", "--to", "replica", "--apply"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["content"]["lfs"], "pointers-only");
+    assert_eq!(report["source_reason"], "observed-source-fetched");
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["repository_complete"], false);
+    assert_eq!(git(&f.replica, &["rev-parse", "refs/heads/main"]), head);
+    assert!(git(&f.replica, &["show", "refs/heads/main:large"])
+        .starts_with("version https://git-lfs.github.com/spec/v1"));
+}
+
+#[test]
+fn pointer_only_requires_the_exception_at_every_selected_destination() {
+    let f = Fixture::new();
+    f.commit("first");
+    fs::write(
+        f.source.join("large"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12345\n",
+            "c".repeat(64)
+        ),
+    )
+    .unwrap();
+    git(&f.source, &["add", "large"]);
+    git(&f.source, &["commit", "-qm", "lfs pointer"]);
+    let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
+    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let (output, report) = f.report(&[
+        "--all-refs",
+        "--to",
+        "replica",
+        "--to",
+        "offline",
+        "--apply",
+    ]);
+    assert!(!output.status.success());
+    assert_eq!(report["source_reason"], "external-content-unverified");
+    assert!(git(&f.replica, &["for-each-ref"]).is_empty());
+}
+
+#[test]
+fn pointer_only_never_promotes_submodules() {
+    let f = Fixture::new();
+    let first = f.commit("first");
+    fs::write(
+        f.source.join("large"),
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12345\n",
+            "d".repeat(64)
+        ),
+    )
+    .unwrap();
+    git(&f.source, &["add", "large"]);
+    git(
+        &f.source,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{first},dependency"),
+        ],
+    );
+    git(&f.source, &["commit", "-qm", "pointer and gitlink"]);
+    let mut policy: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
+    policy["repositories"]["widget"]["lfs"] = json!({"replica": "pointers-only"});
+    fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let (output, report) = f.report(&["--all-refs", "--to", "replica", "--apply"]);
+    assert!(!output.status.success());
+    assert_eq!(report["source_reason"], "external-content-unverified");
+    assert_eq!(report["content"]["submodules_required"], true);
+    assert!(git(&f.replica, &["for-each-ref"]).is_empty());
+}
+
+#[test]
+fn lfs_exception_must_name_a_declared_secondary() {
+    let f = Fixture::new();
+    f.commit("first");
+    let original: Value = serde_json::from_slice(&fs::read(&f.policy).unwrap()).unwrap();
+    for location in ["source", "missing"] {
+        let mut policy = original.clone();
+        policy["repositories"]["widget"]["lfs"] = json!({location: "pointers-only"});
+        fs::write(&f.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let output = f.run(&["--all-refs", "--to", "replica", "--apply"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("LFS"));
+    }
 }
 
 #[test]

@@ -14,6 +14,17 @@ remain claims until a collector verifies them; presentation checks remain in cql
 `cfrg sync` provides explicit, bounded, fast-forward-only reconciliation from
 the declared primary to selected secondaries. See [its safety and completeness
 contract](forge-sync.md), including offline replicas and external content.
+A repository that contains Git LFS pointers is refused by default. An exact
+per-location exception may be declared beside its locations:
+
+```json
+"locations": {"forgejo": "team/widget", "gitlab": "team/widget"},
+"lfs": {"gitlab": "pointers-only"}
+```
+
+This permits refs and pointer blobs to reach that secondary while the LFS
+payloads stay at the primary; the sync report states `lfs: pointers-only` and
+never reports the repository complete. Submodules remain refused.
 
 `cfrg clone --policy forges.json --repository widget --commit FULL_SHA
 --destination NEW_DIRECTORY` tries the primary then the declared clone fallbacks.

@@ -652,6 +652,8 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Bulk,
                         source: "/x".into(),
+                        private: false,
+                        description: String::new(),
                     },
                 ),
                 (
@@ -659,6 +661,8 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Build,
                         source: "/x".into(),
+                        private: false,
+                        description: String::new(),
                     },
                 ),
                 (
@@ -666,12 +670,15 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Bulk,
                         source: "/x".into(),
+                        private: false,
+                        description: String::new(),
                     },
                 ),
             ]),
             state_dir: "/s".into(),
             paused_dir: "/p".into(),
             kill_switch: "/k".into(),
+            quiet_fill: true,
         };
         let mut queue = Vec::new();
         enqueue(&mut queue, "o/bulk-new", 30);

@@ -52,11 +52,34 @@ pub struct Repository {
     pub attributes: BTreeMap<String, String>,
     /// Forge declaration -> complete namespace/repository path; nested groups allowed.
     pub locations: BTreeMap<String, String>,
+    /// Forge declaration -> external LFS handling at that location. Absent (or
+    /// `block`) refuses every repository whose history contains LFS pointers;
+    /// `pointers-only` explicitly permits promoting refs and pointer blobs while
+    /// the payloads stay at the primary. Never declared for the primary itself.
+    #[serde(default)]
+    pub lfs: BTreeMap<String, Lfs>,
     #[serde(default)]
     pub clone_fallbacks: Vec<String>,
     #[serde(default)]
     pub execution_fallbacks: Vec<String>,
     pub promotion: Promotion,
+}
+
+/// How one location treats Git LFS pointers found in the source history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Lfs {
+    /// Refuse promotion; the payloads cannot be verified at this location (default).
+    Block,
+    /// Promote refs and pointer blobs only; LFS payloads stay at the primary.
+    PointersOnly,
+}
+
+impl Repository {
+    /// Whether this location is explicitly allowed a pointer-only mirror.
+    pub fn lfs_pointers_only(&self, forge: &str) -> bool {
+        self.lfs.get(forge) == Some(&Lfs::PointersOnly)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -174,6 +197,18 @@ impl Policy {
                 if let Some(other) = identities.insert(identity, id) {
                     return Err(failure(format!(
                         "Repositories {other} and {id} claim the same remote location"
+                    )));
+                }
+            }
+            for forge in repo.lfs.keys() {
+                if !repo.locations.contains_key(forge) {
+                    return Err(failure(format!(
+                        "Repository {id} declares LFS handling for an undeclared location {forge}"
+                    )));
+                }
+                if forge == &primary.forge {
+                    return Err(failure(format!(
+                        "Repository {id} cannot declare LFS handling at its primary forge"
                     )));
                 }
             }

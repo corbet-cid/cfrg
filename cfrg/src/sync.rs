@@ -1,5 +1,9 @@
 //! Explicit, fast-forward-only reconciliation of declared Git locations.
-use crate::{failure, placement::Policy, profile, Result};
+use crate::{
+    failure,
+    placement::{Lfs, Policy},
+    profile, Result,
+};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -198,13 +202,23 @@ pub fn reconcile(
     };
     report.content = content;
     if !report.content.verified() {
-        report.source_state = State::Blocked;
-        report.source_reason = "external-content-unverified";
-        for replica in &mut report.replicas {
-            replica.state = State::Blocked;
-            replica.reason = report.source_reason;
+        // A pointer-only mirror requires the explicit, per-location exception at
+        // every selected destination. Submodules are never promoted this way.
+        let pointers_only = report.content.lfs_required
+            && !report.content.submodules_required
+            && destinations
+                .iter()
+                .all(|forge| repo.lfs_pointers_only(forge));
+        if !pointers_only {
+            report.source_state = State::Blocked;
+            report.source_reason = "external-content-unverified";
+            for replica in &mut report.replicas {
+                replica.state = State::Blocked;
+                replica.reason = report.source_reason;
+            }
+            return Ok(report);
         }
-        return Ok(report);
+        report.content.lfs = Some(Lfs::PointersOnly);
     }
     for (index, replica) in report.replicas.iter_mut().enumerate() {
         inspect_replica(
@@ -240,8 +254,10 @@ pub fn reconcile(
             report.complete = false;
         }
     }
-    report.repository_complete =
-        report.complete && all_refs && destinations.len() + 1 == repo.locations.len();
+    report.repository_complete = report.complete
+        && all_refs
+        && destinations.len() + 1 == repo.locations.len()
+        && !report.content.lfs_required;
     Ok(report)
 }
 

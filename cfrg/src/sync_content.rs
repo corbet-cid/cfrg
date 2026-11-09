@@ -1,6 +1,6 @@
 //! Ref promotion never claims to have copied external source payloads.
 use super::git::{valid_oid, Git};
-use crate::{failure, Result};
+use crate::{failure, placement::Lfs, Result};
 use serde::Serialize;
 use std::io::Write;
 
@@ -8,12 +8,23 @@ use std::io::Write;
 pub struct Content {
     pub inspected: bool,
     pub lfs_required: bool,
+    /// Present only when the policy explicitly allows a pointer-only mirror at
+    /// every selected destination: refs and pointer blobs were promoted without
+    /// the LFS payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lfs: Option<Lfs>,
     pub submodules_required: bool,
 }
 
 impl Content {
     pub fn verified(&self) -> bool {
         self.inspected && !self.lfs_required && !self.submodules_required
+    }
+
+    /// A pointer-only mirror needs the explicit per-location exception and is
+    /// still not verified replication of the source payloads.
+    pub fn pointers_only(&self) -> bool {
+        self.lfs == Some(Lfs::PointersOnly)
     }
 }
 
