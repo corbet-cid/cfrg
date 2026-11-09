@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 fn value() -> Value {
-    serde_json::from_str(include_str!("../examples/repository-policy.json")).unwrap()
+    serde_json::from_str(include_str!("../../examples/repository-policy.json")).unwrap()
 }
 fn policy() -> Policy {
     serde_json::from_value(value()).unwrap()

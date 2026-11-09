@@ -31,5 +31,5 @@ CFRG_GITHUB_TOKEN=... cfrg gate --config gate.json dispatch org/repo ccid-remote
 | Credential | read from the environment variable named by `--token-env` at the last moment and handed to git through `GIT_CONFIG_*` (an `http.extraheader`) or to curl through `--variable`/`--expand-header` for `create` and `dispatch`, never through arguments or files; `--origin`, `--api` exist for tests |
 
 The configuration is JSON: `budgets` (optional), `repos` (`org/repo` to `{lane, source}`; a repository that is not listed is never pushed), `state_dir`, `paused_dir`,
-`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/gate_flush.rs` runs the executor against local bare repositories (including the empty LFS listing of a repository without LFS), `cfrg-cli/tests/gate_create.rs` covers the creation budget, gap and validation without network, and
-`cfrg-cli/tests/gate_dispatch.rs` covers dispatch validation and refusals without network access; `cfrg-cli/tests/gate_delete.rs` and the unit tests in `cfrg-cli/src/delete.rs` cover the deletion refusals.
+`kill_switch`. The pure decisions are `cfrg::gate`; `cfrg-cli/tests/it/gate_flush.rs` runs the executor against local bare repositories (including the empty LFS listing of a repository without LFS), `cfrg-cli/tests/it/gate_create.rs` covers the creation budget, gap and validation without network, and
+`cfrg-cli/tests/it/gate_dispatch.rs` covers dispatch validation and refusals without network access; `cfrg-cli/tests/it/gate_delete.rs` and the unit tests in `cfrg-cli/src/delete.rs` cover the deletion refusals.

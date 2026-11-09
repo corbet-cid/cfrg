@@ -1,9 +1,7 @@
 #![cfg(unix)]
-#[path = "support/forge_sync.rs"]
-mod support;
+use crate::support::{git, Fixture};
 use serde_json::{json, Value};
 use std::{fs, os::unix::fs::PermissionsExt};
-use support::{git, Fixture};
 
 #[test]
 fn plans_then_copies_all_heads_and_exact_tag_objects_without_touching_other_locations() {
