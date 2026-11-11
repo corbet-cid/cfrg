@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn package_paths_are_stable_and_hash_comes_from_the_listing() {
         let artifact = Artifact {
-            owner: "corbet-libs".into(),
+            owner: "corbet-cid".into(),
             package: "cfrg".into(),
             version: "a".repeat(40),
             file: "cfrg-x86_64-unknown-linux-gnu".into(),
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(
             PACKAGES.file_path(&artifact),
             format!(
-                "/api/packages/corbet-libs/generic/cfrg/{}/cfrg-x86_64-unknown-linux-gnu",
+                "/api/packages/corbet-cid/generic/cfrg/{}/cfrg-x86_64-unknown-linux-gnu",
                 "a".repeat(40)
             )
         );

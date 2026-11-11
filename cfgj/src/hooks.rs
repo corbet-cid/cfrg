@@ -171,7 +171,7 @@ mod tests {
         let report = ensure(
             &mut plan,
             &endpoint(),
-            Scope::Org("corbet-libs"),
+            Scope::Org("corbet-cid"),
             URL,
             Some("s"),
             false,
@@ -186,7 +186,7 @@ mod tests {
         let report = ensure(
             &mut io,
             &endpoint(),
-            Scope::Org("corbet-libs"),
+            Scope::Org("corbet-cid"),
             URL,
             Some("s3cret"),
             true,
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(report["state"], "created");
         assert!(!report.to_string().contains("s3cret"));
         let post = &io.1[1];
-        assert_eq!(post.path, "/api/v1/orgs/corbet-libs/hooks");
+        assert_eq!(post.path, "/api/v1/orgs/corbet-cid/hooks");
         let body = post.body.as_ref().unwrap();
         assert_eq!(body["config"]["secret"], "s3cret");
         assert_eq!(body["config"]["content_type"], "json");
