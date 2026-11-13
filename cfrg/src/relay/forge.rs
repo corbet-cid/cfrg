@@ -184,6 +184,15 @@ impl Screen for HoldAll {
     }
 }
 
+/// Pass-through screen (`screen: rate_limit`): the per-author cap of the engine is the only brake.
+pub struct PassThrough;
+
+impl Screen for PassThrough {
+    fn screen(&self, _forge: Forge, _object: &ObjectState) -> ScreenVerdict {
+        ScreenVerdict::Pass
+    }
+}
+
 /// Maps an HTTP status of a failed call to the router's error classes. A 404 or 410 is NOT mapped to `Gone` here:
 /// only the read and delete calls of a driver treat it as such, after looking at the object they asked for.
 pub fn from_status(status: u16, detail: String) -> ForgeError {

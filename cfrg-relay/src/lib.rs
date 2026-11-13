@@ -14,10 +14,11 @@ use cfrg::{
         copyid::CopyIds,
         derive::{repos_from_placement, repos_from_placement_with, unresolved_copies},
         heads::Heads,
+        model::ScreenKind,
         ops::SweepReport,
         pacing::SystemClock,
         pg::PgStore,
-        Engine, Hint, HoldAll, Report, RouterConfig,
+        Engine, Hint, HoldAll, PassThrough, Report, RouterConfig, Screen,
     },
     Result,
 };
@@ -120,8 +121,7 @@ fn run<T>(
         store: &mut store,
         forges: &mut forges,
         clock: &clock,
-        // Fail closed until the reviewer's abuse screen (R51) is attached: new objects stay on Forgejo.
-        screen: &HoldAll,
+        screen: screen_for(p.config.screen),
         contributed: &p.contributed,
         holder: &holder,
         contrib: contrib.as_mut(),
@@ -238,4 +238,54 @@ pub fn sweep(settings: &Settings, older_than: Option<u64>) -> Result<Swept> {
     run(settings, Swept::Refused, |engine| {
         Ok(Swept::Done(engine.sweep(older_than)?))
     })
+}
+
+/// The abuse screen of the `screen` setting (R51): `hold_all` fails closed, `rate_limit` lets the engine's per-author cap decide.
+pub fn screen_for(kind: ScreenKind) -> &'static dyn Screen {
+    match kind {
+        ScreenKind::HoldAll => &HoldAll,
+        ScreenKind::RateLimit => &PassThrough,
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+    use cfrg::relay::{model::ObjectState, ScreenVerdict};
+
+    fn verdict(json: &str) -> ScreenVerdict {
+        let cfg = RouterConfig::parse(json).unwrap();
+        screen_for(cfg.screen).screen(
+            cfrg::model::Forge::Forgejo,
+            &ObjectState {
+                number: 1,
+                url: String::new(),
+                author: cfrg::relay::model::Actor {
+                    id: "u1".into(),
+                    login: "a".into(),
+                },
+                snap: Default::default(),
+                confidential: false,
+                comments: vec![],
+                updated_at: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn missing_screen_is_hold_all() {
+        assert!(matches!(verdict(r#"{"relay":{}}"#), ScreenVerdict::Hold(_)));
+        assert!(matches!(
+            verdict(r#"{"relay":{},"screen":"hold_all"}"#),
+            ScreenVerdict::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn rate_limit_passes_to_the_engine_cap() {
+        assert_eq!(
+            verdict(r#"{"relay":{},"screen":"rate_limit"}"#),
+            ScreenVerdict::Pass
+        );
+    }
 }

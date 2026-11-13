@@ -217,6 +217,19 @@ pub struct RouterConfig {
     /// Labels that exist on one forge only and are never merged across forges.
     #[serde(default = "default_local_labels")]
     pub local_labels: Vec<String>,
+    /// R51 abuse screen: `hold_all` (default, fail closed) or `rate_limit` (pass-through; the per-author cap of
+    /// `limits.author_fanout_per_day` is the only brake, the rest is held on Forgejo).
+    #[serde(default)]
+    pub screen: ScreenKind,
+}
+
+/// Which abuse screen the relay runs (R51).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenKind {
+    #[default]
+    HoldAll,
+    RateLimit,
 }
 
 fn default_held_label() -> String {
@@ -238,6 +251,7 @@ impl Default for RouterConfig {
             kill_switch: None,
             held_label: default_held_label(),
             local_labels: default_local_labels(),
+            screen: ScreenKind::default(),
         }
     }
 }

@@ -51,5 +51,5 @@ mod tests_pg;
 mod tests_tls;
 
 pub use engine::{Engine, Outcome, Report};
-pub use forge::{Forges, HoldAll, RouterForge, Screen, ScreenVerdict};
+pub use forge::{Forges, HoldAll, PassThrough, RouterForge, Screen, ScreenVerdict};
 pub use model::{Hint, HintAction, RouterConfig};
