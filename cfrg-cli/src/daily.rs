@@ -213,6 +213,45 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             Action::Command { program: exe.to_owned(), args, env }
         }
     };
+    let gitlab_key = if credential(dir, "gitlab_token").is_none()
+        || credential(dir, "forgejo_push").is_none()
+    {
+        Action::Noop(
+            "the credentials gitlab_token and forgejo_push are not in the credentials directory"
+                .into(),
+        )
+    } else {
+        let mut env = BTreeMap::new();
+        for (var, file) in [
+            ("PGHOST", "host"),
+            ("PGPORT", "port"),
+            ("PGDATABASE", "dbname"),
+            ("PGUSER", "username"),
+        ] {
+            if let Some(value) = credential(dir, file) {
+                env.insert(var.to_owned(), value);
+            }
+        }
+        env.insert(
+            "PGPASSWORD_FILE".into(),
+            dir.join("password").display().to_string(),
+        );
+        env.insert("PGSSLMODE".into(), "verify-full".into());
+        env.insert("PGSSLROOTCERT".into(), options.ca.display().to_string());
+        env.insert("CREDENTIALS_DIRECTORY".into(), dir.display().to_string());
+        env.insert("PENDING".into(), options.pending.display().to_string());
+        env.insert("WORK".into(), "/work/gitlab-key".into());
+        env.insert("HOME".into(), "/work".into());
+        if dry {
+            // Nothing is due, so nothing is rotated: the run reads both keys and the lease only.
+            env.insert("THRESHOLD_DAYS".into(), "0".into());
+        }
+        Action::Command {
+            program: "bash".into(),
+            args: vec![options.gitlab_key_script.display().to_string()],
+            env,
+        }
+    };
     vec![
         Step {
             name: "renovate",
@@ -228,7 +267,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         },
         Step {
             name: "gitlab-key",
-            action: Action::Noop("the GitLab key renewal is not built yet (B11)".into()),
+            action: gitlab_key,
         },
     ]
 }
