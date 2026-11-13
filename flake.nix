@@ -22,8 +22,9 @@
           };
           cargoBuildFlags = [ "-p" package ];
           env = pkgs.lib.optionalAttrs (self ? rev) { CFRG_SOURCE_REVISION = self.rev; };
-          nativeBuildInputs = [ pkgs.pkg-config ] ++ extraNative;
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ] ++ extraNative;
           dontUseCmakeConfigure = true;
+          preBuild = "unset AWS_LC_SYS_USE_SYSTEM"; # newer nixpkgs hooks demand a system AWS-LC; aws-lc-sys builds its own copy
           doCheck = false; # the repository's own CI runs the tests
           passthru = { inherit rev; };
           meta = { mainProgram = pname; license = pkgs.lib.licenses.lgpl3Only; };
@@ -32,7 +33,7 @@
     {
       packages = forAll (system: pkgs:
         let
-          cfrg = mk pkgs { pname = "cfrg"; package = "cfrg-cli"; extraNative = [ pkgs.cmake ]; }; # cmake: aws-lc-sys may build with it
+          cfrg = mk pkgs { pname = "cfrg"; package = "cfrg-cli"; }; # cmake: aws-lc-sys may build with it
           cfrg-serve = mk pkgs { pname = "cfrg-serve"; package = "cfrg-serve"; };
         in
         {
