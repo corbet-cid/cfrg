@@ -1,6 +1,6 @@
 //! The live GitLab `HeadHost` of the pull request heads (Bridge design §3.3, build task B8).
 //!
-//! Writes that the GitLab driver (`cglb`) offers go through it: `subgroup_create`, `fork_into_relay_subgroup`,
+//! Writes that the GitLab driver (`cglb`) offers go through it: `fork_into_relay_subgroup`,
 //! `merge_request_note` and `merge_request_close`. Two things the driver has no call for are done here with `curl`
 //! (the token travels in a header file of a private temporary directory, never in an argument or a message):
 //! the reads (does the subgroup or fork exist, which merge request has this head) and opening a merge request
@@ -188,16 +188,16 @@ impl HeadHost for GitlabHeads {
             .ok_or_else(|| ForgeError::Rejected("repository path".into()))?;
         let sub = format!("{group}/cforge");
         let fork = format!("{sub}/{name}");
-        // Look first; create the subgroup only when it does not exist.
+        // The `<group>/cforge` subgroups are made once by the owner (least privilege: the relay account is
+        // Maintainer there and nowhere else). A missing one is reported, never created by the relay.
         if self
             .rest
             .call_opt("GET", &format!("groups/{}", enc(&sub)), &[])?
             .is_none()
         {
-            let parent = Self::path(group)?;
-            self.rt
-                .block_on(self.driver.subgroup_create(&parent))
-                .map_err(Self::fail)?;
+            return Err(ForgeError::Rejected(format!(
+                "the relay subgroup {sub} does not exist; the owner creates it once (the relay does not)"
+            )));
         }
         if self.project_id(&fork)?.is_none() {
             let (project, group) = (Self::path(copy_repo)?, Self::path(group)?);
@@ -338,5 +338,236 @@ impl HeadHost for GitlabHeads {
                 &[],
             )
             .map(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// GitHub
+// ---------------------------------------------------------------------------------------------------------
+
+fn b64url(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..=c.len() {
+            out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// An App JWT (RS256, ten minutes) signed with the `openssl` binary; the key is read from `key_file`, never
+/// copied. `now` is the unix time.
+pub fn app_jwt(app_id: u64, key_file: &std::path::Path, now: u64) -> Result<String, ForgeError> {
+    let head = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let claims = b64url(
+        format!(
+            r#"{{"iat":{},"exp":{},"iss":{app_id}}}"#,
+            now - 30,
+            now + 540
+        )
+        .as_bytes(),
+    );
+    let signing = format!("{head}.{claims}");
+    let mut child = Command::new("openssl")
+        .args(["dgst", "-sha256", "-sign"])
+        .arg(key_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
+    std::io::Write::write_all(&mut child.stdin.take().expect("piped"), signing.as_bytes())
+        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(ForgeError::Unavailable("the App key could not sign".into()));
+    }
+    Ok(format!("{signing}.{}", b64url(&out.stdout)))
+}
+
+/// The GitHub head host: the head is the branch `cforge/<origin>-<n>` inside the copy. Reads, the branch
+/// delete and the push use the installation token; the pull request is opened and closed by the `cghb`
+/// driver.
+pub struct GithubHeads {
+    pub rt: Rc<Runtime>,
+    pub driver: cghb::relay::GithubRelay,
+    pub rest: Rest,
+    token: String,
+}
+
+impl GithubHeads {
+    /// Mints an installation token (valid one hour) from the App key file and builds the host.
+    pub fn new(
+        rt: Rc<Runtime>,
+        driver: cghb::relay::GithubRelay,
+        app_id: u64,
+        installation_id: u64,
+        key_file: &std::path::Path,
+    ) -> Result<Self, ForgeError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let jwt = app_jwt(app_id, key_file, now)?;
+        let app = Rest::new(
+            "https://api.github.com",
+            &format!("Authorization: Bearer {jwt}"),
+        )?;
+        let v = app
+            .call_opt(
+                "POST",
+                &format!("app/installations/{installation_id}/access_tokens"),
+                &[],
+            )?
+            .ok_or_else(|| ForgeError::Rejected("installation not found".into()))?;
+        let token = v["token"]
+            .as_str()
+            .ok_or_else(|| ForgeError::Unavailable("no installation token".into()))?
+            .to_owned();
+        let rest = Rest::new(
+            "https://api.github.com",
+            &format!("Authorization: Bearer {token}"),
+        )?;
+        Ok(Self {
+            rt,
+            driver,
+            rest,
+            token,
+        })
+    }
+
+    fn repo(r: &str) -> Result<cghb::relay::Repo, ForgeError> {
+        cghb::relay::Repo::parse(r).map_err(|e| ForgeError::Rejected(e.to_string()))
+    }
+
+    fn state_of(v: &Value) -> ReqState {
+        if !v["merged_at"].is_null() || v["merged"].as_bool() == Some(true) {
+            ReqState::Merged
+        } else if v["state"].as_str() == Some("closed") {
+            ReqState::Closed
+        } else {
+            ReqState::Open
+        }
+    }
+}
+
+impl HeadHost for GithubHeads {
+    fn forge(&self) -> Forge {
+        Forge::Github
+    }
+
+    fn site(&mut self, copy_repo: &str) -> Result<Site, ForgeError> {
+        Self::repo(copy_repo)?;
+        Ok(Site {
+            repo: copy_repo.into(),
+            push_url: format!(
+                "https://x-access-token:{}@github.com/{copy_repo}.git",
+                self.token
+            ),
+        })
+    }
+
+    fn branch_tip(&mut self, site: &Site, branch: &str) -> Result<Option<String>, ForgeError> {
+        let r = self.rest.call_opt(
+            "GET",
+            &format!("repos/{}/git/ref/heads/{branch}", site.repo),
+            &[],
+        )?;
+        Ok(r.and_then(|v| v["object"]["sha"].as_str().map(str::to_owned)))
+    }
+
+    fn find_request(
+        &mut self,
+        copy_repo: &str,
+        _site: &Site,
+        branch: &str,
+    ) -> Result<Option<ReqRef>, ForgeError> {
+        let owner = copy_repo.split('/').next().unwrap_or("");
+        let q = format!(
+            "repos/{copy_repo}/pulls?state=all&sort=created&direction=desc&per_page=10&head={}",
+            enc(&format!("{owner}:{branch}"))
+        );
+        let list = self.rest.call_opt("GET", &q, &[])?.unwrap_or(Value::Null);
+        Ok(list.as_array().and_then(|l| l.first()).map(|m| ReqRef {
+            number: m["number"].as_u64().unwrap_or(0),
+            url: m["html_url"].as_str().unwrap_or("").to_owned(),
+            state: Self::state_of(m),
+        }))
+    }
+
+    fn open_request(
+        &mut self,
+        copy_repo: &str,
+        _site: &Site,
+        branch: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<ReqRef, ForgeError> {
+        let repo = Self::repo(copy_repo)?;
+        let c = self
+            .rt
+            .block_on(self.driver.pull_open(&repo, title, branch, base, body))
+            .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
+        Ok(ReqRef {
+            number: c.number,
+            url: c.html_url,
+            state: ReqState::Open,
+        })
+    }
+
+    fn request_state(&mut self, repo: &str, number: u64) -> Result<Option<ReqState>, ForgeError> {
+        let v = self
+            .rest
+            .call_opt("GET", &format!("repos/{repo}/pulls/{number}"), &[])?;
+        Ok(v.map(|v| Self::state_of(&v)))
+    }
+
+    fn close_request(&mut self, repo: &str, number: u64, note: &str) -> Result<(), ForgeError> {
+        if self.request_state(repo, number)? != Some(ReqState::Open) {
+            return Ok(());
+        }
+        let r = Self::repo(repo)?;
+        self.rt
+            .block_on(self.driver.comment(&r, number, note))
+            .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
+        self.rt
+            .block_on(self.driver.pull_close(&r, number))
+            .map_err(|e| ForgeError::Unavailable(e.to_string()))
+    }
+
+    fn delete_branch(&mut self, site: &Site, branch: &str) -> Result<(), ForgeError> {
+        match self.rest.call(
+            "DELETE",
+            &format!("repos/{}/git/refs/heads/{branch}", site.repo),
+            &[],
+        )? {
+            (200..=299 | 404 | 422, _) => Ok(()),
+            (c, v) => Err(http_error(c, &v.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_matches_the_known_vectors() {
+        assert_eq!(b64url(b""), "");
+        assert_eq!(b64url(b"f"), "Zg");
+        assert_eq!(b64url(b"fo"), "Zm8");
+        assert_eq!(b64url(b"foo"), "Zm9v");
+        assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
+    }
+
+    #[test]
+    fn percent_encoding_keeps_slashes_out_of_paths() {
+        assert_eq!(enc("a/b c"), "a%2Fb%20c");
     }
 }
