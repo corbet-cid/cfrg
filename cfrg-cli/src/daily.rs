@@ -2,7 +2,7 @@
 //!
 //! Four steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
 //! failed, so the Job fails. A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
-//!   renovate     runs `--renovate-command` when the credential `renovate-forgejo` is in the credentials directory
+//!   renovate     runs in its own image (an initContainer of the Job: Renovate, cargo, git, nix are a large closure); it leaves its exit status in `--renovate-status`, and this step reports it (no file: a logged no-op)
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
 //!   settings     `cfrg native --operation settings --apply` (R42 copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
@@ -36,9 +36,9 @@ pub struct Options {
     /// CA file the database certificate is verified against (NOT `SSL_CERT_FILE`: that stays the public roots, which the providers and the key renewal need).
     #[arg(long, env = "CFRG_DAILY_CA", default_value = "/ca/ca.crt")]
     ca: PathBuf,
-    /// The Renovate runner (tools/renovate/run in the infra repository).
-    #[arg(long, default_value = "/bin/renovate-run")]
-    renovate_command: PathBuf,
+    /// The file the Renovate initContainer leaves its exit status in (a decimal number).
+    #[arg(long, default_value = "/work/renovate.status")]
+    renovate_status: PathBuf,
     /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
@@ -58,6 +58,8 @@ pub struct Options {
 pub enum Action {
     /// Succeeds, saying why nothing was done.
     Noop(String),
+    /// A step that already ran elsewhere in the pod: succeeds when the file holds `0`.
+    Status(PathBuf),
     Command {
         program: PathBuf,
         args: Vec<String>,
@@ -82,6 +84,15 @@ pub fn run_steps(steps: &[Step]) -> Vec<&'static str> {
                     json!({"step": step.name, "outcome": "noop", "why": why})
                 );
                 true
+            }
+            Action::Status(path) => {
+                let code = fs::read_to_string(path).unwrap_or_default();
+                let ok = code.trim() == "0";
+                println!(
+                    "{}",
+                    json!({"step": step.name, "outcome": if ok { "ok" } else { "failed" }, "exit": code.trim()})
+                );
+                ok
             }
             Action::Command { program, args, env } => {
                 println!("{}", json!({"step": step.name, "outcome": "start"}));
@@ -163,32 +174,12 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             dir.display().to_string(),
         );
     };
-    let renovate = if credential(dir, "renovate-forgejo").is_none() {
-        Action::Noop(
-            "the Forgejo credential renovate-forgejo is not in the credentials directory yet"
-                .into(),
-        )
+    let renovate = if options.renovate_status.is_file() {
+        Action::Status(options.renovate_status.clone())
     } else {
-        let mut env = BTreeMap::new();
-        env.insert(
-            "RENOVATE_PLACEMENT".into(),
-            options.placement.display().to_string(),
-        );
-        env.insert("RENOVATE_NO_NIX".into(), "1".into());
-        env.insert("HOME".into(), "/work".into());
-        env.insert("RENOVATE_BASE_DIR".into(), "/work/renovate".into());
-        env.insert(
-            "RENOVATE_FORGEJO_TOKEN_FILE".into(),
-            dir.join("renovate-forgejo").display().to_string(),
-        );
-        if dry {
-            env.insert("RENOVATE_DRY_RUN".into(), "full".into());
-        }
-        Action::Command {
-            program: options.renovate_command.clone(),
-            args: vec![],
-            env,
-        }
+        Action::Noop(
+            "renovate did not run in this pod (no status file from its initContainer)".into(),
+        )
     };
     let native = match env_file(dir, "native-env") {
         None => Action::Noop("the provider credentials of cfrg native (native-env) are not in the credentials directory yet".into()),
@@ -416,7 +407,7 @@ mod tests {
             placement: "/app/placement.json".into(),
             state: "/work/state".into(),
             ca: "/ca/ca.crt".into(),
-            renovate_command: "/bin/renovate-run".into(),
+            renovate_status: dir.join("renovate.status"),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
             gate_dir: "/nonexistent-gate".into(),
             max_writes: 20,
@@ -467,17 +458,13 @@ mod tests {
         assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
         assert_eq!(env["THRESHOLD_DAYS"], "0");
         assert!(!env.values().any(|v| v.contains("p'w")));
-        for step in [&steps[0], &steps[1], &steps[4]] {
-            let Action::Command { args, env, .. } = &step.action else {
+        for step in [&steps[1], &steps[4]] {
+            let Action::Command { args, .. } = &step.action else {
                 panic!("{} must run", step.name)
             };
             assert!(args
                 .iter()
                 .all(|a| !a.contains("p'w") && !a.contains("tok")));
-            assert!(
-                step.name != "renovate"
-                    || env.get("RENOVATE_DRY_RUN").map(String::as_str) == Some("full")
-            );
         }
         let Action::Command { args, env, .. } = &steps[4].action else {
             unreachable!()
@@ -585,6 +572,23 @@ mod tests {
             };
             assert!(why.starts_with("refused"), "{why}");
         }
+    }
+
+    #[test]
+    fn renovate_is_the_status_its_init_container_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = options(dir.path(), false);
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        assert!(matches!(&steps[0].action, Action::Noop(why) if why.contains("did not run")));
+        fs::write(dir.path().join("renovate.status"), "0\n").unwrap();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        assert!(matches!(steps[0].action, Action::Status(_)));
+        assert!(run_steps(&steps[..1]).is_empty());
+        fs::write(dir.path().join("renovate.status"), "3\n").unwrap();
+        assert_eq!(
+            run_steps(&plan(&o, Path::new("/bin/cfrg"))[..1]),
+            vec!["renovate"]
+        );
     }
 
     #[test]
