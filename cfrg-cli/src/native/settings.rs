@@ -293,7 +293,9 @@ pub fn run(options: &Options) -> Result<()> {
                     incomplete = true;
                     // A refusal by the forge (auth, rate, plan, server) stops that forge for
                     // the rest of the run: no retry, the window is recorded in the state.
-                    if message.contains("Native API HTTP") || message.contains("hold for") {
+                    // (`expect` failures, like a 422 on one repository, name the status too but
+                    // are no refusal: only the transport's "stopped without retry" is.)
+                    if message.contains("stopped without retry") || message.contains("hold for") {
                         stopped.insert(name, message.clone());
                     }
                     rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"error", "error":message}));

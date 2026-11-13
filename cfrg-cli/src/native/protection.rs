@@ -123,7 +123,7 @@ pub fn run(options: &Options) -> Result<()> {
             Err(error) => {
                 let message = error.to_string();
                 *tally.entry("errors").or_default() += 1;
-                if message.contains("Native API HTTP") || message.contains("hold for") {
+                if message.contains("stopped without retry") || message.contains("hold for") {
                     stopped.insert(name.to_string(), message.clone());
                 }
                 rows.push(

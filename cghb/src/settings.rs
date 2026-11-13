@@ -61,13 +61,14 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         call(io, target, "GET", "/actions/permissions", None)?,
         &[200],
     )?;
-    // Private vulnerability reporting is only offered on public repositories.
-    let reporting = if repo["private"] == false {
-        expect(
-            call(io, target, "GET", "/private-vulnerability-reporting", None)?,
-            &[200],
-        )?["enabled"]
-            .as_bool()
+    // Private vulnerability reporting is only offered on public repositories that can still
+    // be changed; an archived one (or one the API refuses with 404 or 422) is left alone.
+    let reporting = if repo["private"] == false && repo["archived"] != true {
+        let response = call(io, target, "GET", "/private-vulnerability-reporting", None)?;
+        match response.status {
+            404 | 422 => None,
+            _ => expect(response, &[200])?["enabled"].as_bool(),
+        }
     } else {
         None
     };
@@ -404,6 +405,33 @@ mod tests {
             io.asked[0].1,
             "/repos/org/repo/private-vulnerability-reporting"
         );
+    }
+
+    #[test]
+    fn an_archived_or_refused_repository_has_no_reporting_state_and_is_no_error() {
+        let public = |archived: bool| {
+            json!({"full_name":"org/repo","private":false,"description":"","homepage":"","topics":[],
+            "default_branch":"main","archived":archived,"has_issues":true,"has_wiki":false})
+        };
+        // Archived: the reporting switch is not even asked.
+        let mut io = Script {
+            answers: vec![(200, public(true)), (200, json!({"enabled":true}))],
+            asked: vec![],
+        };
+        let seen = observe(&mut io, &target()).unwrap().unwrap();
+        assert_eq!(seen.vulnerability_reporting, None);
+        assert_eq!(io.asked.len(), 2);
+        // The API answers 422 for one repository: unknown, not a failure of the run.
+        let mut io = Script {
+            answers: vec![
+                (200, public(false)),
+                (200, json!({"enabled":true})),
+                (422, Value::Null),
+            ],
+            asked: vec![],
+        };
+        let seen = observe(&mut io, &target()).unwrap().unwrap();
+        assert_eq!(seen.vulnerability_reporting, None);
     }
 
     #[test]
