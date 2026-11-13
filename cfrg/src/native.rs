@@ -536,6 +536,17 @@ pub fn owned_by(repo: &Repository, copy: Option<&Copy>, mirror: &serde_json::Val
     })
 }
 
+/// Ownership of a GitHub copy. GitHub copies are fed by the GitHub gate, never by a Forgejo push
+/// mirror (one mechanism per forge), so the mirror test of [`owned_by`] cannot see them. A GitHub
+/// copy is ours when the placement declares it (`declared` is one of `repo`'s destinations) AND
+/// the gate manages it: its `owner/repo` is a key of the gate catalogue (`gate_repos`).
+pub fn github_copy_owned(repo: &Repository, declared: &Destination, gate_repos: &[String]) -> bool {
+    declared.provider == Provider::Github
+        && gate_repos
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case(&repo.destination_path(declared)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +758,26 @@ mod tests {
         .unwrap()
     }
     const GITLAB: &str = r#"{"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"T"},"path":"team/new","namespace":"2","repository_id":"7","mirror_user":"9","password_env":"T","use_ssh":true,"interval_seconds":3600}"#;
+
+    #[test]
+    fn a_github_copy_is_owned_when_declared_and_managed_by_the_gate() {
+        let github = GITLAB.replace("\"gitlab\"", "\"github\"");
+        let repo = declared_repo(&github);
+        let declared = &repo.destinations[0];
+        let gate = vec!["Team/New".to_string(), "other/x".to_string()];
+        assert!(github_copy_owned(&repo, declared, &gate));
+        // Declared but not in the gate: not ours.
+        assert!(!github_copy_owned(
+            &repo,
+            declared,
+            &["other/x".to_string()]
+        ));
+        assert!(!github_copy_owned(&repo, declared, &[]));
+        // A destination that is not one of the repository's, or not GitHub: not ours.
+        let gitlab = declared_repo(GITLAB);
+        assert!(!github_copy_owned(&gitlab, &gitlab.destinations[0], &gate));
+        assert!(!github_copy_owned(&repo, &gitlab.destinations[0], &gate));
+    }
 
     #[test]
     fn a_mirror_is_owned_when_its_address_is_a_declared_destination_or_the_copy() {

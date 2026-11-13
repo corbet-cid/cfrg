@@ -48,6 +48,10 @@ pub struct Options {
     /// `settings` only: the write gate's pause directory; `<dir>/<org>` pauses that organisation.
     #[arg(long)]
     github_paused_dir: Option<PathBuf>,
+    /// `settings` only: the GitHub gate's catalogue (`catalog/github-gate.json`); a GitHub copy is
+    /// written only when the placement declares it and the catalogue lists it.
+    #[arg(long)]
+    github_gate_catalog: Option<PathBuf>,
     /// `members` only: the identity table (TOML, person id to a handle per forge).
     #[arg(long)]
     identities: Option<PathBuf>,
@@ -143,6 +147,7 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         max_writes: None,
         github_kill_switch: None,
         github_paused_dir: None,
+        github_gate_catalog: None,
         identities: None,
         copies_from: None,
         operator: None,
@@ -171,6 +176,7 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         max_writes: None,
         github_kill_switch: None,
         github_paused_dir: None,
+        github_gate_catalog: None,
         identities: None,
         copies_from: None,
         operator: None,

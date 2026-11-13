@@ -12,6 +12,7 @@ use super::Options;
 use cfrg::{
     contributed::Contributed,
     native::{
+        github_copy_owned,
         http::{Http, Transport},
         links::{self, PublicGithub},
         owned_by,
@@ -96,6 +97,17 @@ pub fn run(options: &Options) -> Result<()> {
     placement.validate()?;
     let contributed = Contributed::from_placement(&placement, &[])?;
     let write = options.apply;
+    // The repositories the GitHub gate manages (keys of its catalogue); none without the option.
+    let gate_repos: Vec<String> = match &options.github_gate_catalog {
+        Some(path) => {
+            let catalog: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            catalog["repos"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     // Fail closed: a GitHub write needs the write gate's kill switch and pause directory.
     if write
         && options
@@ -285,7 +297,13 @@ pub fn run(options: &Options) -> Result<()> {
                 if !write {
                     return Ok(row(&primary.path, name, &path, "planned", &plan, None));
                 }
-                if mirrors_cache.is_none() {
+                let gate_owned = provider == Provider::Github
+                    && dest.is_some_and(|(repo, d)| {
+                        let mut live = repo.clone();
+                        live.path = primary.path.clone();
+                        github_copy_owned(&live, d, &gate_repos)
+                    });
+                if mirrors_cache.is_none() && provider != Provider::Github {
                     mirrors_cache = Some(match declared {
                         Some(repo) => {
                             let mut live = repo.clone();
@@ -300,19 +318,24 @@ pub fn run(options: &Options) -> Result<()> {
                         None => Vec::new(),
                     });
                 }
-                let owned = declared.is_some_and(|repo| {
-                    let mut live = repo.clone();
-                    live.path = primary.path.clone();
-                    let wanted =
-                        format!("{}/{}", copy_host(provider, &target.endpoint.origin), path);
-                    mirrors_cache.iter().flatten().any(|m| {
-                        owned_by(&live, placement.copy.as_ref(), m)
-                            && m["remote_address"]
-                                .as_str()
-                                .and_then(cfrg::replicate::address_of)
-                                .is_some_and(|a| a.eq_ignore_ascii_case(&wanted))
-                    })
-                });
+                let owned = gate_owned
+                    || (provider != Provider::Github
+                        && declared.is_some_and(|repo| {
+                            let mut live = repo.clone();
+                            live.path = primary.path.clone();
+                            let wanted = format!(
+                                "{}/{}",
+                                copy_host(provider, &target.endpoint.origin),
+                                path
+                            );
+                            mirrors_cache.iter().flatten().any(|m| {
+                                owned_by(&live, placement.copy.as_ref(), m)
+                                    && m["remote_address"]
+                                        .as_str()
+                                        .and_then(cfrg::replicate::address_of)
+                                        .is_some_and(|a| a.eq_ignore_ascii_case(&wanted))
+                            })
+                        }));
                 if !owned {
                     count.not_owned += 1;
                     return Ok(row(&primary.path, name, &path, "not-owned", &plan, None));
@@ -532,6 +555,7 @@ mod tests {
             max_writes: None,
             github_kill_switch: None,
             github_paused_dir: None,
+            github_gate_catalog: None,
             identities: None,
             copies_from: None,
             operator: None,
