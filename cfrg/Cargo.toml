@@ -18,6 +18,8 @@ sha2.workspace = true
 toml.workspace = true
 tempfile.workspace = true
 process-wrap.workspace = true
+postgres.workspace = true
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }

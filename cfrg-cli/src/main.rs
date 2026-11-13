@@ -27,6 +27,7 @@ mod gate;
 mod land;
 mod native;
 mod observe;
+mod relay;
 mod release;
 mod resolve;
 mod serve;
@@ -54,6 +55,8 @@ enum Action {
     Release(release::Options),
     /// Switch the primary of one repository to the forge the placement now names; plan by default.
     Switch(switch::Options),
+    /// The issue relay: apply one event from a forge, or sweep what stayed pending.
+    Relay(relay::Options),
     /// Long-running mode: signed webhooks and a periodic reconcile drive landing and mirror verification.
     Serve(serve::Options),
     /// Validate all placements, costs, primary CI/forge relationships and rules.
@@ -406,6 +409,7 @@ fn run(action: Action) -> Result<()> {
         Action::Land(options) => land::run(options)?,
         Action::Release(options) => release::run(options)?,
         Action::Observe(options) => observe::run(options)?,
+        Action::Relay(options) => relay::run(options)?,
         Action::Serve(options) => serve::run(options)?,
         Action::Switch(options) => switch::run(options)?,
         Action::Validate { policy } => {

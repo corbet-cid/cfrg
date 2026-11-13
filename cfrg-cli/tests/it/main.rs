@@ -11,6 +11,7 @@ mod gate_delete;
 mod gate_dispatch;
 mod gate_flush;
 mod pr_bridge_cli;
+mod relay_cli;
 mod resolve_lookup;
 mod resolve_probes;
 mod resolve_routing;

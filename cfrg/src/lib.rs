@@ -39,6 +39,7 @@ pub mod observe;
 pub mod placement;
 pub mod process;
 pub mod profile;
+pub mod relay;
 pub mod release;
 pub mod replicate;
 pub mod serve;
