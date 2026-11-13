@@ -623,9 +623,11 @@ fn create_repository(
         "name": repo,
         "private": private,
         "description": description,
-        "has_issues": false,
+        // R38/R40/R42: issues are on everywhere; the wiki is on where GitHub holds it for free
+        // (public repositories). Projects stay off.
+        "has_issues": true,
         "has_projects": false,
-        "has_wiki": false,
+        "has_wiki": !private,
         "auto_init": false,
     });
     let answer = github(

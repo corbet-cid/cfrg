@@ -219,7 +219,7 @@ repository ID; `mirror_user` is the login of the account whose token is both the
 API credential (`token_env`) and the mirror credential (`password_env`). Reconcile:
 
 * Ensures the repository (a missing one is created in the organisation, private
-  as the primary is, with issues, projects and wiki off; creation is paced by the
+  as the primary is, with issues on, projects off and the wiki on when public (R38, R40, R42); creation is paced by the
   creation window) and switches GitHub Actions off on it unless it declares
   `"ci": true` (a remote CI broker runs the provider's workflow there).
 * Locks it as above. GitHub Free has rulesets for public repositories only: a

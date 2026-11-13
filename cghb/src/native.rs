@@ -121,8 +121,9 @@ pub fn ensure_destination_repo(
                 "POST",
                 &format!("/orgs/{}/repos", owner_of(dest)?),
                 Some(json!({
-                    "name":name, "private":repo.private, "has_issues":false,
-                    "has_projects":false, "has_wiki":false, "auto_init":false
+                    // R38/R40/R42: issues on; the wiki on where GitHub holds it for free.
+                    "name":name, "private":repo.private, "has_issues":true,
+                    "has_projects":false, "has_wiki":!repo.private, "auto_init":false
                 })),
                 true,
             )?,
