@@ -40,9 +40,6 @@ pub struct Options {
     /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
-    /// Where the renewal parks a new key until it is persisted (a persistent volume: it must survive a pod crash).
-    #[arg(long, default_value = "/pending/pending")]
-    pending: PathBuf,
     /// Look only: every step plans or tests, nothing is written.
     #[arg(long, env = "DAILY_DRY_RUN")]
     dry: bool,
@@ -213,45 +210,43 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             Action::Command { program: exe.to_owned(), args, env }
         }
     };
-    let gitlab_key = if credential(dir, "gitlab_token").is_none()
-        || credential(dir, "forgejo_push").is_none()
-    {
-        Action::Noop(
+    let gitlab_key =
+        if credential(dir, "gitlab_token").is_none() || credential(dir, "forgejo_push").is_none() {
+            Action::Noop(
             "the credentials gitlab_token and forgejo_push are not in the credentials directory"
                 .into(),
         )
-    } else {
-        let mut env = BTreeMap::new();
-        for (var, file) in [
-            ("PGHOST", "host"),
-            ("PGPORT", "port"),
-            ("PGDATABASE", "dbname"),
-            ("PGUSER", "username"),
-        ] {
-            if let Some(value) = credential(dir, file) {
-                env.insert(var.to_owned(), value);
+        } else {
+            let mut env = BTreeMap::new();
+            for (var, file) in [
+                ("PGHOST", "host"),
+                ("PGPORT", "port"),
+                ("PGDATABASE", "dbname"),
+                ("PGUSER", "username"),
+            ] {
+                if let Some(value) = credential(dir, file) {
+                    env.insert(var.to_owned(), value);
+                }
             }
-        }
-        env.insert(
-            "PGPASSWORD_FILE".into(),
-            dir.join("password").display().to_string(),
-        );
-        env.insert("PGSSLMODE".into(), "verify-full".into());
-        env.insert("PGSSLROOTCERT".into(), options.ca.display().to_string());
-        env.insert("CREDENTIALS_DIRECTORY".into(), dir.display().to_string());
-        env.insert("PENDING".into(), options.pending.display().to_string());
-        env.insert("WORK".into(), "/work/gitlab-key".into());
-        env.insert("HOME".into(), "/work".into());
-        if dry {
-            // Nothing is due, so nothing is rotated: the run reads both keys and the lease only.
-            env.insert("THRESHOLD_DAYS".into(), "0".into());
-        }
-        Action::Command {
-            program: "bash".into(),
-            args: vec![options.gitlab_key_script.display().to_string()],
-            env,
-        }
-    };
+            env.insert(
+                "PGPASSWORD_FILE".into(),
+                dir.join("password").display().to_string(),
+            );
+            env.insert("PGSSLMODE".into(), "verify-full".into());
+            env.insert("PGSSLROOTCERT".into(), options.ca.display().to_string());
+            env.insert("CREDENTIALS_DIRECTORY".into(), dir.display().to_string());
+            env.insert("WORK".into(), "/work/gitlab-key".into());
+            env.insert("HOME".into(), "/work".into());
+            if dry {
+                // Nothing is due, so nothing is rotated: the run reads both keys and the lease only.
+                env.insert("THRESHOLD_DAYS".into(), "0".into());
+            }
+            Action::Command {
+                program: "bash".into(),
+                args: vec![options.gitlab_key_script.display().to_string()],
+                env,
+            }
+        };
     vec![
         Step {
             name: "renovate",
@@ -344,7 +339,6 @@ mod tests {
             ca: "/ca/ca.crt".into(),
             renovate_command: "/bin/renovate-run".into(),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
-            pending: "/pending/pending".into(),
             dry,
         }
     }
@@ -384,7 +378,6 @@ mod tests {
         };
         assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
         assert_eq!(env["THRESHOLD_DAYS"], "0");
-        assert_eq!(env["PENDING"], "/pending/pending");
         assert!(!env.values().any(|v| v.contains("p'w")));
         for step in &steps[..3] {
             let Action::Command { args, env, .. } = &step.action else {
