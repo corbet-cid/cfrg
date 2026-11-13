@@ -33,6 +33,7 @@ pub fn run(options: &Options) -> Result<()> {
             push_gap: Duration::from_secs(options.wiki_push_gap_secs),
             provider: options.provider.clone(),
             write: options.apply,
+            key_id: options.wiki_key_id,
         },
         &secret,
     )?;

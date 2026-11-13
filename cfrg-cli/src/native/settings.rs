@@ -457,6 +457,7 @@ mod tests {
             operator: None,
             wiki_key: None,
             wiki_known_hosts: None,
+            wiki_key_id: None,
             wiki_max_pushes: 20,
             wiki_push_gap_secs: 2,
         }

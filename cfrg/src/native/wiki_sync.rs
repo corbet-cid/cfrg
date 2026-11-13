@@ -151,6 +151,7 @@ fn ensure_key(
     dest: &Destination,
     project: &str,
     public_key: &str,
+    key_id: Option<u64>,
 ) -> Result<&'static str> {
     let mut found = None;
     for page in 1..=20 {
@@ -206,6 +207,33 @@ fn ensure_key(
             )?;
             verify(&updated)?;
             Ok("key-push-enabled")
+        }
+        // GitLab refuses to create a key that already exists on another project (400, fingerprint taken):
+        // it is enabled by its id instead, and then given push on this project.
+        None if key_id.is_some() => {
+            let id = key_id.ok_or("No key id")?;
+            expect(
+                gitlab(
+                    io,
+                    dest,
+                    "POST",
+                    format!("/projects/{project}/deploy_keys/{id}/enable"),
+                    None,
+                )?,
+                &[200, 201],
+            )?;
+            let updated = expect(
+                gitlab(
+                    io,
+                    dest,
+                    "PUT",
+                    format!("/projects/{project}/deploy_keys/{id}"),
+                    Some(json!({"can_push": true})),
+                )?,
+                &[200],
+            )?;
+            verify(&updated)?;
+            Ok("key-enabled-by-id")
         }
         None => {
             let created = expect(
@@ -326,6 +354,8 @@ pub struct WikiOptions {
     /// Limit the run to one provider's copies.
     pub provider: Option<String>,
     pub write: bool,
+    /// The id of the deploy key on GitLab, once it exists anywhere: copies enable it by id.
+    pub key_id: Option<u64>,
 }
 
 /// One run over any number of repositories.
@@ -582,6 +612,7 @@ impl<'a> Session<'a> {
             dest,
             &project,
             self.public_key.as_deref().ok_or("No wiki key")?,
+            self.options.key_id,
         )?;
         if self.pushes > 0 {
             std::thread::sleep(self.options.push_gap);

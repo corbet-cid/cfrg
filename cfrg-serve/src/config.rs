@@ -112,6 +112,8 @@ pub struct WikiConfig {
     pub state: String,
     pub key: String,
     pub known_hosts: String,
+    /// The id of the deploy key on GitLab (copies that do not have it yet enable it by id).
+    pub key_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

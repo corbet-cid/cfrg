@@ -62,6 +62,9 @@ pub struct Options {
     /// `wiki` only: the known_hosts file the push verifies the host against.
     #[arg(long)]
     wiki_known_hosts: Option<PathBuf>,
+    /// `wiki` only: the id of the deploy key on GitLab (copies without it enable it by id).
+    #[arg(long)]
+    wiki_key_id: Option<u64>,
     /// `wiki` only: push to at most this many copies in one run (default 20).
     #[arg(long, default_value_t = 20)]
     wiki_max_pushes: usize,
@@ -139,6 +142,7 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         operator: None,
         wiki_key: None,
         wiki_known_hosts: None,
+        wiki_key_id: None,
         wiki_max_pushes: 20,
         wiki_push_gap_secs: 2,
     };
@@ -166,6 +170,7 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         operator: None,
         wiki_key: None,
         wiki_known_hosts: None,
+        wiki_key_id: None,
         wiki_max_pushes: 20,
         wiki_push_gap_secs: 2,
     };

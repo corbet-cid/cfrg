@@ -65,6 +65,7 @@ pub fn sync(cfg: &Config, creds: &Credentials, forgejo_id: &str) -> Result<Value
             push_gap: Duration::ZERO,
             provider: Some("gitlab".into()),
             write: true,
+            key_id: wiki.key_id,
         },
         &secrets,
     )
