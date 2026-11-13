@@ -19,6 +19,7 @@ pub mod cascade;
 pub mod derive;
 pub mod engine;
 pub mod forge;
+pub mod heads;
 pub mod marker;
 pub mod merge;
 pub mod model;
@@ -32,7 +33,11 @@ pub mod store;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+mod fake_heads;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_heads;
 #[cfg(test)]
 mod tests_ops;
 #[cfg(test)]
