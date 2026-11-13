@@ -15,8 +15,8 @@
 //!   once more on the frozen repository; if replication has not caught up the
 //!   old primary is unlocked again and the switch refuses.
 //! * (b) **disable** the old direction: every owned mirror whose sender is not
-//!   the new primary is removed. Mirrors cfrg does not own are never touched; a
-//!   foreign mirror between two sites refuses the switch.
+//!   the new primary is removed. A mirror is cfrg's when it points at another site of the
+//!   repository (derived, never recorded); a mirror to any other address is never touched.
 //! * (d) **unlock** the new primary for normal landing.
 //! * (e) **create** the new direction: for each other site, the mechanism from
 //!   [`crate::replicate::choose`]; a native push mirror is created and its
@@ -31,7 +31,7 @@ use crate::{
     failure,
     land::Support,
     native::http::Transport,
-    replicate::{choose, Admit, Ledger, Method, Mirror, Refs, Replica},
+    replicate::{choose, Admit, Method, Mirror, Refs, Replica},
     Result,
 };
 use serde_json::{json, Value};
@@ -116,18 +116,13 @@ struct Found {
     sender: usize,
     target: usize,
     mirror: Mirror,
-    key: String,
 }
 
 fn describe(site: &dyn Replica) -> String {
     format!("{}:{}", site.site().forge.as_str(), site.site().path)
 }
 
-fn mirrors_between<T: Transport + Ledger>(
-    io: &mut T,
-    sites: &[&dyn Replica],
-    refused: &mut Vec<String>,
-) -> Result<Vec<Found>> {
+fn mirrors_between<T: Transport>(io: &mut T, sites: &[&dyn Replica]) -> Result<Vec<Found>> {
     let mut found = Vec::new();
     for (sender, site) in sites.iter().enumerate() {
         for mirror in site.mirrors(io)? {
@@ -140,19 +135,12 @@ fn mirrors_between<T: Transport + Ledger>(
             if target == sender {
                 continue;
             }
-            let key = site.site().mirror_key(sites[target].site());
-            if io.owned(&key).as_deref() != Some(mirror.id.as_str()) {
-                refused.push(format!(
-                    "unowned mirror {} -> {}: record or declare its remote_name before switching",
-                    describe(*site),
-                    describe(sites[target])
-                ));
-            }
+            // A push mirror that points at another site of this repository is ours: ownership is
+            // derived from the declared sites (design 3.7), nothing is recorded.
             found.push(Found {
                 sender,
                 target,
                 mirror,
-                key,
             });
         }
     }
@@ -173,7 +161,7 @@ fn poll<F: FnMut() -> Result<bool>>(options: &Options, mut done: F) -> Result<bo
 }
 
 /// Switch `repository` from `sites[from]` to `sites[to]`.
-pub fn switch<T: Transport + Ledger>(
+pub fn switch<T: Transport>(
     io: &mut T,
     repository: &str,
     sites: &[&dyn Replica],
@@ -233,7 +221,7 @@ pub fn switch<T: Transport + Ledger>(
             }
         }
     }
-    let found = mirrors_between(io, sites, &mut refused)?;
+    let found = mirrors_between(io, sites)?;
 
     if options.apply && !refused.is_empty() {
         return Err(failure(format!("Switch refused: {}", refused.join("; "))));
@@ -287,10 +275,7 @@ pub fn switch<T: Transport + Ledger>(
             "disable-mirror",
             &describe(sender),
             format!("remove push mirror to {}", describe(sites[entry.target])),
-            || {
-                sender.remove_mirror(io, &entry.mirror)?;
-                io.forget(&entry.key)
-            },
+            || sender.remove_mirror(io, &entry.mirror),
         )?;
     }
 
@@ -322,9 +307,7 @@ pub fn switch<T: Transport + Ledger>(
                     ),
                     || {
                         if created.is_none() {
-                            let mirror = new.add_mirror(io, &target)?;
-                            io.record(&new.site().mirror_key(receiver.site()), &mirror.id)?;
-                            created = Some(mirror);
+                            created = Some(new.add_mirror(io, &target)?);
                         }
                         Ok(())
                     },
@@ -386,15 +369,11 @@ pub fn switch<T: Transport + Ledger>(
                 "mirrored": mirrored.contains(&index),
             });
         }
-        let after = {
-            let mut ignored = Vec::new();
-            mirrors_between(io, sites, &mut ignored)?
-        };
+        let after = mirrors_between(io, sites)?;
         if after.iter().any(|f| f.sender != to) {
             verified = false;
             refused.push("a mirror outside the new primary still exists".into());
         }
-        io.record(&format!("primary:{repository}"), &new.site().web)?;
     }
     Ok(json!({
         "repository": repository,

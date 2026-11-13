@@ -131,27 +131,12 @@ impl Replica for Fake {
     }
 }
 
-#[derive(Default)]
-struct Mem(BTreeMap<String, String>);
+struct Mem;
 impl Transport for Mem {
     fn send(&mut self, _request: Request) -> Result<Response> {
         Err("the fake forges never use HTTP".into())
     }
 }
-impl Ledger for Mem {
-    fn owned(&self, key: &str) -> Option<String> {
-        self.0.get(key).cloned()
-    }
-    fn record(&mut self, key: &str, value: &str) -> Result<()> {
-        self.0.insert(key.into(), value.into());
-        Ok(())
-    }
-    fn forget(&mut self, key: &str) -> Result<()> {
-        self.0.remove(key);
-        Ok(())
-    }
-}
-
 fn refs(pairs: &[(&str, &str)]) -> Refs {
     pairs
         .iter()
@@ -162,7 +147,7 @@ fn refs(pairs: &[(&str, &str)]) -> Refs {
 struct Setup {
     world: Shared,
     sites: Vec<Fake>,
-    ledger: Mem,
+    io: Mem,
 }
 
 /// forgejo (primary, native sender) -> gitlab and bitbucket (receivers);
@@ -193,7 +178,6 @@ fn setup() -> Setup {
             native_sender,
         });
     }
-    let mut ledger = Mem::default();
     for target in 1..3 {
         let from = sites[0].site.clone();
         let to = sites[target].site.clone();
@@ -206,7 +190,6 @@ fn setup() -> Setup {
             enabled: true,
             healthy: Some(true),
         };
-        ledger.record(&from.mirror_key(&to), &mirror.id).unwrap();
         w.mirrors.push((from.path.clone(), to.path.clone(), mirror));
         w.locks
             .insert(to.path.clone(), Admit::User("principal".into()));
@@ -214,14 +197,14 @@ fn setup() -> Setup {
     Setup {
         world,
         sites,
-        ledger,
+        io: Mem,
     }
 }
 
 fn run(setup: &mut Setup, from: usize, to: usize, apply: bool) -> Result<Value> {
     let sites: Vec<&dyn Replica> = setup.sites.iter().map(|s| s as &dyn Replica).collect();
     switch(
-        &mut setup.ledger,
+        &mut setup.io,
         "team/project",
         &sites,
         from,
@@ -288,7 +271,6 @@ fn apply_runs_one_direction_at_a_time_and_ends_with_matching_heads() {
         Admit::User("principal-of-forge".into())
     );
     assert!(!world.locks.contains_key("gitlab"));
-    assert_eq!(s.ledger.0["primary:team/project"], "https://gitlab.example");
 }
 
 #[test]
@@ -320,12 +302,30 @@ fn a_receiver_holding_an_extra_ref_refuses() {
 }
 
 #[test]
-fn a_mirror_cfrg_does_not_own_refuses_instead_of_being_touched() {
+fn a_mirror_to_an_address_that_is_no_site_of_the_repository_is_never_touched() {
     let mut s = setup();
-    s.ledger.0.clear();
-    let error = run(&mut s, 0, 1, true).unwrap_err().to_string();
-    assert!(error.contains("unowned mirror"), "{error}");
-    assert_eq!(s.world.borrow().mirrors.len(), 2);
+    {
+        let mut w = s.world.borrow_mut();
+        w.next += 1;
+        let foreign = Mirror {
+            id: "foreign".into(),
+            address: "elsewhere.example/team/project".into(),
+            public_key: None,
+            enabled: true,
+            healthy: Some(true),
+        };
+        w.mirrors
+            .push(("forge".into(), "elsewhere".into(), foreign));
+    }
+    let report = run(&mut s, 0, 1, true).unwrap();
+    assert_eq!(report["complete"], true, "{report}");
+    assert!(s
+        .world
+        .borrow()
+        .mirrors
+        .iter()
+        .any(|(_, to, _)| to == "elsewhere"));
+    assert!(!s.world.borrow().log.join("|").contains("foreign"));
 }
 
 #[test]
@@ -338,7 +338,6 @@ fn switching_back_restores_the_first_direction() {
     assert!(world.mirrors.iter().all(|(from, _, _)| from == "forge"));
     assert_eq!(world.mirrors.len(), 2);
     assert!(!world.locks.contains_key("forge"));
-    assert_eq!(s.ledger.0["primary:team/project"], "https://forge.example");
 }
 
 #[test]
@@ -346,7 +345,6 @@ fn a_sender_without_a_native_mirror_gets_sync_edges_and_a_locked_receiver() {
     let mut s = setup();
     // Bitbucket as the new primary: its edges are cfrg sync.
     s.world.borrow_mut().mirrors.clear();
-    s.ledger.0.clear();
     let report = run(&mut s, 0, 2, true).unwrap();
     assert_eq!(report["edges"][0]["method"], "sync");
     assert_eq!(report["sync_edges"].as_array().unwrap().len(), 2);

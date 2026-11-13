@@ -494,9 +494,52 @@ pub fn encode(value: &str) -> String {
         .collect()
 }
 
+/// The one definition of ownership (design 3.7, R56): a push mirror that Forgejo holds for
+/// `repo` is ours exactly when its address is a destination the placement declares for the
+/// repository (under its wanted or its last recorded name), or an address on the git copy, or
+/// it carries the `remote_name` the placement claims. Nothing is recorded anywhere. Any other
+/// mirror is foreign: report it, never change it. Code that writes to a destination restricts
+/// itself with this.
+pub fn owned_by(repo: &Repository, copy: Option<&Copy>, mirror: &serde_json::Value) -> bool {
+    let Some(address) = mirror["remote_address"]
+        .as_str()
+        .and_then(crate::replicate::address_of)
+    else {
+        return false;
+    };
+    if copy.is_some_and(|c| address.starts_with(&format!("{}/", c.host.to_ascii_lowercase()))) {
+        return true;
+    }
+    repo.destinations.iter().any(|declared| {
+        let host = match declared.provider {
+            Provider::Gitlab => declared
+                .endpoint
+                .origin
+                .split_once("://")
+                .map_or(declared.endpoint.origin.as_str(), |(_, rest)| rest)
+                .trim_end_matches('/')
+                .to_ascii_lowercase(),
+            Provider::Bitbucket => "bitbucket.org".to_string(),
+            Provider::Github => "github.com".to_string(),
+        };
+        [
+            repo.destination_path(declared),
+            declared.recorded_path.clone(),
+        ]
+        .iter()
+        .filter(|path| !path.is_empty())
+        .any(|path| address.eq_ignore_ascii_case(&format!("{host}/{path}")))
+            || declared
+                .remote_name
+                .as_deref()
+                .is_some_and(|claim| mirror["remote_name"].as_str() == Some(claim))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn both_views_of_the_one_placement_file_load_and_name_the_primary() {
         let native = r#"{"schema":1,"source":{"origin":"https://forge.example","token_env":"T"},"repositories":[]}"#;
@@ -695,5 +738,62 @@ mod tests {
         assert_eq!(plan_move("g/s/x", "g/s/y"), Move::Rename { leaf: "y" });
         assert_eq!(plan_move("a/x", "b/x"), Move::Transfer);
         assert_eq!(plan_move("g/s/x", "g/x"), Move::Transfer);
+    }
+
+    fn declared_repo(destinations: &str) -> Repository {
+        serde_json::from_str(&format!(
+            r#"{{"path":"team/new","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[{destinations}]}}"#
+        ))
+        .unwrap()
+    }
+    const GITLAB: &str = r#"{"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"T"},"path":"team/new","namespace":"2","repository_id":"7","mirror_user":"9","password_env":"T","use_ssh":true,"interval_seconds":3600}"#;
+
+    #[test]
+    fn a_mirror_is_owned_when_its_address_is_a_declared_destination_or_the_copy() {
+        let mirror =
+            |name: &str, address: &str| json!({"remote_name":name,"remote_address":address});
+        let copy: Copy = serde_json::from_str(r#"{"host":"10.0.42.6","user":"git","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#).unwrap();
+        let repo = declared_repo(GITLAB);
+        // The declared destination, with or without the SSH userinfo Forgejo sanitises.
+        assert!(owned_by(
+            &repo,
+            None,
+            &mirror("a", "ssh://gitlab.example/team/new.git")
+        ));
+        assert!(owned_by(
+            &repo,
+            None,
+            &mirror("a", "ssh://git@gitlab.example/Team/New.git")
+        ));
+        // Another path, another host or no address: foreign.
+        assert!(!owned_by(
+            &repo,
+            None,
+            &mirror("b", "ssh://gitlab.example/team/other.git")
+        ));
+        assert!(!owned_by(
+            &repo,
+            None,
+            &mirror("c", "https://bitbucket.org/team/new.git")
+        ));
+        assert!(!owned_by(&repo, None, &json!({"remote_name":"d"})));
+        // The git copy is ours only when the placement declares one.
+        let on_copy = mirror("e", "ssh://10.0.42.6/team/new.git");
+        assert!(!owned_by(&repo, None, &on_copy));
+        assert!(owned_by(&repo, Some(&copy), &on_copy));
+        assert!(!owned_by(
+            &repo,
+            Some(&copy),
+            &mirror("f", "ssh://10.0.42.7/team/new.git")
+        ));
+        // A declared remote_name is an explicit claim.
+        let claimed = declared_repo(
+            &GITLAB.replace(r#""use_ssh":true"#, r#""use_ssh":true,"remote_name":"g""#),
+        );
+        assert!(owned_by(
+            &claimed,
+            None,
+            &mirror("g", "ssh://gitlab.example/elsewhere.git")
+        ));
     }
 }

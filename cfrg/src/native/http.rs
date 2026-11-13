@@ -24,6 +24,7 @@ pub enum Auth {
 }
 
 /// Constructed only by adapters, never accepted as arbitrary CLI input.
+#[derive(Clone)]
 pub struct Request {
     pub endpoint: Endpoint,
     pub auth: Auth,
@@ -68,8 +69,11 @@ impl Default for Pacing {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
-    #[serde(default)]
-    pub owned: BTreeMap<String, String>,
+    /// Ownership is derived, never stored (design 3.7). An older state file may still carry the
+    /// retired key: it is read, dropped, and never written back.
+    #[serde(default, skip_serializing, rename = "owned")]
+    #[allow(dead_code)]
+    retired_owned: serde::de::IgnoredAny,
     pub windows: BTreeMap<String, Window>,
     pub pending: BTreeMap<String, String>,
     pub next_request: u64,
@@ -181,8 +185,59 @@ impl Drop for Http {
     }
 }
 
+/// Pauses before the retries of a read that Forgejo answered with a 5xx: bounded, growing.
+const READ_RETRIES: [u64; 3] = [5, 20, 60];
+
+/// Run `attempt`; a failure for which `transient` holds is run again after each pause of
+/// `pauses` (through `sleep`), so a flaky server costs time and never the whole run.
+fn retried<T>(
+    pauses: &[u64],
+    sleep: &mut dyn FnMut(u64),
+    transient: impl Fn(&dyn std::error::Error) -> bool,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut pauses = pauses.iter();
+    loop {
+        match attempt() {
+            Err(error) if transient(error.as_ref()) => match pauses.next() {
+                Some(seconds) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event":"native-retry","after_seconds":seconds})
+                    );
+                    sleep(*seconds);
+                }
+                None => return Err(error),
+            },
+            other => return other,
+        }
+    }
+}
+
 impl Transport for Http {
     fn send(&mut self, request: Request) -> Result<Response> {
+        // A read has no side effect, so a server error is retried; a write never is (it may
+        // have been committed), and no 5xx records a window.
+        if request.method != "GET" {
+            return self.send_once(request);
+        }
+        let pauses = READ_RETRIES;
+        retried(
+            &pauses,
+            &mut |seconds| std::thread::sleep(Duration::from_secs(seconds)),
+            |error| error.to_string().starts_with("Native API HTTP 5"),
+            || self.send_once(request.clone()),
+        )
+    }
+
+    fn resolve(&mut self, scope: &str) -> Result<()> {
+        self.state.pending.remove(scope);
+        self.save()
+    }
+}
+
+impl Http {
+    fn send_once(&mut self, request: Request) -> Result<Response> {
         request.endpoint.validate()?;
         env_name(&request.endpoint.token_env)?;
         crate::bridge::http::reject_path_tricks(&request.path)?;
@@ -359,25 +414,6 @@ impl Transport for Http {
         };
         Ok(Response { status, body })
     }
-
-    fn resolve(&mut self, scope: &str) -> Result<()> {
-        self.state.pending.remove(scope);
-        self.save()
-    }
-}
-
-impl crate::replicate::Ledger for Http {
-    fn owned(&self, key: &str) -> Option<String> {
-        self.state.owned.get(key).cloned()
-    }
-    fn record(&mut self, key: &str, value: &str) -> Result<()> {
-        self.state.owned.insert(key.into(), value.into());
-        self.save()
-    }
-    fn forget(&mut self, key: &str) -> Result<()> {
-        self.state.owned.remove(key);
-        self.save()
-    }
 }
 
 pub fn expect(response: Response, statuses: &[u16]) -> Result<Value> {
@@ -481,5 +517,41 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("Uncertain prior write"));
+    }
+
+    #[test]
+    fn a_transient_server_error_is_retried_with_growing_pauses_and_then_gives_up() {
+        let transient = |e: &dyn std::error::Error| e.to_string().starts_with("Native API HTTP 5");
+        let mut slept = Vec::new();
+        let mut calls = 0;
+        let ok = retried(&[5, 20, 60], &mut |s| slept.push(s), transient, || {
+            calls += 1;
+            if calls < 3 {
+                Err(failure("Native API HTTP 500; stopped"))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!((ok.unwrap(), slept), (3, vec![5, 20]));
+        let mut slept = Vec::new();
+        let mut calls = 0;
+        let gave_up = retried(
+            &[5, 20, 60],
+            &mut |s| slept.push(s),
+            transient,
+            || -> Result<()> {
+                calls += 1;
+                Err(failure("Native API HTTP 502; stopped"))
+            },
+        );
+        assert!(gave_up.is_err());
+        assert_eq!((calls, slept), (4, vec![5, 20, 60]));
+        // Anything else (403, 429, a malformed answer) is never retried.
+        let mut calls = 0;
+        let refused = retried(&[5], &mut |_| {}, transient, || -> Result<()> {
+            calls += 1;
+            Err(failure("Native API HTTP 403; stopped"))
+        });
+        assert!(refused.is_err() && calls == 1);
     }
 }

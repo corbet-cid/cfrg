@@ -115,18 +115,6 @@ impl Site {
             address: format!("{}/{}", git_host.to_ascii_lowercase(), path),
         }
     }
-
-    /// Key under which the mirror from `self` to `to` is recorded as owned.
-    /// For a Forgejo sender this is the key `cfrg native` has always used.
-    pub fn mirror_key(&self, to: &Site) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.origin,
-            self.id.as_deref().unwrap_or(&self.path),
-            to.origin,
-            to.path
-        )
-    }
 }
 
 /// `host/path` of a Git URL or a mirror address: scheme, user information
@@ -197,14 +185,6 @@ pub fn secret(env: &str) -> Result<String> {
         return Err(failure("Invalid mirror credential format"));
     }
     Ok(value)
-}
-
-/// Ownership records: only mirrors cfrg recorded (or the placement declared)
-/// are ever disabled or replaced. Implemented by the native request state.
-pub trait Ledger {
-    fn owned(&self, key: &str) -> Option<String>;
-    fn record(&mut self, key: &str, value: &str) -> Result<()>;
-    fn forget(&mut self, key: &str) -> Result<()>;
 }
 
 fn unsupported(forge: Forge, what: &str) -> crate::Result<()> {
@@ -319,33 +299,5 @@ mod tests {
         }
         assert_eq!(address_of("https://host"), None);
         assert_eq!(address_of("https://host/"), None);
-    }
-
-    #[test]
-    fn ownership_key_keeps_the_native_forgejo_form() {
-        let source = Site::new(
-            Forge::Forgejo,
-            "https://forge.example",
-            "https://forge.example",
-            "forge.example",
-            "team/project",
-            Some("123".into()),
-        );
-        let gitlab = Site::new(
-            Forge::Gitlab,
-            "https://gitlab.example",
-            "https://gitlab.example",
-            "gitlab.example",
-            "team/project",
-            None,
-        );
-        assert_eq!(
-            source.mirror_key(&gitlab),
-            "https://forge.example/123/https://gitlab.example/team/project"
-        );
-        assert_eq!(
-            gitlab.mirror_key(&source),
-            "https://gitlab.example/team/project/https://forge.example/team/project"
-        );
     }
 }

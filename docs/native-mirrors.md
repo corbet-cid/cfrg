@@ -8,8 +8,9 @@ repository-wide sync endpoint only after every remote passes ownership and
 protection checks. API create enables `sync_on_commit` (unless the destination declares `"sync_on_commit": false`: a destination paced by a gate then receives one push per interval, however many commits came in) and the declared interval.
 Changes to mirror options replace the owned remote because Forgejo exposes no
 update operation. Declare `absent: true` and its `remote_name` to delete a mirror;
-this never deletes a destination repository. A declared hold removes owned push
-mirrors during reconciliation so scheduled retries cannot bypass the hold.
+this never deletes a destination repository. A declared hold means do not
+touch: reconciliation never removes, replaces or creates a mirror of a held repository or
+destination (it reports `held` or `held-untouched`).
 Omission is not deletion.
 
 Keep the desired placement in the repository that owns deployment configuration.

@@ -7,7 +7,7 @@ mod wiki;
 use cfrg::{
     native::{
         http::{Http, Pacing, Transport},
-        Content, Destination, Naming, Placement, Provider, Repository,
+        owned_by, Content, Destination, Naming, Placement, Provider, Repository,
     },
     Result,
 };
@@ -296,7 +296,22 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 endpoint: &placement.source,
                 repository: declared,
             }
-            .verify_source(&mut io)?;
+            .verify_source(&mut io);
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    // One repository that Forgejo does not vouch for never hides the others.
+                    eprintln!(
+                        "{}",
+                        json!({"event":"repository-skipped","source":declared.path,"error":error.to_string()})
+                    );
+                    report.push(
+                        json!({"source":declared.path, "state":"error", "error":error.to_string()}),
+                    );
+                    incomplete = true;
+                    continue;
+                }
+            };
             let mut followed = declared.clone();
             if current != declared.path {
                 report.push(
@@ -310,7 +325,20 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 endpoint: &placement.source,
                 repository: repo,
             };
-            let mut mirrors = api.list(&mut io)?;
+            let mut mirrors = match api.list(&mut io) {
+                Ok(mirrors) => mirrors,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        json!({"event":"repository-skipped","source":declared.path,"error":error.to_string()})
+                    );
+                    report.push(
+                        json!({"source":declared.path, "state":"error", "error":error.to_string()}),
+                    );
+                    incomplete = true;
+                    continue;
+                }
+            };
             let mut managed = Vec::new();
             for declared_dest in &repo.destinations {
                 if options.provider.as_deref().is_some_and(|selected| {
@@ -369,8 +397,11 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     if stale_owned.is_some() {
                         return Err("Owned mirror points at another destination".into());
                     }
+                    // A hold means: do not touch. Only a declared absence, with nothing holding the
+                    // repository or the destination, removes an owned mirror.
+                    let removable = removable(dest.absent, held);
                     if let Some(value) = &mirror {
-                        if options.apply && options.operation == Operation::Reconcile {
+                        if removable && options.apply && options.operation == Operation::Reconcile {
                             api.delete(
                                 &mut io,
                                 value["remote_name"].as_str().ok_or("Missing remote name")?,
@@ -380,7 +411,19 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             incomplete = true;
                         }
                     }
-                    report.push(json!({"source":repo.path, "destination":dest.path, "state":if mirror.is_none() || (options.apply && options.operation == Operation::Reconcile) {"absent"} else {"delete-planned"}}));
+                    let state = match (&mirror, removable) {
+                        (None, true) => "absent",
+                        (None, false) => "held",
+                        (Some(_), true)
+                            if options.apply && options.operation == Operation::Reconcile =>
+                        {
+                            "absent"
+                        }
+                        (Some(_), true) => "delete-planned",
+                        (Some(_), false) => "held-untouched",
+                    };
+                    report
+                        .push(json!({"source":repo.path, "destination":dest.path, "state":state}));
                     continue;
                 }
                 if options.operation == Operation::Status {
@@ -604,9 +647,8 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 // Foreign push mirrors (not a declared destination of this repository) are
                 // reported and never touched (design 3.7).
                 for mirror in mirrors.iter().filter(|m| {
-                    !copy::is_copy_mirror(placement.copy.as_ref(), m)
-                        && !managed.contains(&m["remote_name"])
-                        && !owned_by(repo, m)
+                    !managed.contains(&m["remote_name"])
+                        && !owned_by(repo, placement.copy.as_ref(), m)
                 }) {
                     report.push(json!({"source":repo.path, "state":"foreign", "forge":forge_of(mirror), "mirror":cfgj::native::status(mirror)}));
                 }
@@ -787,21 +829,10 @@ fn locate(
     ))
 }
 
-/// Whether a Forgejo push mirror of `repo` is ours: its address is a destination the placement
-/// declares for the repository (under the wanted or the last recorded name), or it carries a
-/// declared `remote_name`.
-fn owned_by(repo: &Repository, mirror: &Value) -> bool {
-    repo.destinations.iter().any(|declared| {
-        let wanted = repo.destination_path(declared);
-        let known = names(&wanted, &declared.recorded_path, None);
-        known
-            .iter()
-            .any(|name| cfgj::native::address_matches(mirror, &destination_url(declared, name)))
-            || declared
-                .remote_name
-                .as_deref()
-                .is_some_and(|claim| mirror["remote_name"].as_str() == Some(claim))
-    })
+/// A hold means: do not touch. An owned mirror may be removed only when the placement declares
+/// the destination absent and nothing holds the repository, the destination or its workspace.
+fn removable(absent: bool, held: bool) -> bool {
+    absent && !held
 }
 
 /// The forge a mirror pushes to: the host of its address, userinfo removed.
@@ -840,11 +871,8 @@ fn adopt_one(
     };
     let mirrors = api.list(io)?;
     let mut owned = 0;
-    for mirror in mirrors
-        .iter()
-        .filter(|m| !copy::is_copy_mirror(placement.copy.as_ref(), m))
-    {
-        let is_ours = owned_by(repo, mirror);
+    for mirror in &mirrors {
+        let is_ours = owned_by(repo, placement.copy.as_ref(), mirror);
         let entry = tally.entry(forge_of(mirror)).or_default();
         if is_ours {
             entry.0 += 1;
@@ -1022,37 +1050,13 @@ mod tests {
         assert!(mirror_named(&twins, &dest, &both).is_err());
     }
 
-    fn repo_with(dests: Vec<Destination>) -> Repository {
-        let mut repo: Repository = serde_json::from_value(json!({"path":"team/new","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
-        repo.destinations = dests;
-        repo
-    }
-
     #[test]
-    fn ownership_is_derived_from_the_address_of_a_declared_destination() {
-        let repo = repo_with(vec![gitlab("team/new")]);
-        // The address of the declared destination: ours, with no record anywhere.
-        assert!(owned_by(
-            &repo,
-            &mirror("remote_mirror_a", "ssh://gitlab.example/team/new.git")
-        ));
-        // Any other address, on the same host or not: foreign.
-        assert!(!owned_by(
-            &repo,
-            &mirror("remote_mirror_b", "ssh://gitlab.example/team/other.git")
-        ));
-        assert!(!owned_by(
-            &repo,
-            &mirror("remote_mirror_c", "https://bitbucket.org/team/new.git")
-        ));
-        // A declared remote_name is an explicit claim.
-        let mut claimed = gitlab("team/new");
-        claimed.remote_name = Some("remote_mirror_d".into());
-        let repo = repo_with(vec![claimed]);
-        assert!(owned_by(
-            &repo,
-            &mirror("remote_mirror_d", "ssh://gitlab.example/team/elsewhere.git")
-        ));
+    fn a_hold_never_lets_a_mirror_be_removed() {
+        assert!(removable(true, false));
+        // Held and absent, or only held: the mirror stays exactly as it is.
+        assert!(!removable(true, true));
+        assert!(!removable(false, true));
+        assert!(!removable(false, false));
     }
 
     #[test]

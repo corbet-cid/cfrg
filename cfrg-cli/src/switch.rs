@@ -1,22 +1,22 @@
 use cfrg::{
     native::{
-        http::{Http, Pacing, Request, Response, Transport},
+        http::{Http, Pacing},
         Content, Placement, Provider,
     },
-    replicate::{self, Ledger, Replica},
+    replicate::{self, Replica},
     switch::{self, Options as Run},
     Result,
 };
 use clap::Args;
 use serde_json::json;
-use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 #[derive(Args)]
 pub struct Options {
     /// The one declared placement: `lib/placement.json`, or its native view.
     #[arg(long, required_unless_present = "capabilities")]
     placement: Option<PathBuf>,
-    /// Ownership of mirrors, rate windows and uncertain writes (never credentials).
+    /// Rate windows and uncertain writes (never credentials). Ownership is derived, not stored.
     #[arg(long, required_unless_present = "capabilities")]
     state: Option<PathBuf>,
     /// `owner/repo` to switch.
@@ -25,7 +25,7 @@ pub struct Options {
     /// The placement as it was before the change (for example `git show HEAD~1:lib/placement.json`).
     #[arg(long, conflicts_with = "from")]
     previous: Option<PathBuf>,
-    /// Base URL of the current primary, when neither `--previous` nor the recorded state says it.
+    /// Base URL of the current primary, when `--previous` is not given (default: the source forge, the primary before any switch).
     #[arg(long)]
     from: Option<String>,
     /// Act. Without it nothing is written.
@@ -52,36 +52,6 @@ pub fn capabilities() -> serde_json::Value {
         cbkt::replica::CAPABILITIES,
         cghb::REPLICATION,
     ])
-}
-
-/// The native request state plus the mirror names the placement declares as owned.
-struct Claims<'a> {
-    http: &'a mut Http,
-    declared: BTreeMap<String, String>,
-}
-
-impl Transport for Claims<'_> {
-    fn send(&mut self, request: Request) -> Result<Response> {
-        self.http.send(request)
-    }
-    fn resolve(&mut self, scope: &str) -> Result<()> {
-        self.http.resolve(scope)
-    }
-}
-
-impl Ledger for Claims<'_> {
-    fn owned(&self, key: &str) -> Option<String> {
-        self.http
-            .owned(key)
-            .or_else(|| self.declared.get(key).cloned())
-    }
-    fn record(&mut self, key: &str, value: &str) -> Result<()> {
-        self.http.record(key, value)
-    }
-    fn forget(&mut self, key: &str) -> Result<()> {
-        self.declared.remove(key);
-        self.http.forget(key)
-    }
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -139,29 +109,12 @@ pub fn run(options: Options) -> Result<()> {
     } else if let Some(previous) = &options.previous {
         Placement::from_document(&fs::read(previous)?)?.primary_of(path)
     } else {
-        http.owned(&format!("primary:{path}"))
-            .unwrap_or_else(|| placement.source.origin.clone())
+        placement.source.origin.clone()
     };
     let from = index_of(&from_url)?;
 
-    let forgejo = sites[0].site();
-    let declared = repo
-        .destinations
-        .iter()
-        .filter(|d| !d.absent)
-        .zip(sites.iter().skip(1))
-        .filter_map(|(dest, site)| {
-            dest.remote_name
-                .clone()
-                .map(|name| (forgejo.mirror_key(site.site()), name))
-        })
-        .collect();
-    let mut io = Claims {
-        http: &mut http,
-        declared,
-    };
     let report = switch::switch(
-        &mut io,
+        &mut http,
         path,
         &sites,
         from,

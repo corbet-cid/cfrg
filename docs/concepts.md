@@ -9,7 +9,7 @@
 | Native first | If Forgejo has a mechanism (push mirror, merge when checks succeed), cfrg configures it instead of reimplementing it. | [land](land.md) "Native first"; [native mirrors](native-mirrors.md) |
 | Gate | The single writer to GitHub, with budgets, a kill switch and an append-only ledger. | [gate](gate.md) |
 | Contributed project | Someone else's project we contribute to. Never mirrored, never relayed, no CI run by us. | [contributed](contributed.md); `cfrg/src/contributed.rs` |
-| Hold | A declared pause on a destination: owned mirrors are removed so scheduled retries cannot bypass it. | [native mirrors](native-mirrors.md) |
+| Hold | A declared pause: nothing about the held repository or destination is touched, its mirrors included. | [native mirrors](native-mirrors.md) |
 
 ## Design rules
 

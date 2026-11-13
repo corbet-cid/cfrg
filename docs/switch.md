@@ -41,7 +41,7 @@ consumers are unaffected:
 
 The old primary comes from `--previous FILE` (the placement before the change,
 for example `git show HEAD~1:lib/placement.json`), else `--from URL`, else the
-primary the state file recorded after the last switch, else the default.
+source forge (nothing records the last switch; pass `--previous` after the first one).
 
 ## The switch
 
@@ -54,20 +54,19 @@ cfrg switch ... --apply
 
 | Step | What happens |
 |---|---|
-| a. hash check | the new primary holds every branch and tag of the old one at the same commit; no receiver holds a ref the new primary lacks (a mirror would delete it); a mirror between sites that cfrg does not own refuses. Replication that is merely behind is nudged and awaited (`--drain`) |
+| a. hash check | the new primary holds every branch and tag of the old one at the same commit; no receiver holds a ref the new primary lacks (a mirror would delete it); a mirror to an address that is no site of the repository is never touched. Replication that is merely behind is nudged and awaited (`--drain`) |
 | c. freeze (early) | the old primary is locked against every writer, then the hash check runs once more on the frozen repository. If it fails the old primary is unlocked again and the switch refuses |
 | b. disable | every owned mirror whose sender is not the new primary is removed (so two directions never exist at once) |
 | d. unlock | the receiver lock on the new primary is removed for normal landing |
 | e. create | per other site the mechanism above; for a push mirror the receiver admits only the mirror principal (this also protects the old primary as a receiver). `cfrg sync` edges are only declared; on GitLab the deploy keys of mirrors that no longer exist are removed once the rule names the new key |
-| f. verify | the mirrors are forced, every site must show the new primary's heads, and only the new primary may own a mirror. The state file records the new primary |
+| f. verify | the mirrors are forced, every site must show the new primary's heads, and only the new primary may own a mirror. |
 
 The freeze precedes the disable on purpose: it is the only order in which no
 write can slip in between the hash check and the change. Every step is
 idempotent, so an interrupted run is simply run again with the same
-arguments. Mirrors are owned by record: the state file keeps
-`<sender origin>/<sender id>/<receiver origin>/<receiver path>` to the
-mirror's id (the key `cfrg native` always used), and a declared `remote_name`
-counts as a record. cfrg never removes a mirror it does not own.
+arguments. Mirrors are owned by derivation: a push mirror whose address is another site of the
+repository is cfrg's (the same rule as `cfrg native`, `cfrg::native::owned_by`); nothing is
+recorded. cfrg never removes a mirror to any other address.
 
 ## What the live probe showed (Forgejo 15, GitLab Free, Bitbucket Free)
 
