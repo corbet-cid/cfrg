@@ -4,8 +4,9 @@
 //! is a method here, so a policy can enumerate them and a fake can record them. Reads and writes name
 //! a repository by its immutable id (RF14); the adapter resolves it to the current path.
 
+use super::heads::ReqState;
 use super::merge::Patch;
-use super::model::{Actor, ObjectRef, ObjectState, Snap};
+use super::model::{Actor, CommentState, ObjectRef, ObjectState, Snap};
 use crate::model::Forge;
 use std::{collections::BTreeMap, fmt};
 
@@ -70,9 +71,43 @@ pub struct Created {
     pub snap: Snap,
 }
 
+/// A pull or merge request as the contribution flow reads it (RL4, RL5). The commits are fetched from
+/// `fetch_url` (a clean https URL; credentials are the git host's business) at `reference`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestRead {
+    pub number: u64,
+    pub url: String,
+    pub author: Actor,
+    pub title: String,
+    pub body: String,
+    pub state: ReqState,
+    pub head_sha: String,
+    /// The source branch name; a relay head (`cforge/<forge>-<n>`) marks a sibling the relay itself opened.
+    pub head_branch: String,
+    /// The base branch.
+    pub base: String,
+    pub fetch_url: String,
+    /// `refs/pull/<n>/head` or `refs/merge-requests/<n>/head`.
+    pub reference: String,
+    pub comments: Vec<CommentState>,
+    pub updated_at: u64,
+}
+
 /// What the router needs from one forge. All methods are synchronous and bounded by the adapter.
 pub trait RouterForge {
     fn forge(&self) -> Forge;
+
+    /// A pull or merge request with its comments (complete, in creation order); `None` only on a definitive
+    /// 404/410. Adapters without contribution support keep the default.
+    fn read_request(
+        &mut self,
+        _repo: &str,
+        _number: u64,
+    ) -> Result<Option<RequestRead>, ForgeError> {
+        Err(ForgeError::Rejected(
+            "this adapter does not read pull requests".into(),
+        ))
+    }
 
     /// Current state of one object, with its comments (complete, in creation order).
     fn read(&mut self, object: &ObjectRef) -> Result<ReadOutcome, ForgeError>;

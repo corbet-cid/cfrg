@@ -12,8 +12,10 @@ use cfrg::{
     model::Forge,
     relay::{
         forge::{
-            from_status, has_marker_line, Created, ForgeError, NewObject, ReadOutcome, RouterForge,
+            from_status, has_marker_line, Created, ForgeError, NewObject, ReadOutcome, RequestRead,
+            RouterForge,
         },
+        heads::ReqState,
         merge::Patch,
         model::{Actor, IssueState, ObjectRef, RouterConfig},
         Forges,
@@ -35,7 +37,7 @@ pub fn default_credentials_dir() -> Option<PathBuf> {
 }
 
 /// Reads one credential; `None` for a missing, unreadable or empty one. Never a value in a message.
-fn credential(dir: &Option<PathBuf>, name: &str) -> Option<String> {
+pub fn credential(dir: &Option<PathBuf>, name: &str) -> Option<String> {
     let dir = dir.as_ref()?;
     let text = fs::read_to_string(dir.join(name)).ok()?;
     let text = text.trim();
@@ -102,87 +104,95 @@ pub struct Drivers {
     github: Option<cghb::relay::GithubRelay>,
     gitlab: Option<cglb::relay::GitlabRelay>,
     forgejo: Option<cfgj::relay::ForgejoRelay>,
+    forgejo_origin: String,
+}
+
+pub fn open_forgejo(dir: &Option<PathBuf>, origin: &str) -> Option<cfgj::relay::ForgejoRelay> {
+    match credential(dir, FORGEJO_TOKEN) {
+        Some(token) => {
+            match cfgj::relay::ForgejoRelay::new(origin, &cfgj::relay::Token::new(token)) {
+                Ok(driver) => Some(driver),
+                Err(why) => {
+                    eprintln!("relay: forgejo refused: {why}");
+                    None
+                }
+            }
+        }
+        None => {
+            refused("forgejo", &[FORGEJO_TOKEN]);
+            None
+        }
+    }
+}
+
+pub fn open_gitlab(dir: &Option<PathBuf>, rt: &Rc<Runtime>) -> Option<cglb::relay::GitlabRelay> {
+    match credential(dir, GITLAB_TOKEN) {
+        Some(token) => match rt.block_on(cglb::relay::GitlabRelay::new(
+            "gitlab.com",
+            &cglb::relay::Token::new(token),
+            false,
+        )) {
+            Ok(driver) => Some(driver),
+            Err(why) => {
+                eprintln!("relay: gitlab refused: {why}");
+                None
+            }
+        },
+        None => {
+            refused("gitlab", &[GITLAB_TOKEN]);
+            None
+        }
+    }
+}
+
+pub fn open_github(dir: &Option<PathBuf>, rt: &Rc<Runtime>) -> Option<cghb::relay::GithubRelay> {
+    let app = (
+        credential(dir, GITHUB_APP_ID),
+        credential(dir, GITHUB_INSTALLATION_ID),
+        credential(dir, GITHUB_APP_KEY),
+    );
+    match app {
+        (Some(app_id), Some(installation_id), Some(key)) => {
+            match (app_id.parse::<u64>(), installation_id.parse::<u64>()) {
+                (Ok(app_id), Ok(installation_id)) => {
+                    let creds = cghb::relay::AppCredentials {
+                        app_id,
+                        installation_id,
+                        private_key_pem: cghb::relay::Redacted::new(key),
+                    };
+                    match rt.block_on(async {
+                        cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
+                    }) {
+                        Ok(driver) => Some(driver),
+                        Err(why) => {
+                            eprintln!("relay: github refused: {why}");
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("relay: github refused: {GITHUB_APP_ID} and {GITHUB_INSTALLATION_ID} must be numbers");
+                    None
+                }
+            }
+        }
+        _ => {
+            refused(
+                "github",
+                &[GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_APP_KEY],
+            );
+            None
+        }
+    }
 }
 
 impl Drivers {
     pub fn open(dir: &Option<PathBuf>, rt: &Rc<Runtime>, forgejo_origin: &str) -> Self {
-        let forgejo = match credential(dir, FORGEJO_TOKEN) {
-            Some(token) => {
-                match cfgj::relay::ForgejoRelay::new(
-                    forgejo_origin,
-                    &cfgj::relay::Token::new(token),
-                ) {
-                    Ok(driver) => Some(driver),
-                    Err(why) => {
-                        eprintln!("relay: forgejo refused: {why}");
-                        None
-                    }
-                }
-            }
-            None => {
-                refused("forgejo", &[FORGEJO_TOKEN]);
-                None
-            }
-        };
-        let gitlab = match credential(dir, GITLAB_TOKEN) {
-            Some(token) => match rt.block_on(cglb::relay::GitlabRelay::new(
-                "gitlab.com",
-                &cglb::relay::Token::new(token),
-                false,
-            )) {
-                Ok(driver) => Some(driver),
-                Err(why) => {
-                    eprintln!("relay: gitlab refused: {why}");
-                    None
-                }
-            },
-            None => {
-                refused("gitlab", &[GITLAB_TOKEN]);
-                None
-            }
-        };
-        let app = (
-            credential(dir, GITHUB_APP_ID),
-            credential(dir, GITHUB_INSTALLATION_ID),
-            credential(dir, GITHUB_APP_KEY),
-        );
-        let github = match app {
-            (Some(app_id), Some(installation_id), Some(key)) => {
-                match (app_id.parse::<u64>(), installation_id.parse::<u64>()) {
-                    (Ok(app_id), Ok(installation_id)) => {
-                        let creds = cghb::relay::AppCredentials {
-                            app_id,
-                            installation_id,
-                            private_key_pem: cghb::relay::Redacted::new(key),
-                        };
-                        match rt.block_on(async {
-                            cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
-                        }) {
-                            Ok(driver) => Some(driver),
-                            Err(why) => {
-                                eprintln!("relay: github refused: {why}");
-                                None
-                            }
-                        }
-                    }
-                    _ => {
-                        eprintln!("relay: github refused: {GITHUB_APP_ID} and {GITHUB_INSTALLATION_ID} must be numbers");
-                        None
-                    }
-                }
-            }
-            _ => {
-                refused(
-                    "github",
-                    &[GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_APP_KEY],
-                );
-                None
-            }
-        };
         Self {
-            github,
-            gitlab,
-            forgejo,
+            forgejo: open_forgejo(dir, forgejo_origin),
+            gitlab: open_gitlab(dir, rt),
+            github: open_github(dir, rt),
+            forgejo_origin: forgejo_origin.to_owned(),
         }
     }
 
@@ -247,6 +257,7 @@ impl Drivers {
                 paths: paths_of(Forge::Forgejo),
                 relay: relay_of(Forge::Forgejo),
                 stale: stale.clone(),
+                origin: self.forgejo_origin.clone(),
             }));
         }
         if let Some(driver) = self.gitlab {
@@ -335,6 +346,47 @@ fn number_i64(n: u64) -> Result<i64, ForgeError> {
     i64::try_from(n).map_err(|_| ForgeError::Rejected("number out of range".into()))
 }
 
+fn req_state(state: &str, merged: bool) -> ReqState {
+    if merged || state == "merged" {
+        ReqState::Merged
+    } else if state == "closed" {
+        ReqState::Closed
+    } else {
+        ReqState::Open
+    }
+}
+
+/// A pull or merge request from its issue-shaped read (title, text, author, comments) and its head facts.
+#[allow(clippy::too_many_arguments)]
+fn request_of(
+    issue: cfrg::relay::model::ObjectState,
+    url: String,
+    state: ReqState,
+    head_sha: Option<String>,
+    head_branch: String,
+    base: String,
+    fetch_url: String,
+    reference: String,
+) -> Result<RequestRead, ForgeError> {
+    Ok(RequestRead {
+        number: issue.number,
+        url,
+        author: issue.author,
+        title: issue.snap.title,
+        body: issue.snap.body,
+        state,
+        head_sha: head_sha
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ForgeError::Unavailable("the request has no head commit yet".into()))?,
+        head_branch,
+        base,
+        fetch_url,
+        reference,
+        comments: issue.comments,
+        updated_at: issue.updated_at,
+    })
+}
+
 struct Github {
     rt: Rc<Runtime>,
     driver: cghb::relay::GithubRelay,
@@ -350,6 +402,35 @@ impl Github {
 impl RouterForge for Github {
     fn forge(&self) -> Forge {
         Forge::Github
+    }
+    fn read_request(&mut self, repo: &str, number: u64) -> Result<Option<RequestRead>, ForgeError> {
+        let r = self.repo(repo)?;
+        let Some(pull) = self
+            .rt
+            .block_on(self.driver.pull_read(&r, number))
+            .map_err(github_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(issue) = self
+            .rt
+            .block_on(self.driver.pull_conversation(&r, number))
+            .map_err(github_error)?
+        else {
+            return Ok(None);
+        };
+        let path = path_of(&self.paths, repo)?;
+        request_of(
+            issue,
+            pull.html_url,
+            req_state(&pull.state, pull.merged),
+            Some(pull.head_sha),
+            pull.head_ref,
+            pull.base_ref,
+            format!("https://github.com/{path}.git"),
+            format!("refs/pull/{number}/head"),
+        )
+        .map(Some)
     }
     fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
         let r = self.repo(&o.repo)?;
@@ -450,6 +531,28 @@ impl RouterForge for Gitlab {
     fn forge(&self) -> Forge {
         Forge::Gitlab
     }
+    fn read_request(&mut self, repo: &str, number: u64) -> Result<Option<RequestRead>, ForgeError> {
+        let p = self.project(repo)?;
+        let Some((mr, issue)) = self
+            .rt
+            .block_on(self.driver.merge_request_object(&p, number))
+            .map_err(gitlab_error)?
+        else {
+            return Ok(None);
+        };
+        let path = path_of(&self.paths, repo)?;
+        request_of(
+            issue,
+            mr.web_url,
+            req_state(&mr.state, mr.merged),
+            mr.head_sha,
+            mr.source_branch,
+            mr.target_branch,
+            format!("https://gitlab.com/{path}.git"),
+            format!("refs/merge-requests/{number}/head"),
+        )
+        .map(Some)
+    }
     fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
         let p = self.project(&o.repo)?;
         let state = self
@@ -484,6 +587,13 @@ impl RouterForge for Gitlab {
     }
     fn create_comment(&mut self, o: &ObjectRef, body: &str) -> Result<u64, ForgeError> {
         let p = self.project(&o.repo)?;
+        if o.kind == cfrg::relay::model::Kind::Contribution {
+            return Ok(self
+                .rt
+                .block_on(self.driver.merge_request_note(&p, o.number, body))
+                .map_err(gitlab_error)?
+                .id);
+        }
         Ok(self
             .rt
             .block_on(self.driver.issue_note(&p, o.number, body))
@@ -542,6 +652,8 @@ struct Forgejo {
     paths: BTreeMap<String, String>,
     relay: Vec<String>,
     stale: Stale,
+    /// Web origin of the instance, for the clone URL of a request head.
+    origin: String,
 }
 impl Forgejo {
     fn repo(&self, id: &str) -> Result<cfgj::relay::Repo, ForgeError> {
@@ -551,6 +663,36 @@ impl Forgejo {
 impl RouterForge for Forgejo {
     fn forge(&self) -> Forge {
         Forge::Forgejo
+    }
+    fn read_request(&mut self, repo: &str, number: u64) -> Result<Option<RequestRead>, ForgeError> {
+        let r = self.repo(repo)?;
+        let n = number_i64(number)?;
+        let Some(pull) = self
+            .rt
+            .block_on(self.driver.pull_read(&r, n))
+            .map_err(forgejo_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(issue) = self
+            .rt
+            .block_on(self.driver.pull_conversation(&r, n))
+            .map_err(forgejo_error)?
+        else {
+            return Ok(None);
+        };
+        let path = path_of(&self.paths, repo)?;
+        request_of(
+            issue,
+            pull.html_url,
+            req_state(&pull.state, pull.merged),
+            pull.head_sha,
+            pull.head_ref,
+            pull.base_ref,
+            format!("{}/{path}.git", self.origin.trim_end_matches('/')),
+            format!("refs/pull/{number}/head"),
+        )
+        .map(Some)
     }
     fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
         let r = self.repo(&o.repo)?;

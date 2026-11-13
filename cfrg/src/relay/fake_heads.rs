@@ -28,6 +28,8 @@ pub type Shared = Rc<RefCell<World>>;
 pub struct FakeHost {
     pub forge: Forge,
     pub w: Shared,
+    /// The router-side fake of the same forge and its path-to-id table, when a test reads the requests back through it.
+    pub forge_world: Option<(super::fake::Handle, BTreeMap<String, String>)>,
 }
 
 impl FakeHost {
@@ -120,7 +122,17 @@ impl HeadHost for FakeHost {
     ) -> Result<ReqRef, ForgeError> {
         self.check("open")?;
         let mut w = self.w.borrow_mut();
-        let n = w.requests.keys().filter(|(r, _)| r == copy_repo).count() as u64 + 1;
+        let mut n = w.requests.keys().filter(|(r, _)| r == copy_repo).count() as u64 + 1;
+        if let Some((fw, ids)) = &self.forge_world {
+            let sha = w
+                .branches
+                .get(&(site.repo.clone(), branch.into()))
+                .cloned()
+                .unwrap_or_default();
+            let mut fw = fw.borrow_mut();
+            let relay = fw.relay.clone();
+            n = fw.open_pull(&ids[copy_repo], &relay, _t, _b, branch, &sha, base);
+        }
         w.requests.insert(
             (copy_repo.into(), n),
             (site.repo.clone(), branch.into(), ReqState::Open),
@@ -135,6 +147,15 @@ impl HeadHost for FakeHost {
     }
 
     fn request_state(&mut self, repo: &str, number: u64) -> Result<Option<ReqState>, ForgeError> {
+        if let Some((fw, ids)) = &self.forge_world {
+            if let Some(id) = ids.get(repo) {
+                return Ok(fw
+                    .borrow()
+                    .pulls
+                    .get(&(id.clone(), number))
+                    .map(|p| p.state));
+            }
+        }
         Ok(self
             .w
             .borrow()
@@ -148,7 +169,12 @@ impl HeadHost for FakeHost {
         let mut w = self.w.borrow_mut();
         if let Some(r) = w.requests.get_mut(&(repo.into(), number)) {
             r.2 = ReqState::Closed;
-            w.log.push(format!("close {repo}!{number}"));
+        }
+        w.log.push(format!("close {repo}!{number}"));
+        if let Some((fw, ids)) = &self.forge_world {
+            if let Some(id) = ids.get(repo) {
+                fw.borrow_mut().set_pull_state(id, number, ReqState::Closed);
+            }
         }
         Ok(())
     }
@@ -171,6 +197,7 @@ impl HeadGit for FakeGit {
     fn push_head(
         &mut self,
         _from: &str,
+        _reference: &str,
         sha: &str,
         to_url: &str,
         branch: &str,
@@ -182,5 +209,29 @@ impl HeadGit for FakeGit {
         w.branches.insert((repo.into(), branch.into()), sha.into());
         w.log.push(format!("push {repo} {branch} {sha}"));
         Ok(())
+    }
+}
+
+/// A notice host the test keeps a handle on.
+#[derive(Clone, Default)]
+pub struct SharedNotices(pub Rc<RefCell<super::notice::FakeNotices>>);
+
+impl super::notice::NoticeHost for SharedNotices {
+    fn find(
+        &mut self,
+        repo: &str,
+        origin: &str,
+        reference: &str,
+    ) -> Result<Option<super::notice::NoticeRef>, ForgeError> {
+        self.0.borrow_mut().find(repo, origin, reference)
+    }
+    fn create(&mut self, repo: &str, title: &str, body: &str) -> Result<u64, ForgeError> {
+        self.0.borrow_mut().create(repo, title, body)
+    }
+    fn set_body(&mut self, repo: &str, number: u64, body: &str) -> Result<(), ForgeError> {
+        self.0.borrow_mut().set_body(repo, number, body)
+    }
+    fn close(&mut self, repo: &str, number: u64, note: &str) -> Result<(), ForgeError> {
+        self.0.borrow_mut().close(repo, number, note)
     }
 }

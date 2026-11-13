@@ -10,10 +10,12 @@ fn setup() -> (Heads, Shared) {
     h.insert(Box::new(FakeHost {
         forge: Forge::Github,
         w: w.clone(),
+        forge_world: None,
     }));
     h.insert(Box::new(FakeHost {
         forge: Forge::Gitlab,
         w: w.clone(),
+        forge_world: None,
     }));
     (h, w)
 }
@@ -25,6 +27,8 @@ fn origin(sha: &str, state: ReqState) -> Origin {
         number: 7,
         head_sha: sha.into(),
         fetch_url: "origin-url".into(),
+        reference: "refs/pull/1/head".into(),
+        bodies: Default::default(),
         title: "t".into(),
         body: "b".into(),
         state,
@@ -264,6 +268,7 @@ fn git_cli_pushes_exactly_the_named_commit() {
     GitCli
         .push_head(
             src.to_str().unwrap(),
+            "refs/heads/main",
             &sha,
             dst.to_str().unwrap(),
             "cforge/github-1",

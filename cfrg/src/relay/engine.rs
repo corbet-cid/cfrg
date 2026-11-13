@@ -29,7 +29,7 @@ pub enum Outcome {
     Held(String),
     /// A deletion was carried to the other copies (R50).
     Deleted,
-    /// Contribution flows belong to later build tasks (B7, B8).
+    /// The flow is not attached to this engine (no contribution ports).
     Unsupported(String),
 }
 
@@ -95,6 +95,8 @@ pub struct Engine<'a> {
     pub contributed: &'a Contributed,
     /// Names this writer in the lease of an object.
     pub holder: &'a str,
+    /// Heads and notices of the contribution flow (RL4, RL5); `None` = contributions are not handled.
+    pub contrib: Option<&'a mut super::contrib::Contrib>,
 }
 
 impl Engine<'_> {
@@ -131,10 +133,13 @@ impl Engine<'_> {
         if let Err(reason) = self.admit_hint(hint) {
             return Ok(Report::new(None).with(Outcome::Dropped(reason)));
         }
+        if hint.kind == Kind::Contribution && !Self::hint_is_deletion(hint) {
+            return self.apply_contribution(hint);
+        }
         let known = self.store.sibling_at(hint.forge, &hint.repo, hint.number)?;
         if known.is_none() && hint.kind != Kind::Issue {
             return Ok(Report::new(None).with(Outcome::Unsupported(
-                "contribution flows are not part of this build".into(),
+                "a deleted contribution that was never tracked".into(),
             )));
         }
         let lid = known.map_or_else(|| lid_object(&hint.object()), |row| row.lid);

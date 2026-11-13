@@ -1,7 +1,10 @@
 //! In-memory forges for tests and dry runs. No network, no clock: every write is logged and can be
 //! made to fail, to be refused, or to succeed with its answer lost (the case the intent journal exists for).
 
-use super::forge::{Created, ForgeError, NewObject, ReadOutcome, Refusal, RouterForge};
+use super::forge::{
+    Created, ForgeError, NewObject, ReadOutcome, Refusal, RequestRead, RouterForge,
+};
+use super::heads::ReqState;
 use super::merge::Patch;
 use super::model::{Actor, CommentState, IssueState, ObjectRef, ObjectState, Snap};
 use crate::model::Forge;
@@ -46,7 +49,17 @@ pub struct Faults {
     pub forbid_reads: BTreeSet<String>,
 }
 
+/// The pull request side of an issue number (forges number requests and issues in one sequence).
+#[derive(Clone, Debug)]
+pub struct Pull {
+    pub head_sha: String,
+    pub head_branch: String,
+    pub base: String,
+    pub state: ReqState,
+}
+
 pub struct World {
+    pub pulls: BTreeMap<(String, u64), Pull>,
     pub forge: Forge,
     pub relay: Actor,
     pub repos: BTreeMap<String, Repo>,
@@ -63,6 +76,7 @@ impl World {
     pub fn new(forge: Forge, relay_id: &str, stamp: Rc<Cell<u64>>) -> Self {
         Self {
             stamp,
+            pulls: BTreeMap::new(),
             forge,
             relay: Actor {
                 id: relay_id.to_owned(),
@@ -184,6 +198,55 @@ impl World {
             .deleted = true;
     }
 
+    /// A pull request: an issue plus its head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_pull(
+        &mut self,
+        repo: &str,
+        author: &Actor,
+        title: &str,
+        body: &str,
+        head_branch: &str,
+        head_sha: &str,
+        base: &str,
+    ) -> u64 {
+        let n = self.open_issue(repo, author, title, body, &[]);
+        self.pulls.insert(
+            (repo.to_owned(), n),
+            Pull {
+                head_sha: head_sha.into(),
+                head_branch: head_branch.into(),
+                base: base.into(),
+                state: ReqState::Open,
+            },
+        );
+        n
+    }
+
+    /// New commits on the head of a pull request.
+    pub fn push_pull(&mut self, repo: &str, number: u64, sha: &str) {
+        if let Some(p) = self.pulls.get_mut(&(repo.to_owned(), number)) {
+            p.head_sha = sha.into();
+        }
+        let at = self.next_tick();
+        if let Some(i) = self.repo(repo).issues.get_mut(&number) {
+            i.updated_at = at;
+        }
+    }
+
+    pub fn set_pull_state(&mut self, repo: &str, number: u64, state: ReqState) {
+        if let Some(p) = self.pulls.get_mut(&(repo.to_owned(), number)) {
+            p.state = state;
+        }
+        if let Some(i) = self.repo(repo).issues.get_mut(&number) {
+            i.snap.state = Some(if state == ReqState::Open {
+                IssueState::Open
+            } else {
+                IssueState::Closed
+            });
+        }
+    }
+
     pub fn remove_comment(&mut self, repo: &str, number: u64, id: u64) {
         let issue = self
             .repo(repo)
@@ -213,7 +276,7 @@ impl World {
         self.log
             .iter()
             .filter(|(_, l)| {
-                !l.starts_with("read ")
+                !l.starts_with("read")
                     && !l.starts_with("list ")
                     && !l.starts_with("find ")
                     && !l.starts_with("maintainer ")
@@ -295,6 +358,39 @@ impl FakeForge {
 impl RouterForge for FakeForge {
     fn forge(&self) -> Forge {
         self.forge
+    }
+
+    fn read_request(&mut self, repo: &str, number: u64) -> Result<Option<RequestRead>, ForgeError> {
+        let world = Rc::clone(&self.world);
+        let mut w = world.borrow_mut();
+        self.gate(&mut w, format!("read-request {repo} #{number}"), false)?;
+        let Some(pull) = w.pulls.get(&(repo.to_owned(), number)).cloned() else {
+            return Ok(None);
+        };
+        let Some(state) = Self::state_of(&mut w, repo, number) else {
+            return Ok(None);
+        };
+        let forge = w.forge.as_str();
+        let reference = if w.forge == Forge::Gitlab {
+            format!("refs/merge-requests/{number}/head")
+        } else {
+            format!("refs/pull/{number}/head")
+        };
+        Ok(Some(RequestRead {
+            number,
+            url: format!("https://{forge}.example/{repo}/pull/{number}"),
+            author: state.author,
+            title: state.snap.title,
+            body: state.snap.body,
+            state: pull.state,
+            head_sha: pull.head_sha,
+            head_branch: pull.head_branch,
+            base: pull.base,
+            fetch_url: format!("https://{forge}.example/{repo}.git"),
+            reference,
+            comments: state.comments,
+            updated_at: state.updated_at,
+        }))
     }
 
     fn read(&mut self, object: &ObjectRef) -> Result<ReadOutcome, ForgeError> {

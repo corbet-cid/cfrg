@@ -3,6 +3,7 @@ use crate::live::{forgejo_error, forgejo_repo};
 use cfrg::relay::{
     forge::ForgeError,
     merge::Patch,
+    model::IssueState,
     notice::{ContributionMarker, NoticeHost, NoticeRef},
 };
 use std::rc::Rc;
@@ -35,6 +36,7 @@ impl NoticeHost for ForgejoNotices {
                 .filter(|m| labelled && m.origin == origin && m.reference == reference)
                 .map(|_| NoticeRef {
                     number: issue.number,
+                    closed: issue.snap.state == Some(IssueState::Closed),
                     body: issue.snap.body,
                 })
         }))
@@ -62,6 +64,21 @@ impl NoticeHost for ForgejoNotices {
             ..Patch::default()
         };
         let n = i64::try_from(n).map_err(|_| ForgeError::Rejected("notice number".into()))?;
+        self.rt
+            .block_on(self.driver.issue_edit(&repo, n, &patch))
+            .map_err(forgejo_error)
+    }
+
+    fn close(&mut self, repo: &str, n: u64, note: &str) -> Result<(), ForgeError> {
+        let repo = forgejo_repo(repo)?;
+        let n = i64::try_from(n).map_err(|_| ForgeError::Rejected("notice number".into()))?;
+        self.rt
+            .block_on(self.driver.comment(&repo, n, note))
+            .map_err(forgejo_error)?;
+        let patch = Patch {
+            state: Some(IssueState::Closed),
+            ..Patch::default()
+        };
         self.rt
             .block_on(self.driver.issue_edit(&repo, n, &patch))
             .map_err(forgejo_error)

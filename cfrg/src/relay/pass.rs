@@ -275,7 +275,7 @@ impl Engine<'_> {
         }
         if obj.kind != Kind::Issue {
             return Ok(rep.with(Outcome::Unsupported(
-                "contribution flows are lanes RL4 and RL5".into(),
+                "a contribution is driven by its request event, not by a pass".into(),
             )));
         }
         // RF8 backstop: a loop shows up as one writing pass per cycle.

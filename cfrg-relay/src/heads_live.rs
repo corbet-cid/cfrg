@@ -4,12 +4,12 @@
 //! fork (the `<group>/cforge` subgroup is never created here), the cross-fork merge request (`target_project_id`) and the note and close writes. There is no other HTTP
 //! path here. Heads are pushed by [`cfrg::relay::heads::GitCli`] to the fork's URL.
 
-use crate::live::{github_error, gitlab_error};
+use crate::live::{forgejo_error, forgejo_repo, github_error, gitlab_error};
 use cfrg::{
     model::Forge,
     relay::{
         forge::ForgeError,
-        heads::{HeadHost, ReqRef, ReqState, Site},
+        heads::{HeadGit, HeadHost, ReqRef, ReqState, Site},
     },
 };
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, thread, time::Duration};
@@ -339,5 +339,149 @@ impl HeadHost for GithubHeads {
             .block_on(self.driver.branch_delete(&Self::repo(&site.repo)?, branch))
             .map(|_| ())
             .map_err(github_error)
+    }
+}
+
+/// The Forgejo primary as the home of a request (a pull request from a fork): it is only ever an origin, so the
+/// head operations are refused and only the state and the closing are real. Everything goes through `cfgj`.
+pub struct ForgejoRequests {
+    pub rt: Rc<Runtime>,
+    pub driver: cfgj::relay::ForgejoRelay,
+}
+
+impl ForgejoRequests {
+    fn number(n: u64) -> Result<i64, ForgeError> {
+        i64::try_from(n).map_err(|_| ForgeError::Rejected("number out of range".into()))
+    }
+
+    fn not_a_copy() -> ForgeError {
+        ForgeError::Rejected("the Forgejo primary shows a notice, never a relay head".into())
+    }
+}
+
+impl HeadHost for ForgejoRequests {
+    fn forge(&self) -> Forge {
+        Forge::Forgejo
+    }
+
+    fn skip_reason(&self, _copy_repo: &str) -> Option<String> {
+        Some("the primary is shown by the notice".into())
+    }
+
+    fn site(&mut self, _copy_repo: &str) -> Result<Site, ForgeError> {
+        Err(Self::not_a_copy())
+    }
+
+    fn branch_tip(&mut self, _site: &Site, _branch: &str) -> Result<Option<String>, ForgeError> {
+        Err(Self::not_a_copy())
+    }
+
+    fn find_request(
+        &mut self,
+        _copy_repo: &str,
+        _site: &Site,
+        _branch: &str,
+    ) -> Result<Option<ReqRef>, ForgeError> {
+        Err(Self::not_a_copy())
+    }
+
+    fn open_request(
+        &mut self,
+        _copy_repo: &str,
+        _site: &Site,
+        _branch: &str,
+        _base: &str,
+        _title: &str,
+        _body: &str,
+    ) -> Result<ReqRef, ForgeError> {
+        Err(Self::not_a_copy())
+    }
+
+    fn request_state(&mut self, repo: &str, number: u64) -> Result<Option<ReqState>, ForgeError> {
+        let pull = self
+            .rt
+            .block_on(
+                self.driver
+                    .pull_read(&forgejo_repo(repo)?, Self::number(number)?),
+            )
+            .map_err(forgejo_error)?;
+        Ok(pull.map(|p| {
+            if p.merged {
+                ReqState::Merged
+            } else if p.state == "closed" {
+                ReqState::Closed
+            } else {
+                ReqState::Open
+            }
+        }))
+    }
+
+    fn close_request(&mut self, repo: &str, number: u64, note: &str) -> Result<(), ForgeError> {
+        if self.request_state(repo, number)? != Some(ReqState::Open) {
+            return Ok(());
+        }
+        let r = forgejo_repo(repo)?;
+        let n = Self::number(number)?;
+        self.rt
+            .block_on(self.driver.comment(&r, n, note))
+            .map_err(forgejo_error)?;
+        self.rt
+            .block_on(self.driver.pull_close(&r, n))
+            .map_err(forgejo_error)
+    }
+
+    fn delete_branch(&mut self, _site: &Site, _branch: &str) -> Result<(), ForgeError> {
+        Err(Self::not_a_copy())
+    }
+}
+
+/// `git` with the credentials of the forge the commits come from: a private origin (a GitHub copy, a GitLab project,
+/// the Forgejo primary) is fetched with the relay's own token, which never appears in a message.
+pub struct LiveGit {
+    pub rt: Rc<Runtime>,
+    pub github: Option<cghb::relay::GithubRelay>,
+    pub gitlab_token: Option<String>,
+    pub forgejo_token: Option<String>,
+    pub forgejo_host: String,
+}
+
+impl LiveGit {
+    fn authed(&self, url: &str) -> Result<String, ForgeError> {
+        let Some(rest) = url.strip_prefix("https://") else {
+            return Ok(url.to_owned());
+        };
+        let host = rest.split('/').next().unwrap_or("");
+        if host == "github.com" {
+            if let Some(driver) = &self.github {
+                let token = self
+                    .rt
+                    .block_on(driver.installation_token())
+                    .map_err(github_error)?;
+                return Ok(format!("https://x-access-token:{}@{rest}", token.expose()));
+            }
+        } else if host == "gitlab.com" {
+            if let Some(token) = &self.gitlab_token {
+                return Ok(format!("https://oauth2:{token}@{rest}"));
+            }
+        } else if host == self.forgejo_host {
+            if let Some(token) = &self.forgejo_token {
+                return Ok(format!("https://x:{token}@{rest}"));
+            }
+        }
+        Ok(url.to_owned())
+    }
+}
+
+impl HeadGit for LiveGit {
+    fn push_head(
+        &mut self,
+        from_url: &str,
+        reference: &str,
+        sha: &str,
+        to_url: &str,
+        branch: &str,
+    ) -> Result<(), ForgeError> {
+        let from = self.authed(from_url)?;
+        cfrg::relay::heads::GitCli.push_head(&from, reference, sha, to_url, branch)
     }
 }

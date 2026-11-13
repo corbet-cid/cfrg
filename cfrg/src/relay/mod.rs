@@ -16,6 +16,7 @@
 //! catch-up and no rebuild of its own: Forgejo Actions runs `apply` per event and `sweep` once a day (R30, R49).
 
 pub mod cascade;
+pub mod contrib;
 pub mod copyid;
 pub mod derive;
 pub mod engine;
@@ -38,6 +39,8 @@ mod fake;
 mod fake_heads;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_contrib;
 #[cfg(test)]
 mod tests_heads;
 #[cfg(test)]

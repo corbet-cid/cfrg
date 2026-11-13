@@ -49,10 +49,21 @@ pub struct Origin {
     pub head_sha: String,
     /// Where the commits can be fetched from (git URL of the head repository).
     pub fetch_url: String,
+    /// The ref of the head at `fetch_url` (`refs/pull/<n>/head`, `refs/merge-requests/<n>/head`).
+    pub reference: String,
     pub title: String,
     /// Body of the relayed request, credit and links included (rendered by the caller).
     pub body: String,
+    /// Bodies per copy forge where the credit differs (R41: the handle maps per target); `body` is the default.
+    pub bodies: BTreeMap<Forge, String>,
     pub state: ReqState,
+}
+
+impl Origin {
+    /// The body of the request on `forge`.
+    pub fn body_on(&self, forge: Forge) -> &str {
+        self.bodies.get(&forge).map_or(&self.body, String::as_str)
+    }
 }
 
 /// A copy that shows the request.
@@ -128,10 +139,11 @@ pub trait HeadHost {
 
 /// Moves commits. The pushing identity is the host's (a credential of the locked unit), never a personal one.
 pub trait HeadGit {
-    /// Fetches exactly `sha` from `from_url` and force-pushes it as `branch` to `to_url`.
+    /// Fetches `reference` from `from_url`, checks that it is exactly `sha`, and force-pushes it as `branch` to `to_url`.
     fn push_head(
         &mut self,
         from_url: &str,
+        reference: &str,
         sha: &str,
         to_url: &str,
         branch: &str,
@@ -145,6 +157,7 @@ impl HeadGit for GitCli {
     fn push_head(
         &mut self,
         from_url: &str,
+        reference: &str,
         sha: &str,
         to_url: &str,
         branch: &str,
@@ -169,7 +182,10 @@ impl HeadGit for GitCli {
             }
         };
         git(&["init", "-q", "--bare"])?;
-        git(&["fetch", "-q", "--no-tags", from_url, sha])?;
+        let fetched = format!("+{reference}:refs/cforge/fetched");
+        git(&["fetch", "-q", "--no-tags", from_url, &fetched])?;
+        // The ref may have moved since the event: the relay pushes exactly the commit it was told about, or nothing.
+        git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
         let spec = format!("+{sha}:refs/heads/{branch}");
         git(&["push", "-q", to_url, &spec])
     }
@@ -229,6 +245,19 @@ impl Heads {
         self.hosts.insert(host.forge(), host);
     }
 
+    /// The relay's request on one copy for this origin, if any (any state); used to relay comments.
+    pub fn sibling(&mut self, origin: &Origin, copy: &Copy) -> Result<Option<ReqRef>, ForgeError> {
+        let host = self
+            .hosts
+            .get_mut(&copy.forge)
+            .ok_or_else(|| outage(copy.forge))?;
+        if host.skip_reason(&copy.repo).is_some() {
+            return Ok(None);
+        }
+        let site = host.site(&copy.repo)?;
+        host.find_request(&copy.repo, &site, &branch_name(origin.forge, origin.number))
+    }
+
     /// Creates or updates the head and the request on every copy; or, when the origin closed without
     /// merging, retires them. A failing copy does not stop the others.
     pub fn sync(&mut self, origin: &Origin, copies: &[Copy]) -> Vec<CopyReport> {
@@ -280,8 +309,13 @@ impl Heads {
         }
         let moved = tip.as_deref() != Some(origin.head_sha.as_str());
         if moved {
-            self.git
-                .push_head(&origin.fetch_url, &origin.head_sha, &site.push_url, &branch)?;
+            self.git.push_head(
+                &origin.fetch_url,
+                &origin.reference,
+                &origin.head_sha,
+                &site.push_url,
+                &branch,
+            )?;
         }
         let host = self
             .hosts
@@ -294,7 +328,7 @@ impl Heads {
                 &branch,
                 &copy.base,
                 &origin.title,
-                &origin.body,
+                origin.body_on(copy.forge),
             )
         };
         match found {

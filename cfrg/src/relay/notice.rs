@@ -119,6 +119,8 @@ pub fn latest_review_head(comments: &[ReviewComment], reviewer: &str) -> Option<
 pub struct NoticeRef {
     pub number: u64,
     pub body: String,
+    /// Closed by take-in, by the relay (the origin closed) or by the owner.
+    pub closed: bool,
 }
 
 /// The Forgejo writes and reads of the notice flow; the drivers implement it, a fake records it.
@@ -133,6 +135,8 @@ pub trait NoticeHost {
     /// A new notice: an issue with the `contribution` label.
     fn create(&mut self, repo: &str, title: &str, body: &str) -> Result<u64, ForgeError>;
     fn set_body(&mut self, repo: &str, number: u64, body: &str) -> Result<(), ForgeError>;
+    /// Closes the notice with a comment; an already closed notice is left alone. Nothing is ever deleted (R50).
+    fn close(&mut self, repo: &str, number: u64, note: &str) -> Result<(), ForgeError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +145,8 @@ pub enum NoticeAction {
     /// New commits at the origin: the marker's sha moved, which starts a new review.
     Updated(u64),
     Unchanged(u64),
+    /// The origin closed, or take-in merged it: the notice is closed.
+    Closed(u64),
 }
 
 /// Makes the notice of one contribution say exactly `text` plus the marker (create, update on a new head, or nothing).
@@ -159,6 +165,8 @@ pub fn sync_notice(
     let body = marker.attach(text);
     match host.find(repo, &marker.origin, &marker.reference)? {
         None => host.create(repo, title, &body).map(NoticeAction::Created),
+        // The owner (or take-in) closed it: it stays closed and its text stays as the reviewer saw it.
+        Some(found) if found.closed => Ok(NoticeAction::Unchanged(found.number)),
         Some(found) if found.body == body => Ok(NoticeAction::Unchanged(found.number)),
         Some(found) => {
             host.set_body(repo, found.number, &body)?;
@@ -177,9 +185,26 @@ pub struct NoticeTarget<'a> {
     pub reference: &'a str,
 }
 
+/// Closes the notice of a contribution that ended (the origin closed without merge, or take-in merged it). A contribution
+/// that never had a notice has nothing to close; a closed notice stays as it is.
+pub fn close_notice(
+    notices: &mut dyn NoticeHost,
+    target: &NoticeTarget<'_>,
+    note: &str,
+) -> Result<Option<NoticeAction>, ForgeError> {
+    match notices.find(target.primary, target.origin_url, target.reference)? {
+        None => Ok(None),
+        Some(found) if found.closed => Ok(Some(NoticeAction::Unchanged(found.number))),
+        Some(found) => {
+            notices.close(target.primary, found.number, note)?;
+            Ok(Some(NoticeAction::Closed(found.number)))
+        }
+    }
+}
+
 /// One contribution event: the heads on the other copies, and the notice on the primary. An open request gets its notice
-/// created, or its marker `sha` moved when the origin has new commits (which starts a new review); a request that is not
-/// open leaves the notice alone (R50: a notice is closed by take-in or by the owner, never deleted by the relay).
+/// created, or its marker `sha` moved when the origin has new commits (which starts a new review); a request that was
+/// closed without merge retires its heads and closes its notice (R50: a notice is never deleted by the relay).
 pub fn sync_contribution(
     heads: &mut Heads,
     notices: &mut dyn NoticeHost,
@@ -188,23 +213,49 @@ pub fn sync_contribution(
     target: &NoticeTarget<'_>,
 ) -> (Vec<CopyReport>, Result<Option<NoticeAction>, ForgeError>) {
     let reports = heads.sync(origin, copies);
-    let notice = if origin.state == ReqState::Open {
-        let marker = ContributionMarker {
-            origin: target.origin_url.to_owned(),
-            reference: target.reference.to_owned(),
-            sha: origin.head_sha.clone(),
-        };
-        sync_notice(
+    let notice = match origin.state {
+        ReqState::Open => {
+            let marker = ContributionMarker {
+                origin: target.origin_url.to_owned(),
+                reference: target.reference.to_owned(),
+                sha: origin.head_sha.clone(),
+            };
+            sync_notice(
+                notices,
+                target.primary,
+                &origin.title,
+                &origin.body,
+                &marker,
+            )
+            .map(Some)
+        }
+        ReqState::Closed => close_notice(
             notices,
-            target.primary,
-            &origin.title,
-            &origin.body,
-            &marker,
-        )
-        .map(Some)
-    } else {
-        Ok(None)
+            target,
+            "The contribution was closed at its origin without merge.",
+        ),
+        // A merge is take-in's: it closes the siblings and the notice together.
+        ReqState::Merged => Ok(None),
     };
+    (reports, notice)
+}
+
+/// Take-in (merge): every sibling and the origin request are closed as merged, the relay heads removed, and the notice
+/// closed. Idempotent: a second run finds everything closed and writes nothing.
+pub fn take_in_contribution(
+    heads: &mut Heads,
+    notices: &mut dyn NoticeHost,
+    origin: &Origin,
+    copies: &[Copy],
+    target: &NoticeTarget<'_>,
+    reviewed_sha: &str,
+) -> (Vec<CopyReport>, Result<Option<NoticeAction>, ForgeError>) {
+    let reports = heads.take_in(origin, copies, reviewed_sha);
+    let notice = close_notice(
+        notices,
+        target,
+        &format!("Merged on the primary forge at {reviewed_sha}."),
+    );
     (reports, notice)
 }
 
@@ -212,6 +263,7 @@ pub fn sync_contribution(
 #[derive(Default)]
 pub struct FakeNotices {
     pub notices: Vec<(u64, String, String)>,
+    pub closed: std::collections::BTreeSet<u64>,
     pub writes: usize,
 }
 
@@ -228,6 +280,7 @@ impl NoticeHost for FakeNotices {
                 .map(|_| NoticeRef {
                     number: *n,
                     body: body.clone(),
+                    closed: self.closed.contains(n),
                 })
         }))
     }
@@ -241,6 +294,12 @@ impl NoticeHost for FakeNotices {
         self.writes += 1;
         if let Some(row) = self.notices.iter_mut().find(|r| r.0 == number) {
             row.2 = body.into();
+        }
+        Ok(())
+    }
+    fn close(&mut self, _repo: &str, number: u64, _note: &str) -> Result<(), ForgeError> {
+        if self.closed.insert(number) {
+            self.writes += 1;
         }
         Ok(())
     }
@@ -335,6 +394,7 @@ mod tests {
         heads.insert(Box::new(FakeHost {
             forge: Forge::Github,
             w,
+            forge_world: None,
         }));
         let copies = [Copy {
             forge: Forge::Github,
@@ -347,6 +407,8 @@ mod tests {
             number: 7,
             head_sha: sha.into(),
             fetch_url: "origin-url".into(),
+            reference: "refs/pull/1/head".into(),
+            bodies: Default::default(),
             title: "Fix".into(),
             body: "Credit\n\ntext".into(),
             state,
@@ -383,13 +445,19 @@ mod tests {
             (m.sha.as_str(), m.reference.as_str()),
             (B, "refs/merge-requests/7/head")
         );
-        // closed at the origin: heads retire, the notice is left alone
+        // closed at the origin: heads retire, the notice is closed (never deleted), and a repeat writes nothing
         assert_eq!(
             run(&mut heads, &mut host, &origin(B, ReqState::Closed))
                 .1
                 .unwrap(),
-            None
+            Some(NoticeAction::Closed(1))
         );
-        assert_eq!((host.notices.len(), host.writes), (1, 2));
+        assert_eq!(
+            run(&mut heads, &mut host, &origin(B, ReqState::Closed))
+                .1
+                .unwrap(),
+            Some(NoticeAction::Unchanged(1))
+        );
+        assert_eq!((host.notices.len(), host.writes), (1, 3));
     }
 }

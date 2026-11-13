@@ -108,6 +108,7 @@ pub(super) struct H {
     pub bb: Handle,
     screen: Box<dyn Screen>,
     contributed: Contributed,
+    pub contrib: Option<super::contrib::Contrib>,
 }
 
 impl H {
@@ -143,6 +144,7 @@ impl H {
             bb,
             screen: Box::new(PassAll),
             contributed: contributed_of(&[]),
+            contrib: None,
         }
     }
 
@@ -163,6 +165,7 @@ impl H {
             screen: &*self.screen,
             contributed: &self.contributed,
             holder: "test",
+            contrib: self.contrib.as_mut(),
         }
     }
 
@@ -454,7 +457,7 @@ fn a_contributed_project_is_refused_before_any_request() {
 }
 
 #[test]
-fn contribution_flows_are_not_part_of_this_lane() {
+fn contributions_are_unsupported_without_contribution_ports() {
     let mut h = H::new();
     let mut hint = h.hint(Forge::Github, 1, HintAction::Changed, Some(&alice()));
     hint.kind = Kind::Contribution;

@@ -21,10 +21,10 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 cfrg = { path = "cfrg" }
 clmr = { path = "clmr" }
-cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "49c42586ea1d2fa0af7e234204056f46fa061628" }
-cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "b964fc9619b5187788cb9e28cfec9ce29d3c8c42" }
+cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "ea6e029af7a5593bb5a79499f0fe4e9ed4789b49" }
+cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "dbfa6fa64714f9598d7da71fce6811f4ba05933c" }
 cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "53441c2669a03f96772827fb81a16d397cdfea0f" }
-cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "a63d74b67df7df06534d6d6afa1a103823e5453d" }
+cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "3d9d66738eaa745255703cc2fa6c7d59b5290ab3" }
 cfrg-relay = { path = "cfrg-relay" }
 
 [workspace.lints.rust]

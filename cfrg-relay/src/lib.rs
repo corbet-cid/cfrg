@@ -10,8 +10,10 @@ use cfrg::{
     contributed::Contributed,
     native::Placement,
     relay::{
+        contrib::Contrib,
         copyid::CopyIds,
         derive::{repos_from_placement, repos_from_placement_with, unresolved_copies},
+        heads::Heads,
         ops::SweepReport,
         pacing::SystemClock,
         pg::PgStore,
@@ -112,6 +114,7 @@ fn run<T>(
     let mut forges = drivers.into_forges(&runtime, &p.config, &stale);
     let clock = SystemClock;
     let holder = format!("cfrg-relay-{}", std::process::id());
+    let mut contrib = live_contrib(&dir, &runtime, &p.placement.source.origin);
     let mut engine = Engine {
         cfg: &p.config,
         store: &mut store,
@@ -121,6 +124,7 @@ fn run<T>(
         screen: &HoldAll,
         contributed: &p.contributed,
         holder: &holder,
+        contrib: contrib.as_mut(),
     };
     let result = f(&mut engine);
     // A definitive 404 on a repository: forget its resolved id, so the next run resolves it again.
@@ -128,6 +132,66 @@ fn run<T>(
         store.drop_id(*forge, id)?;
     }
     result
+}
+
+/// The write ports of the contribution flow, for the forges whose credential is present. Without the Forgejo
+/// credential there is no notice and so no flow at all (`None`: contribution events are reported as unsupported).
+pub fn live_contrib(
+    dir: &Option<PathBuf>,
+    rt: &std::rc::Rc<tokio::runtime::Runtime>,
+    forgejo_origin: &str,
+) -> Option<Contrib> {
+    let notices = live::open_forgejo(dir, forgejo_origin)?;
+    let forgejo_token = live::credential(dir, live::FORGEJO_TOKEN);
+    let gitlab_token = live::credential(dir, live::GITLAB_TOKEN);
+    let host = forgejo_origin
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let git = heads_live::LiveGit {
+        rt: rt.clone(),
+        github: live::open_github(dir, rt),
+        gitlab_token: gitlab_token.clone(),
+        forgejo_token,
+        forgejo_host: host,
+    };
+    let mut heads = Heads::new(Box::new(git));
+    if let Some(driver) = live::open_forgejo(dir, forgejo_origin) {
+        heads.insert(Box::new(heads_live::ForgejoRequests {
+            rt: rt.clone(),
+            driver,
+        }));
+    }
+    if let (Some(driver), Some(token)) = (live::open_gitlab(dir, rt), gitlab_token) {
+        match heads_live::GitlabHeads::new(rt.clone(), driver, "gitlab.com", &token) {
+            Ok(host) => heads.insert(Box::new(host)),
+            Err(why) => eprintln!("relay: gitlab heads refused: {why}"),
+        }
+    }
+    if let Some(driver) = live::open_github(dir, rt) {
+        match heads_live::GithubHeads::new(rt.clone(), driver) {
+            Ok(host) => heads.insert(Box::new(host)),
+            Err(why) => eprintln!("relay: github heads refused: {why}"),
+        }
+    }
+    Some(Contrib {
+        heads,
+        notices: Box::new(notices_live::ForgejoNotices {
+            driver: notices,
+            rt: rt.clone(),
+        }),
+    })
+}
+
+/// Take-in of a contribution (merge): the owner pushed `reviewed_sha`; every sibling and the notice are closed as merged.
+pub fn take_in(settings: &Settings, hint: &Hint, reviewed_sha: &str) -> Result<Applied> {
+    run(settings, Applied::Refused, |engine| {
+        Ok(Applied::Done(
+            engine.take_in_contribution(hint, reviewed_sha)?,
+        ))
+    })
 }
 
 /// Fills the ids of the copies the placement does not know: from the database, else once from the path through the
