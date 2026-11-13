@@ -27,7 +27,7 @@ pub fn sync(cfg: &Config, creds: &Credentials, forgejo_id: &str) -> Result<Value
         let creds = creds.clone();
         move |name: &str| -> cfrg::Result<String> {
             let key = match name {
-                "CFRG_FORGEJO_TOKEN" => "forge_token",
+                "CFRG_FORGEJO_TOKEN" => "wiki_forgejo_token",
                 "CFRG_GITLAB_TOKEN" => "gitlab_token",
                 other => other,
             };

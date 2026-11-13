@@ -160,7 +160,7 @@ impl Config {
 pub struct Credentials(BTreeMap<String, String>);
 
 /// (file name, key): the HMAC keys keep their names; the provider files are the names of `docs/relay.md`.
-pub const CREDENTIAL_KEYS: [(&str, &str); 7] = [
+pub const CREDENTIAL_KEYS: [(&str, &str); 8] = [
     ("hmac_forgejo", "hmac_forgejo"),
     ("hmac_github", "hmac_github"),
     ("hmac_gitlab", "hmac_gitlab"),
@@ -168,6 +168,7 @@ pub const CREDENTIAL_KEYS: [(&str, &str); 7] = [
     ("gitlab-token", "gitlab_token"),
     ("github-token", "github_token"),
     ("github-app-key", "github_app_key"),
+    ("wiki-forgejo-token", "wiki_forgejo_token"),
 ];
 
 impl Credentials {
