@@ -19,7 +19,11 @@ existing metadata and protection still reconcile. Provider filtering cannot
 bypass sync-now's authorization check for every actual remote on the source.
 Pass credentials by the named environment references. Keep mutable state on
 persistent private storage, outside Git; it contains rate windows, pacing,
-uncertain mutation intents and remote ownership IDs, never credentials.
+uncertain mutation intents, never credentials. Mirror ownership is not stored: a push mirror
+is owned when its address is a declared destination of the repository (or carries a declared
+`remote_name`); every other one is `foreign` in the report and is never changed.
+`--operation adopt` is the read-only adoption listing: every push mirror as `owned` or
+`foreign`, with counts per forge. It writes nothing and refuses `--apply`.
 
 ## Renames: destinations follow the primary
 
@@ -43,7 +47,7 @@ still points at an earlier name as `rename-pending`.
 |---|---|
 | `status` | reads Forgejo only; `rename-pending` when a mirror points at an earlier name of the destination |
 | `plan` | looks the destination up by its immutable id (`repository_id`) and reports `rename-planned`, `rename-blocked` (name taken, other namespace) or nothing |
-| `reconcile --apply` | renames the destination through its adapter, replaces the owned Forgejo mirror that points at the old name, moves the ownership record, removes the old SSH deploy key |
+| `reconcile --apply` | renames the destination through its adapter, replaces the owned Forgejo mirror that points at the old name, removes the old SSH deploy key |
 | `rename --apply` | the same, and only for destinations whose name is out of date; never creates a destination |
 
 Adapter capability `rename` (`cfrg switch --capabilities`): GitLab native (the
@@ -54,7 +58,7 @@ and GitHub reported only (its repositories are renamed in GitHub). A rename is r
 wanted name is taken by another repository or when the namespace differs (a
 transfer is not implemented). The recorded `remote_name` of a replaced mirror
 changes: the report prints the new one, and the declared placement keeps it
-(`remote_name` is the durable ownership claim; the state file is the cache).
+(`remote_name` is an explicit ownership claim; the address derives the rest).
 
 ```json
 {

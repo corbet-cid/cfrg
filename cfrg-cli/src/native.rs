@@ -23,7 +23,8 @@ use std::{
 pub struct Options {
     #[arg(long)]
     placement: PathBuf,
-    /// Persistent windows, uncertain intents and owned native remote identities.
+    /// Persistent windows and uncertain intents. Ownership of a mirror is never stored: it is
+    /// derived from Forgejo's own mirror list and the placement (design 3.7).
     #[arg(long)]
     state: PathBuf,
     #[arg(long)]
@@ -81,6 +82,11 @@ enum Operation {
     /// Only what a rename of the primary calls for: rename the destination,
     /// replace the mirror that points at its old name, record the new owner.
     Rename,
+    /// Read-only. The one-time adoption of existing push mirrors (design 3.7, R56): every push
+    /// mirror of every declared repository is listed as owned (its address is a declared
+    /// destination) or foreign, with counts per forge. Holds and exceptions do not exempt a
+    /// repository. Ownership is derived, so there is nothing to write.
+    Adopt,
     /// Read-only audit of every declared name: the primary against the
     /// declared one, every destination (found by its recorded id) against the
     /// name it must carry. Holds and exceptions do not exempt a repository.
@@ -185,10 +191,10 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     if options.apply
         && matches!(
             options.operation,
-            Operation::Plan | Operation::Status | Operation::Names
+            Operation::Plan | Operation::Status | Operation::Names | Operation::Adopt
         )
     {
-        return Err("Plan and status cannot apply changes".into());
+        return Err("Plan, status, names and adopt cannot apply changes".into());
     }
     let contributed = cfrg::contributed::Contributed::from_placement(&placement, &[])?;
     let contributed_paths = contributed.source_paths();
@@ -207,6 +213,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     if copy_only && placement.copy.is_none() {
         return Err("The placement declares no copy".into());
     }
+    let mut tally: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let result = (|| -> Result<()> {
         // Contributed projects (operating model R10, R11) have no mirror, and their copies on our forge run no CI of
         // ours: the Actions unit stays off, or the upstream's own workflows would run on our runners. First, so that
@@ -237,6 +244,18 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 report.push(json!({"source":declared.path, "state":"primary-elsewhere"}));
                 continue;
             }
+            if options.operation == Operation::Adopt {
+                match adopt_one(&mut io, &placement, declared, &mut tally, &mut report) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        report.push(
+                            json!({"source":declared.path, "state":"error", "error":error.to_string()}),
+                        );
+                        incomplete = true;
+                    }
+                }
+                continue;
+            }
             if options.operation == Operation::Names {
                 // One repository failing to answer never hides the others.
                 match audit_names(&mut io, &placement, declared, &mut report) {
@@ -260,12 +279,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
             if source_held {
                 report.push(json!({"source":declared.path, "state":"exception", "reason":declared.hold.as_deref().unwrap_or("content/profile exception")}));
                 incomplete = true;
-                let prefix = format!("{}/{}/", placement.source.origin, declared.source_id);
+                // Only an explicit `remote_name` claim keeps a held repository in the pass; `adopt`
+                // is what lists the mirrors a held repository has.
                 if !declared
                     .destinations
                     .iter()
                     .any(|d| d.remote_name.is_some())
-                    && !io.state.owned.keys().any(|k| k.starts_with(&prefix))
                 {
                     continue;
                 }
@@ -310,10 +329,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 dest.path = repo.destination_path(declared_dest);
                 let url = destination_url(&dest, &dest.path);
                 let mut known = names(&dest.path, &declared_dest.recorded_path, None);
-                let key =
-                    ownership_key(&placement.source.origin, repo.source_id, &dest, &dest.path);
-                let (mut mirror, owner) =
-                    locate(&io, &placement.source.origin, repo, &dest, &mirrors, &known)?;
+                let (mut mirror, owner) = locate(&dest, &mirrors, &known)?;
                 // An owned mirror whose address is none of this destination's
                 // names: the destination was renamed (an address cannot be edited).
                 let mut stale_owned = stale_of(&mirrors, &mirror, &owner);
@@ -360,7 +376,6 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                                 value["remote_name"].as_str().ok_or("Missing remote name")?,
                             )?;
                             mirrors.retain(|m| m["remote_name"] != value["remote_name"]);
-                            forget_owned(&mut io, &placement.source.origin, repo, &dest, &known)?;
                         } else {
                             incomplete = true;
                         }
@@ -411,8 +426,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         &declared_dest.recorded_path,
                         Some(from.as_str()),
                     );
-                    let (found, owner) =
-                        locate(&io, &placement.source.origin, repo, &dest, &mirrors, &known)?;
+                    let (found, owner) = locate(&dest, &mirrors, &known)?;
                     stale_owned = stale_of(&mirrors, &found, &owner);
                     mirror = found;
                 }
@@ -477,7 +491,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     )?,
                 };
                 if dest.use_ssh && target.is_some() && mirror.is_none() && write {
-                    let value = create_owned(&api, &mut io, &dest, &url, &key)?;
+                    let value = create_owned(&api, &mut io, &dest, &url)?;
                     mirrors.push(value.clone());
                     mirror = Some(value);
                 }
@@ -525,7 +539,6 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         let name = old["remote_name"].as_str().ok_or("Missing remote name")?;
                         api.delete(&mut io, name)?;
                         mirrors.retain(|m| m["remote_name"] != old["remote_name"]);
-                        forget_owned(&mut io, &placement.source.origin, repo, &dest, &known)?;
                         replaced = Some(name.to_string());
                     } else {
                         report.push(json!({"source":repo.path, "destination":dest.path, "state":"replace-planned"}));
@@ -534,7 +547,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     }
                 }
                 if mirror.is_none() && write {
-                    let value = create_owned(&api, &mut io, &dest, &url, &key)?;
+                    let value = create_owned(&api, &mut io, &dest, &url)?;
                     if dest.use_ssh {
                         cglb::native::protect_ssh(
                             &mut io,
@@ -587,6 +600,17 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 );
                 }
             }
+            if options.provider.is_none() {
+                // Foreign push mirrors (not a declared destination of this repository) are
+                // reported and never touched (design 3.7).
+                for mirror in mirrors.iter().filter(|m| {
+                    !copy::is_copy_mirror(placement.copy.as_ref(), m)
+                        && !managed.contains(&m["remote_name"])
+                        && !owned_by(repo, m)
+                }) {
+                    report.push(json!({"source":repo.path, "state":"foreign", "forge":forge_of(mirror), "mirror":cfgj::native::status(mirror)}));
+                }
+            }
             if options.operation == Operation::SyncNow {
                 // This Forgejo endpoint synchronizes every remote; never trigger
                 // undeclared, held, absent or unprotected destinations as a side effect.
@@ -602,6 +626,17 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     api.sync_now(&mut io)?;
                 }
             }
+        }
+        if options.operation == Operation::Adopt {
+            for (forge, (owned, foreign)) in &tally {
+                report.push(
+                    json!({"state":"ownership", "forge":forge, "owned":owned, "foreign":foreign}),
+                );
+            }
+            let (owned, foreign) = tally
+                .values()
+                .fold((0, 0), |sum, n| (sum.0 + n.0, sum.1 + n.1));
+            report.push(json!({"state":"ownership-total", "owned":owned, "foreign":foreign}));
         }
         Ok(())
     })();
@@ -738,32 +773,91 @@ fn audit_names(
     Ok(drift)
 }
 
-/// The Forgejo mirror of a destination under any of its `known` names, and the
-/// owner recorded for it. A mirror found by address must be the recorded owner.
+/// The Forgejo mirror of a destination under any of its `known` names, and the owner claim
+/// the placement itself declares (`remote_name`). Ownership is derived (design 3.7): a push
+/// mirror whose address is one of the destination's names is ours; nothing is recorded.
 fn locate(
-    io: &Http,
-    origin: &str,
-    repo: &Repository,
     dest: &Destination,
     mirrors: &[Value],
     known: &[String],
 ) -> Result<(Option<Value>, Option<String>)> {
-    let mirror = mirror_named(mirrors, dest, known)?;
-    // Recorded under any of its names; failing that under its identity (the
-    // repository and the provider, whatever the path was then); the declared
-    // `remote_name` last, because it goes stale when a mirror is replaced.
-    let owner = owner_of(
-        &io.state.owned,
-        &keys_of(origin, repo.source_id, dest, known),
-    )
-    .or_else(|| identity_owner(&io.state.owned, origin, repo, dest))
-    .or_else(|| dest.remote_name.clone());
-    if let Some(value) = &mirror {
-        if owner.as_deref() != value["remote_name"].as_str() {
-            return Err("Existing mirror has no matching declared/recorded ownership; declare remote_name after review".into());
-        }
+    Ok((
+        mirror_named(mirrors, dest, known)?,
+        dest.remote_name.clone(),
+    ))
+}
+
+/// Whether a Forgejo push mirror of `repo` is ours: its address is a destination the placement
+/// declares for the repository (under the wanted or the last recorded name), or it carries a
+/// declared `remote_name`.
+fn owned_by(repo: &Repository, mirror: &Value) -> bool {
+    repo.destinations.iter().any(|declared| {
+        let wanted = repo.destination_path(declared);
+        let known = names(&wanted, &declared.recorded_path, None);
+        known
+            .iter()
+            .any(|name| cfgj::native::address_matches(mirror, &destination_url(declared, name)))
+            || declared
+                .remote_name
+                .as_deref()
+                .is_some_and(|claim| mirror["remote_name"].as_str() == Some(claim))
+    })
+}
+
+/// The forge a mirror pushes to: the host of its address, userinfo removed.
+fn forge_of(mirror: &Value) -> String {
+    mirror["remote_address"]
+        .as_str()
+        .and_then(|address| address.split_once("://"))
+        .and_then(|(_, rest)| rest.split('/').next())
+        .and_then(|authority| authority.rsplit('@').next())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// `--operation adopt` for one repository: every push mirror, owned or foreign. Reads only.
+fn adopt_one(
+    io: &mut dyn Transport,
+    placement: &Placement,
+    declared: &Repository,
+    tally: &mut BTreeMap<String, (usize, usize)>,
+    report: &mut Vec<Value>,
+) -> Result<()> {
+    let api = cfgj::native::Mirrors {
+        endpoint: &placement.source,
+        repository: declared,
+    };
+    let current = api.verify_source(io)?;
+    let mut followed = declared.clone();
+    if current != declared.path {
+        report.push(json!({"source":current, "declared":declared.path, "state":"source-renamed"}));
+        followed.path = current;
     }
-    Ok((mirror, owner))
+    let repo = &followed;
+    let api = cfgj::native::Mirrors {
+        endpoint: &placement.source,
+        repository: repo,
+    };
+    let mirrors = api.list(io)?;
+    let mut owned = 0;
+    for mirror in mirrors
+        .iter()
+        .filter(|m| !copy::is_copy_mirror(placement.copy.as_ref(), m))
+    {
+        let is_ours = owned_by(repo, mirror);
+        let entry = tally.entry(forge_of(mirror)).or_default();
+        if is_ours {
+            entry.0 += 1;
+            owned += 1;
+        } else {
+            entry.1 += 1;
+        }
+        report.push(json!({"source":repo.path, "state":if is_ours {"owned"} else {"foreign"}, "forge":forge_of(mirror), "mirror":cfgj::native::status(mirror)}));
+    }
+    if owned == 0 && mirrors.is_empty() {
+        report.push(json!({"source":repo.path, "state":"no-mirrors"}));
+    }
+    Ok(())
 }
 
 /// The recorded owner's mirror when no mirror carries any known name.
@@ -815,73 +909,6 @@ fn compare_heads(
     }))
 }
 
-/// The key under which the state records which Forgejo mirror is ours.
-fn ownership_key(origin: &str, source_id: u64, dest: &Destination, path: &str) -> String {
-    format!("{origin}/{source_id}/{}/{path}", dest.endpoint.origin)
-}
-
-fn keys_of(origin: &str, source_id: u64, dest: &Destination, names: &[String]) -> Vec<String> {
-    names
-        .iter()
-        .map(|name| ownership_key(origin, source_id, dest, name))
-        .collect()
-}
-
-/// The owner recorded for a destination under any of its names.
-fn owner_of(owned: &BTreeMap<String, String>, keys: &[String]) -> Option<String> {
-    keys.iter().find_map(|key| owned.get(key)).cloned()
-}
-
-/// The owner recorded for the only destination this repository has on that
-/// provider, whatever path the record was made under.
-fn identity_owner(
-    owned: &BTreeMap<String, String>,
-    origin: &str,
-    repo: &Repository,
-    dest: &Destination,
-) -> Option<String> {
-    let siblings = repo
-        .destinations
-        .iter()
-        .filter(|other| other.endpoint.origin == dest.endpoint.origin)
-        .count();
-    if siblings != 1 {
-        return None;
-    }
-    let prefix = format!("{origin}/{}/{}/", repo.source_id, dest.endpoint.origin);
-    let mut found = owned.iter().filter(|(key, _)| key.starts_with(&prefix));
-    match (found.next(), found.next()) {
-        (Some((_, name)), None) => Some(name.clone()),
-        _ => None,
-    }
-}
-
-/// Drop the records of a destination (a replaced or deleted mirror): those under
-/// any of its names and, when it is the repository's only destination on that
-/// provider, every record made for the provider whatever the path was then.
-fn forget_owned(
-    io: &mut Http,
-    origin: &str,
-    repo: &Repository,
-    dest: &Destination,
-    names: &[String],
-) -> Result<()> {
-    for key in keys_of(origin, repo.source_id, dest, names) {
-        io.state.owned.remove(&key);
-    }
-    let sole = repo
-        .destinations
-        .iter()
-        .filter(|other| other.endpoint.origin == dest.endpoint.origin)
-        .count()
-        == 1;
-    if sole {
-        let prefix = format!("{origin}/{}/{}/", repo.source_id, dest.endpoint.origin);
-        io.state.owned.retain(|key, _| !key.starts_with(&prefix));
-    }
-    io.save()
-}
-
 /// The Forgejo push mirror that points at the destination under any of `names`.
 fn mirror_named(mirrors: &[Value], dest: &Destination, names: &[String]) -> Result<Option<Value>> {
     let urls: Vec<String> = names
@@ -921,7 +948,6 @@ fn create_owned(
     io: &mut Http,
     dest: &cfrg::native::Destination,
     url: &str,
-    key: &str,
 ) -> Result<Value> {
     let password = if dest.use_ssh {
         cglb::native::deny_branch_writes(io, dest)?;
@@ -942,8 +968,6 @@ fn create_owned(
         .as_str()
         .ok_or("Missing created mirror remote name")?;
     cfrg::native::component(name)?;
-    io.state.owned.insert(key.into(), name.into());
-    io.save()?;
     Ok(value)
 }
 
@@ -998,57 +1022,46 @@ mod tests {
         assert!(mirror_named(&twins, &dest, &both).is_err());
     }
 
-    #[test]
-    fn ownership_is_found_under_any_name_or_the_identity_of_the_destination() {
-        let dest = gitlab("team/new");
-        let known = names("team/new", "team/old", None);
-        let keys = keys_of("https://forge.example", 5, &dest, &known);
-        assert_eq!(
-            keys[1],
-            "https://forge.example/5/https://gitlab.example/team/old"
-        );
-        let mut owned = BTreeMap::new();
-        owned.insert(keys[1].clone(), "remote_mirror_a".to_string());
-        assert_eq!(owner_of(&owned, &keys).as_deref(), Some("remote_mirror_a"));
-        assert_eq!(owner_of(&BTreeMap::new(), &keys), None);
-        // A record made under a name the destination never had here is still its record.
-        let mut elsewhere = BTreeMap::new();
-        elsewhere.insert(
-            "https://forge.example/5/https://gitlab.example/team/older".to_string(),
-            "remote_mirror_b".to_string(),
-        );
+    fn repo_with(dests: Vec<Destination>) -> Repository {
         let mut repo: Repository = serde_json::from_value(json!({"path":"team/new","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
-        repo.destinations.push(dest.clone());
+        repo.destinations = dests;
+        repo
+    }
+
+    #[test]
+    fn ownership_is_derived_from_the_address_of_a_declared_destination() {
+        let repo = repo_with(vec![gitlab("team/new")]);
+        // The address of the declared destination: ours, with no record anywhere.
+        assert!(owned_by(
+            &repo,
+            &mirror("remote_mirror_a", "ssh://gitlab.example/team/new.git")
+        ));
+        // Any other address, on the same host or not: foreign.
+        assert!(!owned_by(
+            &repo,
+            &mirror("remote_mirror_b", "ssh://gitlab.example/team/other.git")
+        ));
+        assert!(!owned_by(
+            &repo,
+            &mirror("remote_mirror_c", "https://bitbucket.org/team/new.git")
+        ));
+        // A declared remote_name is an explicit claim.
+        let mut claimed = gitlab("team/new");
+        claimed.remote_name = Some("remote_mirror_d".into());
+        let repo = repo_with(vec![claimed]);
+        assert!(owned_by(
+            &repo,
+            &mirror("remote_mirror_d", "ssh://gitlab.example/team/elsewhere.git")
+        ));
+    }
+
+    #[test]
+    fn the_forge_of_a_mirror_is_its_host_without_userinfo() {
         assert_eq!(
-            identity_owner(&elsewhere, "https://forge.example", &repo, &dest).as_deref(),
-            Some("remote_mirror_b")
+            forge_of(&mirror("m", "https://user:pw@github.com/org/repo.git")),
+            "github.com"
         );
-        // Two records, another repository, or two destinations on the provider: no guess.
-        elsewhere.insert(
-            "https://forge.example/5/https://gitlab.example/team/oldest".to_string(),
-            "remote_mirror_c".to_string(),
-        );
-        assert_eq!(
-            identity_owner(&elsewhere, "https://forge.example", &repo, &dest),
-            None
-        );
-        let other = BTreeMap::from([(
-            "https://forge.example/6/https://gitlab.example/team/new".to_string(),
-            "remote_mirror_d".to_string(),
-        )]);
-        assert_eq!(
-            identity_owner(&other, "https://forge.example", &repo, &dest),
-            None
-        );
-        repo.destinations.push(gitlab("team/second"));
-        let single = BTreeMap::from([(
-            "https://forge.example/5/https://gitlab.example/team/new".to_string(),
-            "remote_mirror_e".to_string(),
-        )]);
-        assert_eq!(
-            identity_owner(&single, "https://forge.example", &repo, &dest),
-            None
-        );
+        assert_eq!(forge_of(&json!({"remote_name":"m"})), "unknown");
     }
 
     #[test]

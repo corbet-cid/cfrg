@@ -8,7 +8,7 @@ file: a file names an environment variable (`token_env`, `password_env`,
 | File | Command | Full description |
 |---|---|---|
 | placement (`--placement`) | `cfrg native` | [native mirrors](native-mirrors.md) |
-| state (`--state`) | `cfrg native` | persistent private storage with rate windows, pacing, uncertain intents and ownership IDs; never credentials ([native mirrors](native-mirrors.md)) |
+| state (`--state`) | `cfrg native` | persistent private storage with rate windows, pacing, uncertain intents (no ownership: it is derived from Forgejo); never credentials ([native mirrors](native-mirrors.md)) |
 | repository policy (`--policy`) | `cfrg validate`, `plan`, `decide`, `clone`, `sync` | [repository policy](repository-policy.md); example `cfrg/examples/repository-policy.json` |
 | landing policy (`--policy`, with an optional `serve` block) | `cfrg land`, `cfrg serve` | [land](land.md), [serve](serve.md) |
 | gate configuration (`--config`) | `cfrg gate` | [gate](gate.md) |

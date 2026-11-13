@@ -15,9 +15,9 @@
 
 * Forgejo is the platform; cfrg fills only gaps. Mirror ownership is derived from
   Forgejo's own mirror list plus the declaration: a push mirror is owned exactly
-  when its remote address equals a declared destination. Planned for the
-  state-free form: task B4. Today ownership IDs are kept in the `--state` file
-  (`cfrg-cli/src/native.rs`).
+  when its remote address equals a declared destination (or it carries a declared
+  `remote_name`). Nothing is recorded, so a lost state directory cannot break it;
+  every other push mirror is foreign, reported as `foreign` and never touched.
 * Omission is not deletion. A mirror is removed only when the placement says
   `absent: true`, and a destination repository is never deleted
   ([native mirrors](native-mirrors.md)).

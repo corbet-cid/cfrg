@@ -27,7 +27,7 @@ carries because its primary does ([native mirrors](native-mirrors.md)).
 * The bridge gives each child process only its own forge's credential and
   follows no redirects, credential helpers or proxy settings
   ([contribution bridge](pr-bridge.md)).
-* State files hold rate windows, intents and ownership IDs, never credentials
+* State files hold rate windows and intents, never credentials
   ([native mirrors](native-mirrors.md)).
 * Webhook bodies are authenticated by HMAC-SHA256 over the raw body, compared in
   constant time, before anything is parsed: `cfrg/src/serve.rs`
