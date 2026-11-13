@@ -469,7 +469,7 @@ mod tests {
                     "mirror": {"kind": "forgejo", "url": "https://forge.example.org"}
                 },
                 "ci": {
-                    "primary": {"driver": "github-actions", "forge": "hub", "execution": "owned", "capabilities": ["linux-x86_64"]}
+                    "primary": {"driver": "forgejo-actions", "forge": "hub", "execution": "owned", "capabilities": ["linux-x86_64"]}
                 },
                 "repositories": {
                     ".github": {

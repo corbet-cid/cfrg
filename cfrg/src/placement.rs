@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub schema: u32,
+    /// Accepted so existing documents parse; it has no effect. Every executor is owned (below), so there is nothing paid or
+    /// provider-hosted for it to forbid.
+    #[serde(default)]
     pub free_only: bool,
     pub forges: BTreeMap<String, Forge>,
     pub ci: BTreeMap<String, Ci>,
@@ -27,6 +30,8 @@ pub struct Forge {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ci {
+    /// The engine. The own CI of a mirror forge (`github-actions`, `gitlab-ci`, `bitbucket-pipelines`) is refused: no CI runs on
+    /// a mirror (operating model R6, R7).
     pub driver: String,
     pub forge: String,
     pub execution: Execution,
@@ -37,9 +42,8 @@ pub struct Ci {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Execution {
+    /// Our own compute, the only kind there is: a provider-hosted (`free-hosted`) or `paid` executor cannot be modelled.
     Owned,
-    FreeHosted,
-    Paid,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -61,7 +65,9 @@ pub struct Repository {
     pub external_content: BTreeMap<String, ExternalContent>,
     #[serde(default)]
     pub clone_fallbacks: Vec<String>,
-    #[serde(default)]
+    /// Removed capability: a CI executor on a mirror forge cannot be modelled (operating model R6, R7). The key is still
+    /// accepted EMPTY, because deployed documents carry `[]`; any executor in it is refused by `validate`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_fallbacks: Vec<String>,
     pub promotion: Promotion,
 }
@@ -107,7 +113,6 @@ pub struct Plan {
     pub primary_forge: String,
     pub trigger_forge: String,
     pub clone_urls: Vec<String>,
-    pub execution_fallbacks: Vec<String>,
     pub promotion: &'static str,
 }
 
@@ -131,7 +136,7 @@ impl Policy {
             canonical_repository(&format!("{}/fixture/repo", forge.url))?;
         }
         for (id, ci) in &self.ci {
-            let forge = self.forges.get(&ci.forge).ok_or_else(|| {
+            self.forges.get(&ci.forge).ok_or_else(|| {
                 failure(format!("CI {id} refers to undeclared forge {}", ci.forge))
             })?;
             if !plain(id)
@@ -143,17 +148,12 @@ impl Policy {
                     "CI {id} requires an explicit driver and nonempty coverage capabilities"
                 )));
             }
-            let native_forge = match ci.driver.as_str() {
-                "github-actions" => Some("github"),
-                "gitlab-ci" => Some("gitlab"),
-                "bitbucket-pipelines" => Some("bitbucket"),
-                _ => None,
-            };
-            if native_forge.is_some_and(|kind| forge.kind != kind) {
-                return Err(failure(format!("CI {id} must use its native forge")));
-            }
-            if self.free_only && ci.execution == Execution::Paid {
-                return Err(failure(format!("CI {id} violates free_only")));
+            if ["github-actions", "gitlab-ci", "bitbucket-pipelines"].contains(&ci.driver.as_str())
+            {
+                return Err(failure(format!(
+                    "CI {id} is the own CI of a mirror forge ({}), which cannot be modelled (operating model R6, R7)",
+                    ci.driver
+                )));
             }
         }
         for rule in &self.placement_rules {
@@ -222,25 +222,11 @@ impl Policy {
                     )));
                 }
             }
-            let mut executors = BTreeSet::new();
-            for executor in std::iter::once(&repo.ci).chain(&repo.execution_fallbacks) {
-                let ci = self.ci.get(executor).ok_or_else(|| {
-                    failure(format!(
-                        "Repository {id} has an undeclared execution fallback"
-                    ))
-                })?;
-                if !executors.insert(executor) || !repo.locations.contains_key(&ci.forge) {
-                    return Err(failure(format!(
-                        "Repository {id} execution locations must be declared and unique"
-                    )));
-                }
-                if ci.execution == Execution::FreeHosted
-                    && (repo.visibility != cqlt::Visibility::Public || repo.sensitive)
-                {
-                    return Err(failure(format!(
-                        "Repository {id} is not eligible for public free hosted execution"
-                    )));
-                }
+            // The primary is the only executor: one on a mirror forge cannot be modelled (operating model R6, R7).
+            if !repo.execution_fallbacks.is_empty() {
+                return Err(failure(format!(
+                    "Repository {id} names a CI executor on a mirror forge (execution_fallbacks), which cannot be modelled (operating model R6, R7)"
+                )));
             }
             for rule in &self.placement_rules {
                 if rule
@@ -289,7 +275,6 @@ impl Policy {
             primary_forge: primary.clone(),
             trigger_forge: primary.clone(),
             clone_urls,
-            execution_fallbacks: repo.execution_fallbacks.clone(),
             promotion: "manual",
         })
     }
@@ -319,8 +304,8 @@ pub enum Decision {
     Blocked { reason: String },
 }
 
-/// No API calls or inferred availability. Unknown and active submissions block
-/// failover; check failures never turn into an excuse to try another provider.
+/// No API calls or inferred availability. An unknown or active submission blocks a new one; a failed check never turns
+/// into an excuse to try another provider (there is none: the primary is the only executor).
 pub fn execution_decision(
     policy: &Policy,
     repository: &str,
@@ -332,46 +317,25 @@ pub fn execution_decision(
         .repositories
         .get(repository)
         .ok_or_else(|| failure("Undeclared repository"))?;
-    let order: Vec<_> = std::iter::once(&repo.ci)
-        .chain(&repo.execution_fallbacks)
-        .collect();
-    if required.is_empty() || states.keys().any(|ci| !order.contains(&ci)) {
+    let ci = &repo.ci;
+    if required.is_empty() || states.keys().any(|state| state != ci) {
         return Err(failure(
-            "Execution decision requires explicit coverage and only declared providers",
+            "Execution decision requires explicit coverage and only the declared provider",
         ));
     }
-    // Reconcile ALL providers before dispatch: an old fallback may still own it.
-    for ci in &order {
-        match states.get(*ci) {
-            None | Some(RunState::Unknown) => {
-                return Ok(Decision::Blocked {
-                    reason: format!("Unresolved provider {ci}"),
-                })
-            }
-            Some(RunState::Active) => return Ok(Decision::Attach { ci: (*ci).clone() }),
-            Some(RunState::Failed) => return Ok(Decision::Failed { ci: (*ci).clone() }),
-            _ => (),
-        }
-    }
-    for ci in &order {
-        if matches!(states.get(*ci), Some(RunState::Succeeded))
-            && required
-                .iter()
-                .all(|c| policy.ci[*ci].capabilities.contains(c))
-        {
-            return Ok(Decision::Reuse { ci: (*ci).clone() });
-        }
-    }
-    for ci in &order {
-        if matches!(states.get(*ci), Some(RunState::Absent))
-            && required
-                .iter()
-                .all(|c| policy.ci[*ci].capabilities.contains(c))
-        {
-            return Ok(Decision::Dispatch { ci: (*ci).clone() });
-        }
-    }
-    Ok(Decision::Blocked {
-        reason: "No available provider covers this request".into(),
+    let covers = required
+        .iter()
+        .all(|c| policy.ci[ci].capabilities.contains(c));
+    Ok(match states.get(ci) {
+        None | Some(RunState::Unknown) => Decision::Blocked {
+            reason: format!("Unresolved provider {ci}"),
+        },
+        Some(RunState::Active) => Decision::Attach { ci: ci.clone() },
+        Some(RunState::Failed) => Decision::Failed { ci: ci.clone() },
+        Some(RunState::Succeeded) if covers => Decision::Reuse { ci: ci.clone() },
+        Some(RunState::Absent) if covers => Decision::Dispatch { ci: ci.clone() },
+        _ => Decision::Blocked {
+            reason: "No available provider covers this request".into(),
+        },
     })
 }

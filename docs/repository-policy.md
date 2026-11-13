@@ -47,11 +47,18 @@ observations block dispatch. `active` attaches, `failed` remains failed, and ver
 `succeeded` reuses. `unavailable` means no unresolved submission exists; an outage
 that prevents checking an earlier submission is `unknown`. `cancelled-before-start`
 requires confirmed terminal cancellation and proof no execution began. Only an
-`absent` provider with the requested coverage can receive new work. Execution
-fallback never changes the primary forge or creates a second trigger.
+`absent` primary with the requested coverage can receive new work. The primary is
+the repository's only executor: there is no fallback to turn to, so an unavailable,
+cancelled or unknown primary blocks.
 
-The existing Crow/GitHub dispatcher retains its exact-request receipts, inventory,
+**No CI executor on a mirror forge can be modelled** (operating model R6, R7: no CI runs
+on a mirror). Every executor is `"execution": "owned"` (our own compute); a
+provider-hosted (`free-hosted`) or `paid` executor does not parse; the own CI of a
+mirror forge (`github-actions`, `gitlab-ci`, `bitbucket-pipelines`) is refused as a
+driver; and a repository's `execution_fallbacks` (the one way another forge's executor
+could be named) must be empty or absent: any executor in it is refused. The empty key and
+`free_only` are still accepted, because deployed documents carry them; neither has an effect.
+
+The existing Crow dispatcher retains its exact-request receipts, inventory,
 locking and cancellation checks. These generic policy functions are reusable by
-additional adapters; they are not an autonomous failover service. Paid providers
-are refused by `free_only`; public free hosted execution also requires public,
-nonsensitive source. Owned execution remains available for private repositories.
+additional adapters; they are not an autonomous failover service.

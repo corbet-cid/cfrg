@@ -8,7 +8,7 @@
     "bucket": {"kind": "bitbucket", "url": "https://bucket.example.org"}
   },
   "ci": {
-    "primary": {"driver": "github-actions", "forge": "hub", "execution": "free-hosted", "capabilities": ["linux-x86_64"]},
+    "primary": {"driver": "forgejo-actions", "forge": "hub", "execution": "owned", "capabilities": ["linux-x86_64"]},
     "backup": {"driver": "crow", "forge": "mirror", "execution": "owned", "capabilities": ["linux-x86_64"]}
   },
   "repositories": {
@@ -19,7 +19,6 @@
       "attributes": {"distribution": "public"},
       "locations": {"hub": "team/widget", "mirror": "backup/widget", "lab": "group/subgroup/widget", "bucket": "workspace/widget"},
       "clone_fallbacks": ["mirror", "lab", "bucket"],
-      "execution_fallbacks": ["backup"],
       "promotion": "manual"
     }
   },
