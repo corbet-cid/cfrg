@@ -427,11 +427,12 @@ dependencies = [
 [[package]]
 name = "cghb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=4d13411a224859148cc35a9ecbcb234063d789d4#4d13411a224859148cc35a9ecbcb234063d789d4"
+source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=437548c2ab8741b7a2135daf77a86c89d40259c7#437548c2ab8741b7a2135daf77a86c89d40259c7"
 dependencies = [
  "cfrg",
  "cqlt",
  "octocrab",
+ "secrecy",
  "serde",
  "serde_json",
 ]

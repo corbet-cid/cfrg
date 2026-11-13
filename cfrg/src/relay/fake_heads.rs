@@ -49,6 +49,12 @@ impl HeadHost for FakeHost {
         self.forge
     }
 
+    fn skip_reason(&self, copy_repo: &str) -> Option<String> {
+        copy_repo
+            .starts_with("personal/")
+            .then(|| "personal".to_owned())
+    }
+
     fn site(&mut self, copy_repo: &str) -> Result<Site, ForgeError> {
         if self.forge == Forge::Github {
             return Ok(Site {

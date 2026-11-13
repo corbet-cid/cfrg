@@ -271,3 +271,27 @@ fn git_cli_pushes_exactly_the_named_commit() {
         .unwrap();
     assert_eq!(run(&dst, &["rev-parse", "refs/heads/cforge/github-1"]), sha);
 }
+
+#[test]
+fn a_skipped_copy_is_neither_written_nor_an_error() {
+    let (mut h, w) = setup();
+    let c = Copy {
+        forge: Forge::Gitlab,
+        repo: "personal/proj".into(),
+        base: "main".into(),
+    };
+    let o = Origin {
+        forge: Forge::Github,
+        repo: "org/proj".into(),
+        ..origin("aaa", ReqState::Open)
+    };
+    assert!(matches!(
+        h.sync(&o, std::slice::from_ref(&c))[0].result,
+        Ok(HeadAction::Skipped(_))
+    ));
+    assert!(matches!(
+        h.take_in(&o, &[c], "aaa")[0].result,
+        Ok(HeadAction::Skipped(_))
+    ));
+    assert!(w.borrow().log.is_empty());
+}

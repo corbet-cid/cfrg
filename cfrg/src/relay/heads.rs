@@ -84,6 +84,12 @@ pub struct ReqRef {
 pub trait HeadHost {
     fn forge(&self) -> Forge;
 
+    /// `Some(reason)` when this copy takes no relay head by design (an explicit, reversible skip with one log
+    /// line, not an error).
+    fn skip_reason(&self, _copy_repo: &str) -> Option<String> {
+        None
+    }
+
     /// The place for the head of a request to `copy_repo`. GitHub: the copy itself. GitLab: the fork in
     /// `<group>/cforge`; the subgroup is looked up first and created only when it does not exist, the
     /// fork is created only when it does not exist.
@@ -190,6 +196,8 @@ pub enum HeadAction {
     ClosedLeftover,
     /// Take-in: the request is gone.
     Gone,
+    /// The copy takes no relay head by design.
+    Skipped(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +248,14 @@ impl Heads {
             .hosts
             .get_mut(&copy.forge)
             .ok_or_else(|| outage(copy.forge))?;
+        if let Some(reason) = host.skip_reason(&copy.repo) {
+            eprintln!(
+                "relay: heads skipped on {} {}: {reason}",
+                copy.forge.as_str(),
+                copy.repo
+            );
+            return Ok(HeadAction::Skipped(reason));
+        }
         let branch = branch_name(origin.forge, origin.number);
         let site = host.site(&copy.repo)?;
         let found = host.find_request(&copy.repo, &site, &branch)?;
@@ -347,6 +363,14 @@ impl Heads {
             .hosts
             .get_mut(&copy.forge)
             .ok_or_else(|| outage(copy.forge))?;
+        if let Some(reason) = host.skip_reason(&copy.repo) {
+            eprintln!(
+                "relay: heads skipped on {} {}: {reason}",
+                copy.forge.as_str(),
+                copy.repo
+            );
+            return Ok(HeadAction::Skipped(reason));
+        }
         let branch = branch_name(origin.forge, origin.number);
         let site = host.site(&copy.repo)?;
         let action = match host.find_request(&copy.repo, &site, &branch)? {

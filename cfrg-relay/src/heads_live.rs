@@ -345,52 +345,6 @@ impl HeadHost for GitlabHeads {
 // GitHub
 // ---------------------------------------------------------------------------------------------------------
 
-fn b64url(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for c in bytes.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*c.get(2).unwrap_or(&0));
-        for i in 0..=c.len() {
-            out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
-        }
-    }
-    out
-}
-
-/// An App JWT (RS256, ten minutes) signed with the `openssl` binary; the key is read from `key_file`, never
-/// copied. `now` is the unix time.
-pub fn app_jwt(app_id: u64, key_file: &std::path::Path, now: u64) -> Result<String, ForgeError> {
-    let head = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
-    let claims = b64url(
-        format!(
-            r#"{{"iat":{},"exp":{},"iss":{app_id}}}"#,
-            now - 30,
-            now + 540
-        )
-        .as_bytes(),
-    );
-    let signing = format!("{head}.{claims}");
-    let mut child = Command::new("openssl")
-        .args(["dgst", "-sha256", "-sign"])
-        .arg(key_file)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
-    std::io::Write::write_all(&mut child.stdin.take().expect("piped"), signing.as_bytes())
-        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| ForgeError::Unavailable(e.to_string()))?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Err(ForgeError::Unavailable("the App key could not sign".into()));
-    }
-    Ok(format!("{signing}.{}", b64url(&out.stdout)))
-}
-
 /// The GitHub head host: the head is the branch `cforge/<origin>-<n>` inside the copy. Reads, the branch
 /// delete and the push use the installation token; the pull request is opened and closed by the `cghb`
 /// driver.
@@ -402,32 +356,12 @@ pub struct GithubHeads {
 }
 
 impl GithubHeads {
-    /// Mints an installation token (valid one hour) from the App key file and builds the host.
-    pub fn new(
-        rt: Rc<Runtime>,
-        driver: cghb::relay::GithubRelay,
-        app_id: u64,
-        installation_id: u64,
-        key_file: &std::path::Path,
-    ) -> Result<Self, ForgeError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let jwt = app_jwt(app_id, key_file, now)?;
-        let app = Rest::new(
-            "https://api.github.com",
-            &format!("Authorization: Bearer {jwt}"),
-        )?;
-        let v = app
-            .call_opt(
-                "POST",
-                &format!("app/installations/{installation_id}/access_tokens"),
-                &[],
-            )?
-            .ok_or_else(|| ForgeError::Rejected("installation not found".into()))?;
-        let token = v["token"]
-            .as_str()
-            .ok_or_else(|| ForgeError::Unavailable("no installation token".into()))?
+    /// Takes the installation token from the driver (octocrab authenticates as the App) and builds the host.
+    pub fn new(rt: Rc<Runtime>, driver: cghb::relay::GithubRelay) -> Result<Self, ForgeError> {
+        let token = rt
+            .block_on(driver.installation_token())
+            .map_err(|e| ForgeError::Unavailable(e.to_string()))?
+            .expose()
             .to_owned();
         let rest = Rest::new(
             "https://api.github.com",
@@ -556,15 +490,6 @@ impl HeadHost for GithubHeads {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64url_matches_the_known_vectors() {
-        assert_eq!(b64url(b""), "");
-        assert_eq!(b64url(b"f"), "Zg");
-        assert_eq!(b64url(b"fo"), "Zm8");
-        assert_eq!(b64url(b"foo"), "Zm9v");
-        assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
-    }
 
     #[test]
     fn percent_encoding_keeps_slashes_out_of_paths() {
