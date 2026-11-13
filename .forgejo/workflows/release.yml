@@ -1,0 +1,51 @@
+# Release of cfrg on Forgejo. Runs ONLY when the owner orders it (workflow_dispatch with the tag); never on push or tag.
+# Builds the release binaries (linux x86_64; the macos and windows labels are added when a build there is ordered)
+# and attaches them, with a SHA256SUMS file, to the Forgejo release of that tag (created if absent).
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0 (created on the dispatched commit when absent)"
+        required: true
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  linux-x86_64:
+    runs-on: linux
+    steps:
+      - name: Check out
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          git -c http.extraHeader="Authorization: token ${{ github.token }}" fetch -q --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+      - name: Build
+        env:
+          CFRG_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          cargo build --release --locked -p cfrg-cli -p cfrg-serve
+          mkdir -p dist
+          t=x86_64-unknown-linux-gnu
+          cp target/release/cfrg "dist/cfrg-${{ inputs.tag }}-$t"
+          cp target/release/cfrg-serve "dist/cfrg-serve-${{ inputs.tag }}-$t"
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Publish to the Forgejo release
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          api="${{ github.server_url }}/api/v1/repos/${{ github.repository }}"
+          tag="${{ inputs.tag }}"
+          auth="Authorization: token $TOKEN"
+          if ! curl -fsS -H "$auth" "$api/releases/tags/$tag" >/dev/null 2>&1; then
+            curl -fsS -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"$tag\",\"target_commitish\":\"${{ github.sha }}\",\"name\":\"$tag\"}" "$api/releases" >/dev/null
+          fi
+          id=$(curl -fsS -H "$auth" "$api/releases/tags/$tag" | jq -r .id)
+          for f in dist/*; do
+            curl -fsS -H "$auth" -F "attachment=@$f" "$api/releases/$id/assets?name=$(basename "$f")" >/dev/null
+          done
