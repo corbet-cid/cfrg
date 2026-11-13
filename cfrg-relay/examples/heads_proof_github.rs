@@ -25,7 +25,9 @@ fn main() {
         installation_id: var("PROOF_INSTALLATION_ID").parse().unwrap(),
         private_key_pem: cghb::relay::Redacted::new(var("PROOF_APP_KEY")),
     };
-    let driver = cghb::relay::GithubRelay::new(&creds, "https://api.github.com").unwrap();
+    let driver = rt
+        .block_on(async { cghb::relay::GithubRelay::new(&creds, "https://api.github.com") })
+        .unwrap();
     let fjt = var("PROOF_FORGEJO_TOKEN");
     let mut heads = Heads::new(Box::new(GitCli));
     heads.insert(Box::new(GithubHeads::new(Rc::clone(&rt), driver).unwrap()));
