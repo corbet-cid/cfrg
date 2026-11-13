@@ -10,6 +10,7 @@
 pub mod config;
 pub mod dispatch;
 pub mod event;
+pub mod hooks;
 pub mod http;
 pub mod release;
 pub mod server;

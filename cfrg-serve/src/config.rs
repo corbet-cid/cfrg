@@ -32,6 +32,10 @@ pub struct Config {
     pub release_command: Option<Vec<String>>,
     /// The wiki leg (R40). Absent = a wiki hook is refused.
     pub wiki: Option<WikiConfig>,
+    /// Event hooks (src/hooks): command key (`copy`, `downsync`, `lockrefresh`) -> argv; the job's arguments are appended.
+    /// A hook whose key is absent answers 503.
+    #[serde(default)]
+    pub hook_commands: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub replay: ReplayConfig,
 }

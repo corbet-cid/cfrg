@@ -62,6 +62,7 @@ enum Route {
     Forgejo,
     Github,
     Gitlab,
+    Hook(&'static str),
 }
 
 /// (listener, path) -> route. A listener answers nothing that is not in its rows.
@@ -72,6 +73,7 @@ fn route(listener: &str, path: &str) -> Option<Route> {
         ("internal", "/hooks/forgejo") => Some(Route::Forgejo),
         ("public", "/hooks/github") => Some(Route::Github),
         ("public", "/hooks/gitlab") => Some(Route::Gitlab),
+        ("internal", p) => crate::hooks::lookup(p).map(Route::Hook),
         _ => None,
     }
 }
@@ -91,6 +93,7 @@ pub struct Bridge {
     wiki_pending: Mutex<HashSet<String>>,
     pending: Mutex<HashSet<(String, String)>>,
     last: Mutex<HashMap<(String, String), i32>>,
+    pub(crate) hooks: crate::hooks::Queue,
 }
 
 /// The receiving halves, handed to [`Bridge::run_workers`].
@@ -98,6 +101,7 @@ pub struct Workers {
     release_rx: mpsc::Receiver<(String, String)>,
     dispatch_rx: mpsc::Receiver<DispatchJob>,
     wiki_rx: mpsc::Receiver<String>,
+    hook_rx: mpsc::Receiver<crate::hooks::Job>,
 }
 
 impl Bridge {
@@ -115,6 +119,7 @@ impl Bridge {
             )),
             _ => None,
         };
+        let (hooks, hook_rx) = crate::hooks::Queue::new();
         let ctx = Arc::new(Ctx::new(cfg, creds)?);
         let (release_tx, release_rx) = mpsc::channel(64);
         let (dispatch_tx, dispatch_rx) = mpsc::channel(256);
@@ -129,6 +134,7 @@ impl Bridge {
             wiki_pending: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
             last: Mutex::new(HashMap::new()),
+            hooks,
         });
         Ok((
             bridge,
@@ -136,6 +142,7 @@ impl Bridge {
                 release_rx,
                 dispatch_rx,
                 wiki_rx,
+                hook_rx,
             },
         ))
     }
@@ -159,7 +166,9 @@ impl Bridge {
             mut release_rx,
             mut dispatch_rx,
             mut wiki_rx,
+            hook_rx,
         } = workers;
+        crate::hooks::run(Arc::clone(self), hook_rx);
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
             while let Some((repo, tag)) = release_rx.recv().await {
@@ -292,7 +301,7 @@ fn verified(
     body: &[u8],
 ) -> Result<Option<String>, Reject> {
     match route {
-        Route::Release | Route::Sync | Route::Forgejo => {
+        Route::Release | Route::Sync | Route::Forgejo | Route::Hook(_) => {
             verify::forgejo(creds.get("hmac_forgejo"), headers, body)
         }
         Route::Github => verify::github(creds.get("hmac_github"), headers, body),
@@ -402,6 +411,13 @@ pub async fn handle(bridge: Arc<Bridge>, listener: Arc<str>, request: Request<In
                 return reply(503, "busy");
             }
             reply(202, state)
+        }
+        Route::Hook(hook) => {
+            let (code, text) = crate::hooks::accept(&bridge, hook, &parts.headers, &payload);
+            if code >= 500 {
+                release_key(&replay_key);
+            }
+            reply(code, text)
         }
         Route::Forgejo | Route::Github | Route::Gitlab => {
             let dispatch = match route {
