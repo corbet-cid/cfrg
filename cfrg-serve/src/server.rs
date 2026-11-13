@@ -84,6 +84,7 @@ struct DispatchJob {
 }
 
 pub struct Bridge {
+    allow: crate::allow::Allow,
     ctx: Arc<Ctx>,
     replay: Replay,
     relay: Option<Arc<dyn Relay>>,
@@ -116,11 +117,17 @@ impl Bridge {
             cfg.replay.capacity,
         );
         let (hooks, hook_rx) = crate::hooks::Queue::new();
+        let extra: Vec<&str> = cfg.forge_hosts.iter().skip(1).map(String::as_str).collect();
+        let allow = match &cfg.placement {
+            Some(path) => crate::allow::Allow::load(Path::new(path), &extra)?,
+            None => crate::allow::Allow::default(),
+        };
         let ctx = Arc::new(Ctx::new(cfg, creds)?);
         let (release_tx, release_rx) = mpsc::channel(64);
         let (dispatch_tx, dispatch_rx) = mpsc::channel(256);
         let (wiki_tx, wiki_rx) = mpsc::channel(64);
         let bridge = Arc::new(Self {
+            allow,
             ctx,
             replay,
             relay,
@@ -453,6 +460,16 @@ pub async fn handle(bridge: Arc<Bridge>, listener: Arc<str>, request: Request<In
                     json!({"listener": &*listener, "kind": "wiki", "repository": dispatch.repository}),
                 );
                 return reply(202, "queued");
+            }
+            if !bridge
+                .allow
+                .permits(dispatch.forge, &dispatch.repository, &payload)
+            {
+                log(
+                    "dropped",
+                    json!({"listener": &*listener, "forge": dispatch.forge.as_str(), "repository": dispatch.repository, "reason": "not one of our repositories"}),
+                );
+                return reply(202, "dropped");
             }
             if bridge.relay.is_none() {
                 release_key(&replay_key);

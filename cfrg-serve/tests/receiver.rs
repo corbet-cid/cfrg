@@ -57,6 +57,7 @@ struct Rig {
     bridge: Arc<Bridge>,
     http: Client,
     _stop: watch::Sender<bool>,
+    _placement: tempfile::TempDir,
 }
 
 impl Rig {
@@ -75,6 +76,12 @@ impl Rig {
 
     async fn with(pairs: &[(&str, &str)], tls: Option<&std::path::Path>) -> Rig {
         let w = World::new().await;
+        let placement_file = tempfile::tempdir().unwrap();
+        std::fs::write(
+            placement_file.path().join("placement.json"),
+            placement_text(),
+        )
+        .unwrap();
         let token = gitlab_token();
         let pairs: Vec<(&str, &str)> = pairs
             .iter()
@@ -86,6 +93,7 @@ impl Rig {
             "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
             "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
             "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["corbet-fsl"]},
+            "placement": placement_file.path().join("placement.json"),
                     }))
         .unwrap();
         let recorder = Arc::new(Recorder::default());
@@ -125,6 +133,7 @@ impl Rig {
             bridge,
             http: Client::new(),
             _stop: stop_tx,
+            _placement: placement_file,
         }
     }
 
@@ -170,7 +179,7 @@ impl Rig {
 }
 
 fn github_body() -> Vec<u8> {
-    json!({"action": "opened", "repository": {"id": 4242, "full_name": "x/y"}, "issue": {"number": 7, "title": "SECRET TITLE"}, "sender": {"login": "mallory"}})
+    json!({"action": "opened", "repository": {"id": 4242, "full_name": "corbet-fsl/ccvl", "owner": {"login": "corbet-fsl"}}, "installation": {"account": {"login": "corbet-fsl"}}, "issue": {"number": 7, "title": "SECRET TITLE"}, "sender": {"login": "mallory"}})
         .to_string()
         .into_bytes()
 }
@@ -818,4 +827,96 @@ async fn the_service_speaks_tls_1_3_only_and_still_checks_the_signature() {
         .send()
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn events_of_foreign_installations_and_repositories_are_dropped_with_a_202() {
+    let rig = Rig::new().await;
+    // GitHub: a signed event from an installation on a foreign account.
+    let foreign_installation = json!({"action": "opened", "repository": {"id": 4242, "owner": {"login": "corbet-fsl"}}, "installation": {"account": {"login": "mallory"}}, "issue": {"number": 7}})
+        .to_string()
+        .into_bytes();
+    assert_eq!(
+        rig.post(
+            &rig.public,
+            "/hooks/github",
+            &github_headers("ghkey", &foreign_installation, "x1", "issues"),
+            &foreign_installation
+        )
+        .await,
+        (202, "dropped".into())
+    );
+    // GitHub: our installation, a repository of a foreign owner.
+    let foreign_repo = json!({"action": "opened", "repository": {"id": 99, "full_name": "mallory/x", "owner": {"login": "mallory"}}, "installation": {"account": {"login": "corbet-fsl"}}, "issue": {"number": 7}})
+        .to_string()
+        .into_bytes();
+    assert_eq!(
+        rig.post(
+            &rig.public,
+            "/hooks/github",
+            &github_headers("ghkey", &foreign_repo, "x2", "issues"),
+            &foreign_repo
+        )
+        .await,
+        (202, "dropped".into())
+    );
+    // GitLab: a project that is not in the relay's repository set.
+    let project =
+        json!({"object_kind": "issue", "project": {"id": 999}, "object_attributes": {"iid": 1}})
+            .to_string()
+            .into_bytes();
+    assert_eq!(
+        rig.post(
+            &rig.public,
+            "/hooks/gitlab",
+            &gitlab_headers("g1", now(), &project),
+            &project
+        )
+        .await,
+        (202, "dropped".into())
+    );
+    // Forgejo: a repository id outside the set.
+    let issue = json!({"action": "opened", "repository": {"id": 12345}, "issue": {"number": 2}})
+        .to_string()
+        .into_bytes();
+    let sign = [
+        ("x-forgejo-signature", forgejo_sig("s3cret", &issue)),
+        ("x-forgejo-event", "issues".into()),
+    ];
+    assert_eq!(
+        rig.post(&rig.internal, "/hooks/forgejo", &sign, &issue)
+            .await,
+        (202, "dropped".into())
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        rig.dispatches().is_empty(),
+        "no relay work for a foreign event"
+    );
+    // The drop happens before the relay check: it is the same answer when no relay is configured.
+    let bare = Rig::with(&[("hmac_github", "ghkey")], None).await;
+    assert_eq!(
+        bare.post(
+            &bare.public,
+            "/hooks/github",
+            &github_headers("ghkey", &foreign_installation, "x1", "issues"),
+            &foreign_installation
+        )
+        .await,
+        (202, "dropped".into())
+    );
+    // Our own event still goes through.
+    let body = github_body();
+    assert_eq!(
+        rig.post(
+            &rig.public,
+            "/hooks/github",
+            &github_headers("ghkey", &body, "ok1", "issues"),
+            &body
+        )
+        .await
+        .0,
+        202
+    );
+    assert_eq!(rig.dispatched(1).await.len(), 1);
 }

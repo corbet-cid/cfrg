@@ -570,3 +570,26 @@ fn gitlab(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
         _ => json_resp(404, json!({"message": "not found"})),
     }
 }
+
+/// A placement with one relayed repository: Forgejo 8, GitHub 4242 (corbet-fsl/ccvl), GitLab 55.
+pub fn placement_text() -> String {
+    let dest = |provider: &str, host: &str, id: &str, path: &str, ns: &str| {
+        format!(
+            r#"{{"provider":"{provider}","endpoint":{{"origin":"https://{host}","token_env":"T"}},"path":"{path}","namespace":"{ns}","repository_id":"{id}",
+            "mirror_user":"u","password_env":"T","use_ssh":false,"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}}"#
+        )
+    };
+    format!(
+        r#"{{"native":{{"schema":1,"source":{{"origin":"https://forge.corbet.ch","token_env":"T"}},"repositories":[
+        {{"path":"corbet-fsl/ccvl","source_id":8,"private":false,"default_branch":"main","content":"profile","hold":null,"destinations":[{},{}]}}],
+        "contributed":[]}}}}"#,
+        dest(
+            "github",
+            "api.github.com",
+            "4242",
+            "corbet-fsl/ccvl",
+            "corbet-fsl"
+        ),
+        dest("gitlab", "gitlab.com", "55", "corbet-fsl/ccvl", "2")
+    )
+}

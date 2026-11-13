@@ -7,6 +7,7 @@
 //! Events only: there is no timer and no polling (R30). One attempt per event; the next event completes the rest.
 #![forbid(unsafe_code)]
 
+pub mod allow;
 pub mod config;
 pub mod event;
 pub mod hooks;
