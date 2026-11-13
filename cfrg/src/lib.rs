@@ -44,6 +44,7 @@ pub mod serve;
 pub mod status;
 pub mod switch;
 pub mod sync;
+pub mod sync_hint;
 
 pub(crate) fn failure(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     io::Error::other(message.into()).into()

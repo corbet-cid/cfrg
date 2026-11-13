@@ -196,3 +196,150 @@ fn held_tags_are_neither_pushed_nor_compared_while_branches_keep_flowing() {
         "v1"
     );
 }
+
+/// The forge router keeps relay pull request heads on the copy under `refs/heads/cforge/` (ccid wiki "Forge-router" §4): a flush
+/// leaves them alone, does not count them (the repository is in sync afterwards, so it is not pushed again on every flush), never
+/// pushes a primary branch of that namespace, and hints the forge bridge about each tag it brought to the copy (R45).
+#[test]
+fn a_relay_head_on_the_copy_survives_the_flush_and_each_arriving_tag_is_hinted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("dest/o")).unwrap();
+    git(root, &["init", "-q", "--bare", "src.git"]);
+    git(root, &["init", "-q", "--bare", "dest/o/r.git"]);
+    git(root, &["init", "-q", "work"]);
+    let work = root.join("work");
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "old"]);
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            "../dest/o/r.git",
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/cforge/gitlab-7",
+        ],
+    );
+    let relay = git(
+        root,
+        &["-C", "dest/o/r.git", "rev-parse", "cforge/gitlab-7"],
+    );
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "new"]);
+    git(&work, &["tag", "v1"]);
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            "../src.git",
+            "HEAD:refs/heads/main",
+            "HEAD:refs/heads/cforge/own",
+            "refs/tags/v1",
+        ],
+    );
+
+    // curl stands in for the bridge: it records its arguments and the signature it was given, and answers 202.
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = root.join("curl");
+    fs::write(
+        bin.join("curl"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.args'\nprintf '%s' \"$CFRG_SYNC_HINT_SIGNATURE\" > '{0}.sig'\nprintf 202\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("curl"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(
+        root.join("cfg.json"),
+        serde_json::json!({
+            "repos": {"o/r": {"lane": "bulk", "source": root.join("src.git")}},
+            "state_dir": root.join("state"),
+            "paused_dir": root.join("paused"),
+            "kill_switch": root.join("kill"),
+            "quiet_fill": false,
+            "sync_hint": {"url": "https://bridge.test/hooks/sync", "key_env": "CFRG_TEST_HINT_KEY"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let flush = |args: &[&str]| -> serde_json::Value {
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = Command::new(env!("CARGO_BIN_EXE_cfrg"))
+            .current_dir(root)
+            .args(["gate", "--config", "cfg.json", "--origin"])
+            .arg(format!("file://{}", root.join("dest").display()))
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("CFRG_GITHUB_TOKEN", "dummy")
+            .env("CFRG_TEST_HINT_KEY", "k")
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    flush(&["enqueue", "o/r"]);
+    let done = flush(&["flush", "--execute"]);
+    assert_eq!(done["flush"][0]["verdict"], "pushed", "{done}");
+    assert_eq!(
+        done["flush"][0]["sync_hints"],
+        serde_json::json!([{"tag": "v1", "status": 202}])
+    );
+    let dest = |rev: &str| {
+        git(
+            root,
+            &["-C", "dest/o/r.git", "rev-parse", "--verify", "-q", rev],
+        )
+    };
+    assert_eq!(
+        dest("main"),
+        git(root, &["-C", "src.git", "rev-parse", "main"])
+    );
+    assert_eq!(dest("v1"), git(root, &["-C", "src.git", "rev-parse", "v1"]));
+    assert_eq!(
+        dest("cforge/gitlab-7"),
+        relay,
+        "the relay head is untouched"
+    );
+    assert!(
+        git(
+            root,
+            &[
+                "-C",
+                "dest/o/r.git",
+                "for-each-ref",
+                "refs/heads/cforge/own"
+            ]
+        )
+        .is_empty(),
+        "a primary branch in the relay namespace is never pushed"
+    );
+
+    // The hint is the bridge's interface: the body names repository and tag, the signature is its HMAC with the key.
+    let args = fs::read_to_string(format!("{}.args", log.display())).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let body = args[args.iter().position(|a| *a == "--data-binary").unwrap() + 1];
+    assert_eq!(body, r#"{"repository":"o/r","tag":"v1"}"#);
+    assert_eq!(*args.last().unwrap(), "https://bridge.test/hooks/sync");
+    let sig = fs::read_to_string(format!("{}.sig", log.display())).unwrap();
+    assert!(cfrg::serve::verify_signature(b"k", body.as_bytes(), &sig));
+    assert!(
+        !args.iter().any(|a| a.contains(&sig)),
+        "the signature never enters argv"
+    );
+
+    // The relay head does not count: the next flush finds the repository in sync instead of pushing it again.
+    flush(&["enqueue", "o/r"]);
+    let again = flush(&["flush", "--execute"]);
+    assert_eq!(again["flush"][0]["verdict"], "in sync, dequeued", "{again}");
+}

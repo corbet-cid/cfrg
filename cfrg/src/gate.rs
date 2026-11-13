@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::Result;
+use crate::{sync_hint::SyncHint, Result};
 
 pub const HOUR: u64 = 3600;
 pub const DAY: u64 = 86_400;
@@ -130,6 +130,10 @@ pub struct Config {
     pub paused_dir: PathBuf,
     /// This directory exists = nothing is written to GitHub at all.
     pub kill_switch: PathBuf,
+    /// The tag hint to the forge bridge (operating model R45, [`crate::sync_hint`]): after a push that brought a tag to
+    /// GitHub, `/hooks/sync` is told about each such tag. Absent = no hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_hint: Option<SyncHint>,
 }
 
 fn quiet_fill_default() -> bool {
@@ -141,6 +145,9 @@ impl Config {
         let config: Self = serde_json::from_str(&fs::read_to_string(path)?)?;
         for name in config.repos.keys() {
             split(name)?;
+        }
+        if let Some(hint) = &config.sync_hint {
+            hint.validate()?;
         }
         Ok(config)
     }
@@ -685,6 +692,7 @@ mod tests {
             kill_switch: "/k".into(),
             quiet_fill: true,
             hold_tags: false,
+            sync_hint: None,
         };
         let mut queue = Vec::new();
         enqueue(&mut queue, "o/bulk-new", 30);

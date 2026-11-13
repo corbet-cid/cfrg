@@ -265,12 +265,31 @@ fn refs(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The refs that count for a repository: branches and tags, or branches only while the operator holds tags.
+/// The forge router's namespace on a copy: the heads of its relay pull requests (ccid wiki "Forge-router" §4). The gate never
+/// pushes into it (the negative refspec also excludes a primary branch of that name) and never counts it, so a relay head on
+/// GitHub neither keeps a repository out of sync nor is touched by a push.
+const RELAY_PREFIX: &str = "refs/heads/cforge/";
+const RELAY_EXCLUDED: &str = "^refs/heads/cforge/*";
+
+/// The refs that count for a repository: branches and tags, or branches only while the operator holds tags; never the relay's
+/// namespace, on either side.
 fn counted(mut refs: BTreeMap<String, String>, hold_tags: bool) -> BTreeMap<String, String> {
-    if hold_tags {
-        refs.retain(|name, _| !name.starts_with("refs/tags/"));
-    }
+    refs.retain(|name, _| {
+        !name.starts_with(RELAY_PREFIX) && !(hold_tags && name.starts_with("refs/tags/"))
+    });
     refs
+}
+
+/// The tags the push brings to GitHub: on the source, and not at that object on GitHub before the push (new or moved).
+fn arriving_tags(
+    local: &BTreeMap<String, String>,
+    remote: Option<&BTreeMap<String, String>>,
+) -> Vec<String> {
+    local
+        .iter()
+        .filter(|(name, sha)| remote.and_then(|r| r.get(*name)) != Some(*sha))
+        .filter_map(|(name, _)| name.strip_prefix("refs/tags/").map(String::from))
+        .collect()
 }
 
 fn base64(input: &[u8]) -> String {
@@ -1248,6 +1267,7 @@ fn flush(
         if !config.hold_tags {
             push_args.push("refs/tags/*:refs/tags/*".into());
         }
+        push_args.push(RELAY_EXCLUDED.into());
         let pushed = Runner::new(
             entry.source.clone(),
             environment.clone(),
@@ -1352,7 +1372,21 @@ fn flush(
         match (pushed, lfs) {
             (Ok(_), Ok(())) => {
                 queue.retain(|q| q.repo != name);
-                report.push(json!({"repo": name, "verdict": "pushed", "lane": entry.lane, "refs_changed": changed}));
+                let mut row = json!({"repo": name, "verdict": "pushed", "lane": entry.lane, "refs_changed": changed});
+                // R45: each tag that just reached GitHub may complete a release there; a failed hint never fails the push.
+                if let Some(hint) = &config.sync_hint {
+                    let hints: Vec<Value> = arriving_tags(&local, remote.as_ref())
+                        .into_iter()
+                        .map(|tag| match hint.send(&name, &tag) {
+                            Ok(status) => json!({"tag": tag, "status": status}),
+                            Err(e) => json!({"tag": tag, "error": e.to_string()}),
+                        })
+                        .collect();
+                    if !hints.is_empty() {
+                        row["sync_hints"] = Value::Array(hints);
+                    }
+                }
+                report.push(row);
             }
             (pushed, lfs) => {
                 let error = pushed
@@ -1399,6 +1433,28 @@ mod tests {
         let map = refs(text);
         assert_eq!(map.len(), 2);
         assert_eq!(map["refs/heads/main"], "aaa");
+    }
+
+    #[test]
+    fn the_relay_namespace_never_counts_and_held_tags_drop_out() {
+        let map = refs("a refs/heads/main\nb refs/heads/cforge/gitlab-7\nc refs/heads/cforgeish\nd refs/tags/v1\n");
+        let names = |m: BTreeMap<String, String>| m.into_keys().collect::<Vec<_>>();
+        assert_eq!(
+            names(counted(map.clone(), false)),
+            ["refs/heads/cforgeish", "refs/heads/main", "refs/tags/v1"]
+        );
+        assert_eq!(
+            names(counted(map, true)),
+            ["refs/heads/cforgeish", "refs/heads/main"]
+        );
+    }
+
+    #[test]
+    fn arriving_tags_are_the_new_and_the_moved_ones() {
+        let local = refs("a refs/heads/main\n1 refs/tags/v1\n2 refs/tags/v2\n3 refs/tags/v3\n");
+        let remote = refs("1 refs/tags/v1\nold refs/tags/v2\n");
+        assert_eq!(arriving_tags(&local, Some(&remote)), ["v2", "v3"]);
+        assert_eq!(arriving_tags(&local, None), ["v1", "v2", "v3"]);
     }
 
     #[test]
