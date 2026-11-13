@@ -19,7 +19,6 @@ runs_on = "linux"
 checks = ["test"]
 workflow = "ci"
 command = ["bash", ".ci/run-job.sh"]
-events = ["manual"]
 
 [jobs.build]
 scheduler = "forgejo"
