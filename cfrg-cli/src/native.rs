@@ -198,18 +198,20 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     }
     let contributed = cfrg::contributed::Contributed::from_placement(&placement, &[])?;
     let contributed_paths = contributed.source_paths();
-    if options.repository.as_ref().is_some_and(|path| {
-        !placement.repositories.iter().any(|r| r.path == *path)
+    // `--provider copy` runs the copy pass alone; it covers every repository the forge lists, declared or not.
+    let copy_only = options.provider.as_deref() == Some("copy");
+    if !copy_only
+        && options.repository.as_ref().is_some_and(|path| {
+            !placement.repositories.iter().any(|r| r.path == *path)
             // Forgejo paths are case-insensitive and the contributed list is held in lowercase.
             && !contributed_paths.iter().any(|p| p.eq_ignore_ascii_case(path))
-    }) {
+        })
+    {
         return Err("Selected repository is not declared".into());
     }
     let mut io = Http::open(&options.state, options.apply)?;
     let mut report = Vec::new();
     let mut incomplete = false;
-    // `--provider copy` runs the copy pass alone.
-    let copy_only = options.provider.as_deref() == Some("copy");
     if copy_only && placement.copy.is_none() {
         return Err("The placement declares no copy".into());
     }
@@ -707,7 +709,14 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
         } else {
             &mut none
         };
-        let (rows, open) = copy::reconcile(copy, &placement.source, &mut io, receiver, write)?;
+        let (rows, open) = copy::reconcile(
+            copy,
+            &placement.source,
+            &mut io,
+            receiver,
+            write,
+            options.repository.as_deref(),
+        )?;
         report.extend(rows);
         incomplete |= open;
         Ok(())

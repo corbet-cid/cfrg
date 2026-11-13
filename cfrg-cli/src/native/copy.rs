@@ -179,10 +179,20 @@ pub fn reconcile(
     io: &mut dyn Transport,
     receiver: &mut dyn Receiver,
     write: bool,
+    only: Option<&str>,
 ) -> Result<(Vec<Value>, bool)> {
     let mut report = Vec::new();
     let mut incomplete = false;
     let mut repositories = list_repositories(io, source)?;
+    // `only`: the one repository of an event (cfrg serve's /hooks/copy). Every step below is per repository (an admission
+    // replaces only the key line tagged for its path), so a pass over one repository leaves the others as they are.
+    if let Some(only) = only {
+        repositories.retain(|r| r.path.eq_ignore_ascii_case(only));
+        if repositories.is_empty() {
+            report.push(json!({"source": only, "state": "not-listed"}));
+            return Ok((report, true));
+        }
+    }
     for repo in &mut repositories {
         repo.has_wiki = repo.has_wiki && wiki_exists(io, source, &repo.path)?;
     }
@@ -415,7 +425,7 @@ mod tests {
             .repo(3, "org/old", false, true);
         let mut host = Host::default();
         let (rows, incomplete) =
-            reconcile(&copy(), &source(), &mut forge, &mut host, true).unwrap();
+            reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert!(!incomplete);
         let states: Vec<_> = rows
             .iter()
@@ -451,10 +461,57 @@ mod tests {
         forge.writes.clear();
         host.lines.clear();
         let (rows, incomplete) =
-            reconcile(&copy(), &source(), &mut forge, &mut host, true).unwrap();
+            reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert!(!incomplete && forge.writes.is_empty());
         assert_eq!(rows[0]["state"], "current");
         assert_eq!(host.lines.len(), 3 + 2);
+    }
+
+    #[test]
+    fn one_repository_of_an_event_touches_only_that_repository() {
+        let mut forge =
+            Forge::default()
+                .repo(1, "Org/Wiki", true, false)
+                .repo(2, "org/plain", false, false);
+        let mut host = Host::default();
+        let (rows, incomplete) = reconcile(
+            &copy(),
+            &source(),
+            &mut forge,
+            &mut host,
+            true,
+            Some("org/PLAIN"),
+        )
+        .unwrap();
+        assert!(!incomplete);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0]["source"].as_str(), rows[0]["state"].as_str()),
+            (Some("org/plain"), Some("created"))
+        );
+        assert_eq!(forge.writes, ["create org/plain"]);
+        assert_eq!(
+            host.lines,
+            [
+                "ensure org/plain main 0",
+                "admit org/plain ssh-ed25519 KEY1"
+            ]
+        );
+
+        // A repository the forge does not list is reported, and nothing is sent.
+        forge.writes.clear();
+        host.lines.clear();
+        let (rows, incomplete) = reconcile(
+            &copy(),
+            &source(),
+            &mut forge,
+            &mut host,
+            true,
+            Some("org/gone"),
+        )
+        .unwrap();
+        assert!(incomplete && forge.writes.is_empty() && host.lines.is_empty());
+        assert_eq!(rows[0]["state"], "not-listed");
     }
 
     #[test]
@@ -463,13 +520,13 @@ mod tests {
         let mut forge = Forge::default().repo(1, "org/late", true, false);
         forge.mirror("org/late", "ssh://10.0.42.6/org/late.git", "10m0s");
         let mut host = Host::default();
-        let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true).unwrap();
+        let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert_eq!(rows[0]["state"], "replaced");
         assert_eq!(forge.writes, ["delete org/late", "create org/late"]);
         assert_eq!(forge.mirrors["org/late"].len(), 1);
         // Once the twin exists the same mirror is left alone.
         forge.writes.clear();
-        reconcile(&copy(), &source(), &mut forge, &mut host, true).unwrap();
+        reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert!(forge.writes.is_empty());
     }
 
@@ -482,7 +539,7 @@ mod tests {
         forge.mirror("org/new", "ssh://10.0.42.6/org/old.git", "10m0s");
         forge.mirror("org/slow", "ssh://10.0.42.6/org/slow.git", "1h0m0s");
         let mut host = Host::default();
-        let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true).unwrap();
+        let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert!(rows.iter().all(|r| r["state"] == "replaced"));
         assert_eq!(
             forge.mirrors["org/new"][0]["remote_address"],
@@ -490,7 +547,7 @@ mod tests {
         );
 
         forge.mirror("org/new", "ssh://10.0.42.6/org/new.git", "10m0s");
-        assert!(reconcile(&copy(), &source(), &mut forge, &mut host, true).is_err());
+        assert!(reconcile(&copy(), &source(), &mut forge, &mut host, true, None).is_err());
     }
 
     #[test]
@@ -500,7 +557,7 @@ mod tests {
             .repo(2, "org/b", true, false);
         forge.mirror("org/a", "ssh://10.0.42.6/org/a.git", "10m0s");
         let (rows, incomplete) =
-            reconcile(&copy(), &source(), &mut forge, &mut NoReceiver, false).unwrap();
+            reconcile(&copy(), &source(), &mut forge, &mut NoReceiver, false, None).unwrap();
         assert!(incomplete && forge.writes.is_empty());
         assert_eq!(
             (rows[0]["state"].as_str(), rows[1]["state"].as_str()),
