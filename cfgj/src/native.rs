@@ -295,6 +295,74 @@ pub fn address_matches(mirror: &Value, url: &str) -> bool {
     clean.as_deref() == Some(url)
 }
 
+/// What the Actions unit of a contributed repository on the source forge is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionsState {
+    /// The repository does not exist (yet): nothing runs.
+    Absent,
+    /// Actions are off.
+    Off,
+    /// Actions are ON and were left so (a plan, or a read-only pass): the repository's own workflows would run.
+    On,
+    /// Actions were on and were switched off by this call.
+    Disabled,
+}
+
+impl ActionsState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// Keep Forgejo Actions off for one contributed repository (operating model R10, R11). A fork carries the upstream's
+/// workflows (Forgejo reads `.github` when there is no `.forgejo`), so with Actions on, their CI would run on our
+/// runners. Reads the repository; with `write`, switches the unit off and reads the result back.
+pub fn contributed_actions(
+    io: &mut dyn Transport,
+    endpoint: &Endpoint,
+    path: &str,
+    write: bool,
+) -> Result<ActionsState> {
+    cfrg::native::path(path, false)?;
+    let request = |method: &'static str, body: Option<Value>| Request {
+        endpoint: endpoint.clone(),
+        auth: Auth::Token,
+        method,
+        path: format!("/api/v1/repos/{path}"),
+        body,
+        scope: format!("{}/api", endpoint.origin),
+        creation: false,
+    };
+    let enabled = |value: &Value| -> Result<bool> {
+        value["has_actions"]
+            .as_bool()
+            .ok_or_else(|| "Forgejo response misses boolean has_actions".into())
+    };
+    let response = io.send(request("GET", None))?;
+    if response.status == 404 {
+        return Ok(ActionsState::Absent);
+    }
+    if !enabled(&expect(response, &[200])?)? {
+        return Ok(ActionsState::Off);
+    }
+    if !write {
+        return Ok(ActionsState::On);
+    }
+    let edited = expect(
+        io.send(request("PATCH", Some(json!({"has_actions": false}))))?,
+        &[200],
+    )?;
+    if enabled(&edited)? {
+        return Err(format!("Forgejo kept Actions on for {path}").into());
+    }
+    Ok(ActionsState::Disabled)
+}
+
 /// Forgejo reports an interval as a Go duration (`10m0s`, `1h0m0s`).
 pub fn duration_seconds(value: &str) -> Option<u64> {
     let mut total = 0u64;
@@ -468,5 +536,121 @@ mod tests {
             Some("abc")
         );
         assert_eq!(api.head(&mut Branch(404), "ci/topic").unwrap(), None);
+    }
+
+    struct Script {
+        replies: Vec<(u16, Value)>,
+        seen: Vec<(String, String, Option<Value>)>,
+    }
+    impl Transport for Script {
+        fn send(&mut self, request: Request) -> Result<cfrg::native::http::Response> {
+            self.seen.push((
+                request.method.to_owned(),
+                request.path.clone(),
+                request.body.clone(),
+            ));
+            assert!(
+                matches!(request.auth, Auth::Token) && !request.creation,
+                "an Actions switch is an ordinary token call"
+            );
+            let (status, body) = self.replies.remove(0);
+            Ok(cfrg::native::http::Response { status, body })
+        }
+    }
+    fn script(replies: Vec<(u16, Value)>) -> Script {
+        Script {
+            replies,
+            seen: Vec::new(),
+        }
+    }
+    fn forge() -> Endpoint {
+        Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "TOKEN".into(),
+        }
+    }
+
+    #[test]
+    fn a_contributed_repository_that_does_not_exist_runs_nothing() {
+        let mut io = script(vec![(404, json!({}))]);
+        let state = contributed_actions(&mut io, &forge(), "me/their-project", true).unwrap();
+        assert_eq!(state, ActionsState::Absent);
+        assert_eq!(io.seen.len(), 1);
+        assert_eq!(io.seen[0].0, "GET");
+    }
+
+    #[test]
+    fn actions_that_are_off_are_left_alone_even_when_writing() {
+        let mut io = script(vec![(200, json!({"has_actions": false}))]);
+        let state = contributed_actions(&mut io, &forge(), "me/their-project", true).unwrap();
+        assert_eq!(state, ActionsState::Off);
+        assert_eq!(
+            io.seen.len(),
+            1,
+            "no write for a switch that is already off"
+        );
+    }
+
+    #[test]
+    fn a_plan_reports_actions_that_are_on_and_changes_nothing() {
+        let mut io = script(vec![(200, json!({"has_actions": true}))]);
+        let state = contributed_actions(&mut io, &forge(), "me/their-project", false).unwrap();
+        assert_eq!(state, ActionsState::On);
+        assert_eq!(io.seen.len(), 1);
+        assert_eq!(io.seen[0].0, "GET");
+    }
+
+    #[test]
+    fn actions_that_are_on_are_switched_off_and_read_back() {
+        let mut io = script(vec![
+            (200, json!({"has_actions": true})),
+            (200, json!({"has_actions": false})),
+        ]);
+        let state = contributed_actions(&mut io, &forge(), "me/their-project", true).unwrap();
+        assert_eq!(state, ActionsState::Disabled);
+        assert_eq!(
+            io.seen,
+            vec![
+                ("GET".into(), "/api/v1/repos/me/their-project".into(), None),
+                (
+                    "PATCH".into(),
+                    "/api/v1/repos/me/their-project".into(),
+                    Some(json!({"has_actions": false}))
+                ),
+            ],
+            "the only change is the Actions switch"
+        );
+    }
+
+    #[test]
+    fn a_switch_that_forgejo_does_not_keep_is_an_error() {
+        let mut io = script(vec![
+            (200, json!({"has_actions": true})),
+            (200, json!({"has_actions": true})),
+        ]);
+        let error = contributed_actions(&mut io, &forge(), "me/their-project", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("kept Actions on"), "{error}");
+    }
+
+    #[test]
+    fn an_answer_without_the_switch_is_an_error_not_a_guess() {
+        let mut io = script(vec![(200, json!({"full_name": "me/their-project"}))]);
+        assert!(contributed_actions(&mut io, &forge(), "me/their-project", true).is_err());
+        let mut io = script(vec![(500, json!({}))]);
+        assert!(contributed_actions(&mut io, &forge(), "me/their-project", true).is_err());
+    }
+
+    #[test]
+    fn a_path_that_is_not_owner_and_repository_sends_nothing() {
+        for path in ["../x", "me", "me/a/b", "me/their project", ""] {
+            let mut io = script(vec![]);
+            assert!(
+                contributed_actions(&mut io, &forge(), path, true).is_err(),
+                "{path}"
+            );
+            assert!(io.seen.is_empty(), "{path}");
+        }
     }
 }

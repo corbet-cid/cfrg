@@ -27,8 +27,9 @@ See [repository placement](docs/repository-policy.md),
 [reconciliation](docs/forge-sync.md), [native statuses](docs/native-status.md), [landing](docs/land.md), [serve](docs/serve.md), [release](docs/release.md),
 [contribution bridge](docs/pr-bridge.md), [evidence collection](docs/collect.md),
 [repository contents](docs/contents.md), [observe](docs/observe.md),
-[access mirroring](docs/access-sync.md), [the GitHub write gate](docs/gate.md) and
-[replication with any primary and the primary switch](docs/switch.md).
+[access mirroring](docs/access-sync.md), [the GitHub write gate](docs/gate.md),
+[replication with any primary and the primary switch](docs/switch.md) and
+[contributed projects](docs/contributed.md) (never mirrored or relayed, Actions kept off).
 
 The Rust library forbids unsafe code. `CFRG_SOURCE_REVISION` is embedded at
 build time like ccid's revision. No scheduler, check executor or service is

@@ -111,11 +111,11 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     {
         return Err("Plan and status cannot apply changes".into());
     }
-    if options
-        .repository
-        .as_ref()
-        .is_some_and(|path| !placement.repositories.iter().any(|r| r.path == *path))
-    {
+    let contributed = cfrg::contributed::Contributed::from_placement(&placement, &[])?;
+    let contributed_paths = contributed.source_paths();
+    if options.repository.as_ref().is_some_and(|path| {
+        !placement.repositories.iter().any(|r| r.path == *path) && !contributed_paths.contains(path)
+    }) {
         return Err("Selected repository is not declared".into());
     }
     let mut io = Http::open(&options.state, options.apply)?;
@@ -127,6 +127,20 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
         return Err("The placement declares no copy".into());
     }
     let result = (|| -> Result<()> {
+        // Contributed projects (operating model R10, R11) have no mirror, and their copies on our forge run no CI of
+        // ours: the Actions unit stays off, or the upstream's own workflows would run on our runners. First, so that
+        // no error on an owned repository below can skip it.
+        if !copy_only && options.provider.is_none() {
+            incomplete |= contributed_actions(
+                &mut io,
+                &placement.source,
+                &contributed_paths,
+                options.operation,
+                options.apply,
+                options.repository.as_deref(),
+                &mut report,
+            );
+        }
         for declared in placement.repositories.iter().filter(|_| !copy_only) {
             if options
                 .repository
@@ -541,6 +555,54 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
         Ok(())
     });
     Ok((report, incomplete, result))
+}
+
+/// The Actions pass over the contributed repositories of the source forge (operating model R10, R11). Reads each one;
+/// only `reconcile --apply` switches Actions off. `names`, `rename` and `sync-now` do not concern these repositories
+/// and send nothing. `only` selects one repository.
+///
+/// True when something is open: Actions left on, a repository that is declared but cannot be found (a wrong path, or
+/// one this credential cannot see: Forgejo answers 404 for both, and neither is "safe"), or one that failed to answer.
+/// One failing repository never stops the others.
+fn contributed_actions(
+    io: &mut dyn cfrg::native::http::Transport,
+    source: &cfrg::native::Endpoint,
+    paths: &[String],
+    operation: Operation,
+    apply: bool,
+    only: Option<&str>,
+    report: &mut Vec<Value>,
+) -> bool {
+    if matches!(
+        operation,
+        Operation::Names | Operation::Rename | Operation::SyncNow
+    ) {
+        return false;
+    }
+    let write = apply && operation == Operation::Reconcile;
+    let mut open = false;
+    for path in paths
+        .iter()
+        .filter(|path| only.is_none_or(|only| only == path.as_str()))
+    {
+        match cfgj::native::contributed_actions(io, source, path, write) {
+            Ok(state) => {
+                open |= matches!(
+                    state,
+                    cfgj::native::ActionsState::On | cfgj::native::ActionsState::Absent
+                );
+                report
+                    .push(json!({"source":path, "state":"contributed", "actions":state.as_str()}));
+            }
+            Err(error) => {
+                open = true;
+                report.push(
+                    json!({"source":path, "state":"contributed", "actions":"error", "error":error.to_string()}),
+                );
+            }
+        }
+    }
+    open
 }
 
 /// `--operation names`: compare the names of one repository and its destinations.
@@ -1031,5 +1093,213 @@ mod tests {
         );
         assert_eq!(report[1]["from"], "team/old");
         assert_eq!(report[3]["pinned"], true);
+    }
+
+    struct Forge {
+        actions: std::collections::BTreeMap<String, bool>,
+        seen: Vec<(String, String)>,
+    }
+    impl cfrg::native::http::Transport for Forge {
+        fn send(
+            &mut self,
+            request: cfrg::native::http::Request,
+        ) -> Result<cfrg::native::http::Response> {
+            self.seen
+                .push((request.method.to_owned(), request.path.clone()));
+            let name = request.path.trim_start_matches("/api/v1/repos/").to_owned();
+            let Some(state) = self.actions.get_mut(&name) else {
+                return Ok(cfrg::native::http::Response {
+                    status: 404,
+                    body: json!({}),
+                });
+            };
+            if request.method == "PATCH" {
+                *state = request
+                    .body
+                    .as_ref()
+                    .and_then(|b| b["has_actions"].as_bool())
+                    .unwrap();
+            }
+            Ok(cfrg::native::http::Response {
+                status: 200,
+                body: json!({"has_actions": *state}),
+            })
+        }
+    }
+    fn forge(on: &[&str], off: &[&str]) -> Forge {
+        Forge {
+            actions: on
+                .iter()
+                .map(|p| ((*p).to_owned(), true))
+                .chain(off.iter().map(|p| ((*p).to_owned(), false)))
+                .collect(),
+            seen: Vec::new(),
+        }
+    }
+    fn source() -> cfrg::native::Endpoint {
+        cfrg::native::Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "T".into(),
+        }
+    }
+    fn paths() -> Vec<String> {
+        vec!["me/a".into(), "me/b".into()]
+    }
+    fn pass(
+        io: &mut Forge,
+        operation: Operation,
+        apply: bool,
+        only: Option<&str>,
+    ) -> (bool, Vec<Value>) {
+        let mut report = Vec::new();
+        let open =
+            contributed_actions(io, &source(), &paths(), operation, apply, only, &mut report);
+        (open, report)
+    }
+    fn writes(io: &Forge) -> usize {
+        io.seen.iter().filter(|(method, _)| method != "GET").count()
+    }
+
+    #[test]
+    fn a_plan_and_a_status_read_the_actions_switch_and_report_it_as_open() {
+        for operation in [Operation::Plan, Operation::Status] {
+            let mut io = forge(&["me/a"], &["me/b"]);
+            let (left_on, report) = pass(&mut io, operation, false, None);
+            assert!(left_on, "Actions that are on make the run incomplete");
+            assert_eq!(
+                report,
+                vec![
+                    json!({"source":"me/a","state":"contributed","actions":"on"}),
+                    json!({"source":"me/b","state":"contributed","actions":"off"}),
+                ]
+            );
+            assert_eq!(writes(&io), 0);
+            assert!(io.actions["me/a"], "a read-only pass changes nothing");
+        }
+    }
+
+    #[test]
+    fn reconcile_without_apply_changes_nothing() {
+        let mut io = forge(&["me/a", "me/b"], &[]);
+        let (left_on, _) = pass(&mut io, Operation::Reconcile, false, None);
+        assert!(left_on);
+        assert_eq!(writes(&io), 0);
+    }
+
+    #[test]
+    fn reconcile_with_apply_switches_actions_off_and_nothing_else() {
+        let mut io = forge(&["me/a", "me/b"], &[]);
+        let (left_on, report) = pass(&mut io, Operation::Reconcile, true, None);
+        assert!(!left_on, "nothing is left on");
+        assert!(!io.actions["me/a"]);
+        assert!(!io.actions["me/b"]);
+        assert_eq!(
+            writes(&io),
+            2,
+            "one PATCH for each repository that had Actions on"
+        );
+        assert!(
+            report.contains(&json!({"source":"me/a","state":"contributed","actions":"disabled"}))
+        );
+        // Run again: already off, no further write.
+        let before = io.seen.len();
+        let (left_on, report) = pass(&mut io, Operation::Reconcile, true, None);
+        assert!(!left_on);
+        assert_eq!(writes(&io), 2);
+        assert_eq!(
+            io.seen.len() - before,
+            2,
+            "one read for each repository, nothing more"
+        );
+        assert!(report.contains(&json!({"source":"me/a","state":"contributed","actions":"off"})));
+    }
+
+    #[test]
+    fn the_operations_that_do_not_concern_these_repositories_send_nothing() {
+        for operation in [Operation::Names, Operation::Rename, Operation::SyncNow] {
+            for apply in [false, true] {
+                let mut io = forge(&["me/a"], &[]);
+                let (left_on, report) = pass(&mut io, operation, apply, None);
+                assert!(!left_on && report.is_empty() && io.seen.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn one_repository_can_be_selected() {
+        let mut io = forge(&["me/a", "me/b"], &[]);
+        let (left_on, report) = pass(&mut io, Operation::Reconcile, true, Some("me/b"));
+        assert!(!left_on);
+        assert_eq!(
+            report,
+            vec![json!({"source":"me/b","state":"contributed","actions":"disabled"})]
+        );
+        assert!(io.actions["me/a"], "the others are left alone");
+        let mut io = forge(&["me/a"], &[]);
+        let (_, report) = pass(&mut io, Operation::Status, false, Some("me/unlisted"));
+        assert!(report.is_empty() && io.seen.is_empty());
+    }
+
+    #[test]
+    fn a_declared_repository_that_cannot_be_found_leaves_the_run_open() {
+        // Forgejo answers 404 for a repository that does not exist and for one this credential cannot see: neither
+        // is "safe".
+        let mut io = forge(&[], &["me/b"]);
+        let mut report = Vec::new();
+        let open = contributed_actions(
+            &mut io,
+            &source(),
+            &["me/b".into(), "me/hidden".into()],
+            Operation::Reconcile,
+            true,
+            None,
+            &mut report,
+        );
+        assert!(open);
+        assert_eq!(
+            report,
+            vec![
+                json!({"source":"me/b","state":"contributed","actions":"off"}),
+                json!({"source":"me/hidden","state":"contributed","actions":"absent"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_failing_repository_does_not_stop_the_others() {
+        struct Flaky(Forge);
+        impl cfrg::native::http::Transport for Flaky {
+            fn send(
+                &mut self,
+                request: cfrg::native::http::Request,
+            ) -> Result<cfrg::native::http::Response> {
+                if request.path.ends_with("me/broken") {
+                    return Ok(cfrg::native::http::Response {
+                        status: 500,
+                        body: json!({}),
+                    });
+                }
+                self.0.send(request)
+            }
+        }
+        let mut io = Flaky(forge(&["me/a"], &[]));
+        let mut report = Vec::new();
+        let open = contributed_actions(
+            &mut io,
+            &source(),
+            &["me/broken".into(), "me/a".into()],
+            Operation::Reconcile,
+            true,
+            None,
+            &mut report,
+        );
+        assert!(open, "an error leaves the run open");
+        assert_eq!(report[0]["actions"], "error");
+        assert_eq!(
+            report[1],
+            json!({"source":"me/a","state":"contributed","actions":"disabled"}),
+            "the next repository was still handled"
+        );
+        assert!(!io.0.actions["me/a"]);
     }
 }

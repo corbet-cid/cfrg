@@ -26,6 +26,22 @@ pub struct Placement {
     /// repositories, so a new repository is covered without a placement edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy: Option<Copy>,
+    /// Someone else's projects that we contribute to (operating model R10, R11): never mirrored, relayed or released
+    /// by us, and their copies on our forge run no Actions. See `docs/contributed.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributed: Vec<ContributedProject>,
+}
+
+/// One contributed project: its own repository, and our copies of it on any forge (ours included).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContributedProject {
+    /// A plain lowercase name, unique; the list is in strictly ascending order.
+    pub name: String,
+    /// `https://host/owner/repo` of the project itself.
+    pub upstream: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forks: Vec<String>,
 }
 
 /// The receiver of the copy. Forgejo's own SSH push mirrors do the transfer; cfrg
@@ -281,6 +297,8 @@ impl Placement {
         if let Some(copy) = &self.copy {
             copy.validate()?;
         }
+        // The declaration of contributed projects, and that none of them has a mirror destination (R11).
+        crate::contributed::Contributed::from_placement(self, &[])?;
         let mut sources = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for repo in &self.repositories {
