@@ -14,6 +14,7 @@ use cfrg::{
     native::{
         http::{Http, Transport},
         links::{self, PublicGithub},
+        owned_by,
         settings::{self, Field, Observed, Plan, Target},
         Endpoint, Placement, Provider,
     },
@@ -69,6 +70,7 @@ struct Count {
     changed: u32,
     held: u32,
     errors: u32,
+    not_owned: u32,
     by_field: BTreeMap<String, u32>,
     held_by: BTreeMap<String, u32>,
     unsupported: BTreeMap<String, u32>,
@@ -77,7 +79,7 @@ struct Count {
 impl Count {
     fn to_json(&self) -> Value {
         json!({"copies":self.copies, "absent":self.absent, "converged":self.converged,
-            "to_change":self.to_change, "changed":self.changed, "held":self.held, "errors":self.errors,
+            "to_change":self.to_change, "changed":self.changed, "held":self.held, "errors":self.errors, "not_owned":self.not_owned,
             "changes_by_field":self.by_field, "held_by_reason":self.held_by, "unsupported":self.unsupported})
     }
 }
@@ -142,6 +144,9 @@ pub fn run(options: &Options) -> Result<()> {
         // has wiki pages at all (read once, only when a link needs it).
         let mut github_public: Option<(String, bool)> = None;
         let mut wiki_pages: Option<bool> = None;
+        // The push mirrors Forgejo holds for this primary, read once and only for an apply: a
+        // copy is written only when one of them is ours (`owned_by`, R56) and points at it.
+        let mut mirrors_cache: Option<Vec<Value>> = None;
         for (provider, name, origin, token_env) in PROVIDERS {
             if options.provider.as_deref().is_some_and(|only| only != name) {
                 continue;
@@ -279,6 +284,38 @@ pub fn run(options: &Options) -> Result<()> {
                 count.to_change += 1;
                 if !write {
                     return Ok(row(&primary.path, name, &path, "planned", &plan, None));
+                }
+                if mirrors_cache.is_none() {
+                    mirrors_cache = Some(match declared {
+                        Some(repo) => {
+                            let mut live = repo.clone();
+                            live.path = primary.path.clone();
+                            cfgj::native::Mirrors {
+                                endpoint: &placement.source,
+                                repository: &live,
+                            }
+                            .list(&mut io)
+                            .inspect_err(|_| on_primary = true)?
+                        }
+                        None => Vec::new(),
+                    });
+                }
+                let owned = declared.is_some_and(|repo| {
+                    let mut live = repo.clone();
+                    live.path = primary.path.clone();
+                    let wanted =
+                        format!("{}/{}", copy_host(provider, &target.endpoint.origin), path);
+                    mirrors_cache.iter().flatten().any(|m| {
+                        owned_by(&live, placement.copy.as_ref(), m)
+                            && m["remote_address"]
+                                .as_str()
+                                .and_then(cfrg::replicate::address_of)
+                                .is_some_and(|a| a.eq_ignore_ascii_case(&wanted))
+                    })
+                });
+                if !owned {
+                    count.not_owned += 1;
+                    return Ok(row(&primary.path, name, &path, "not-owned", &plan, None));
                 }
                 if let Some(why) =
                     refused(options, provider, &org, hold.as_deref(), written, budget)
@@ -426,6 +463,19 @@ fn github_wiki_repo_exists(path: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The host a copy's address on this forge starts with (as `address_of` prints it).
+fn copy_host(provider: Provider, origin: &str) -> String {
+    match provider {
+        Provider::Github => "github.com".into(),
+        Provider::Bitbucket => "bitbucket.org".into(),
+        Provider::Gitlab => origin
+            .split_once("://")
+            .map_or(origin, |(_, rest)| rest)
+            .trim_end_matches('/')
+            .to_ascii_lowercase(),
+    }
 }
 
 /// Why a write must wait, if it must. GitHub honours the write gate's files.
