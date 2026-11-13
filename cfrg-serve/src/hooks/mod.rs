@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 pub mod copy;
 pub mod downsync;
+pub mod gate;
 pub mod lockrefresh;
 
 /// One unit of work: run `hook_commands[command]` with `args` appended.
@@ -32,6 +33,7 @@ type Planner = fn(&HeaderMap, &Value) -> Option<Job>;
 const HOOKS: &[(&str, Planner)] = &[
     (copy::PATH, copy::plan),
     (downsync::PATH, downsync::plan),
+    (gate::PATH, gate::plan),
     (lockrefresh::PATH, lockrefresh::plan),
 ];
 
