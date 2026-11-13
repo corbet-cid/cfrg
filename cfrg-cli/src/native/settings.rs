@@ -448,6 +448,10 @@ mod tests {
             identities: None,
             copies_from: None,
             operator: None,
+            wiki_key: None,
+            wiki_known_hosts: None,
+            wiki_max_pushes: 20,
+            wiki_push_gap_secs: 2,
         }
     }
 

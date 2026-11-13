@@ -87,6 +87,8 @@ pub struct Bridge {
     dispatcher: Option<Dispatcher>,
     release_tx: mpsc::Sender<(String, String)>,
     dispatch_tx: mpsc::Sender<DispatchJob>,
+    wiki_tx: mpsc::Sender<String>,
+    wiki_pending: Mutex<HashSet<String>>,
     pending: Mutex<HashSet<(String, String)>>,
     last: Mutex<HashMap<(String, String), i32>>,
 }
@@ -95,6 +97,7 @@ pub struct Bridge {
 pub struct Workers {
     release_rx: mpsc::Receiver<(String, String)>,
     dispatch_rx: mpsc::Receiver<DispatchJob>,
+    wiki_rx: mpsc::Receiver<String>,
 }
 
 impl Bridge {
@@ -115,12 +118,15 @@ impl Bridge {
         let ctx = Arc::new(Ctx::new(cfg, creds)?);
         let (release_tx, release_rx) = mpsc::channel(64);
         let (dispatch_tx, dispatch_rx) = mpsc::channel(256);
+        let (wiki_tx, wiki_rx) = mpsc::channel(64);
         let bridge = Arc::new(Self {
             ctx,
             replay,
             dispatcher,
             release_tx,
             dispatch_tx,
+            wiki_tx,
+            wiki_pending: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
             last: Mutex::new(HashMap::new()),
         });
@@ -129,6 +135,7 @@ impl Bridge {
             Workers {
                 release_rx,
                 dispatch_rx,
+                wiki_rx,
             },
         ))
     }
@@ -151,6 +158,7 @@ impl Bridge {
         let Workers {
             mut release_rx,
             mut dispatch_rx,
+            mut wiki_rx,
         } = workers;
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
@@ -182,6 +190,35 @@ impl Bridge {
                     "done",
                     json!({"kind": "release", "repo": repo, "tag": tag, "exit": exit}),
                 );
+            }
+        });
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(repository) = wiki_rx.recv().await {
+                // A hook that arrives while this runs queues one more pass, which is a no-op when nothing changed.
+                bridge
+                    .wiki_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&repository);
+                let worker = Arc::clone(&bridge);
+                let id = repository.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::wiki::sync(&worker.ctx.cfg, &worker.ctx.creds, &id)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+                match result {
+                    Ok(report) => log(
+                        "done",
+                        json!({"kind": "wiki", "repository": repository, "report": report}),
+                    ),
+                    Err(error) => log(
+                        "failed",
+                        json!({"kind": "wiki", "repository": repository, "error": error}),
+                    ),
+                }
             }
         });
         let bridge = Arc::clone(self);
@@ -375,6 +412,38 @@ pub async fn handle(bridge: Arc<Bridge>, listener: Arc<str>, request: Request<In
             let Some(dispatch) = dispatch else {
                 return reply(200, "ignored");
             };
+            if dispatch.kind == "wiki" {
+                if bridge.ctx.cfg.wiki.is_none() {
+                    release_key(&replay_key);
+                    return reply(503, "the wiki leg is not configured");
+                }
+                let first = bridge
+                    .wiki_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(dispatch.repository.clone());
+                if !first {
+                    return reply(202, "duplicate");
+                }
+                if bridge
+                    .wiki_tx
+                    .try_send(dispatch.repository.clone())
+                    .is_err()
+                {
+                    bridge
+                        .wiki_pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&dispatch.repository);
+                    release_key(&replay_key);
+                    return reply(503, "busy");
+                }
+                log(
+                    "accepted",
+                    json!({"listener": &*listener, "kind": "wiki", "repository": dispatch.repository}),
+                );
+                return reply(202, "queued");
+            }
             if bridge.dispatcher.is_none() {
                 release_key(&replay_key);
                 log(

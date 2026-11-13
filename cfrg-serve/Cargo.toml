@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 cfrg.workspace = true
+cfgj.workspace = true
 base64 = "0.22"
 bytes = "1"
 hex = "0.4"

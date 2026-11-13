@@ -30,6 +30,8 @@ pub struct Config {
     /// Run the release upload as this external command (argv; `OWNER/REPO TAG` are appended) instead of inside the
     /// service, for example a locked unit elsewhere. Absent = inline. The service then holds no provider key.
     pub release_command: Option<Vec<String>>,
+    /// The wiki leg (R40). Absent = a wiki hook is refused.
+    pub wiki: Option<WikiConfig>,
     #[serde(default)]
     pub replay: ReplayConfig,
 }
@@ -99,6 +101,17 @@ fn relay_yml() -> String {
 
 fn main_ref() -> String {
     "main".into()
+}
+
+/// Where the wiki leg keeps its state and finds its deploy key (the key's private half is a mounted Secret file,
+/// its public half sits beside it as `<key>.pub`). The API tokens come from the credentials directory, by the
+/// placement's `token_env` names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WikiConfig {
+    pub state: String,
+    pub key: String,
+    pub known_hosts: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

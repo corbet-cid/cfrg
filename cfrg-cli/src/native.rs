@@ -2,6 +2,7 @@ mod copy;
 mod members;
 mod protection;
 mod settings;
+mod wiki;
 
 use cfrg::{
     native::{
@@ -55,6 +56,18 @@ pub struct Options {
     /// `members` only: the login that is never touched (default julian-corbet).
     #[arg(long)]
     operator: Option<String>,
+    /// `wiki` only: the SSH deploy key (private half; `<key>.pub` beside it) used to push the copy wikis.
+    #[arg(long)]
+    wiki_key: Option<PathBuf>,
+    /// `wiki` only: the known_hosts file the push verifies the host against.
+    #[arg(long)]
+    wiki_known_hosts: Option<PathBuf>,
+    /// `wiki` only: push to at most this many copies in one run (default 20).
+    #[arg(long, default_value_t = 20)]
+    wiki_max_pushes: usize,
+    /// `wiki` only: seconds to wait between two pushes (default 2).
+    #[arg(long, default_value_t = 2)]
+    wiki_push_gap_secs: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Operation {
@@ -79,6 +92,9 @@ enum Operation {
     /// R43: is the default branch of every copy held for the mirroring alone? Read-only; needs
     /// `--copies-from` (the report of a `settings` run).
     Protection,
+    /// R40: push the Forgejo wiki to every GitLab copy (fast-forward only; a diverged copy is
+    /// held). Read-only without `--apply`.
+    Wiki,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -86,6 +102,7 @@ pub fn run(options: Options) -> Result<()> {
         Operation::Settings => return settings::run(&options),
         Operation::Members => return members::run(&options),
         Operation::Protection => return protection::run(&options),
+        Operation::Wiki => return wiki::run(&options),
         _ => {}
     }
     let (report, incomplete, result) = execute(&options)?;
@@ -120,6 +137,10 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         identities: None,
         copies_from: None,
         operator: None,
+        wiki_key: None,
+        wiki_known_hosts: None,
+        wiki_max_pushes: 20,
+        wiki_push_gap_secs: 2,
     };
     let (report, incomplete, result) = execute(&options)?;
     result?;
@@ -143,6 +164,10 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         identities: None,
         copies_from: None,
         operator: None,
+        wiki_key: None,
+        wiki_known_hosts: None,
+        wiki_max_pushes: 20,
+        wiki_push_gap_secs: 2,
     };
     let (report, incomplete, result) = execute(&options)?;
     result?;

@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod http;
 pub mod links;
 pub mod settings;
+pub mod wiki;
+pub mod wiki_sync;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

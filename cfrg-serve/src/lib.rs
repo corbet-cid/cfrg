@@ -14,3 +14,4 @@ pub mod http;
 pub mod release;
 pub mod server;
 pub mod verify;
+pub mod wiki;

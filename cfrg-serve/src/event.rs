@@ -12,7 +12,7 @@ pub struct Dispatch {
     pub forge: Forge,
     /// The forge's immutable repository id (RF14), as text.
     pub repository: String,
-    /// `issue` or `contribution`.
+    /// `issue`, `contribution`, or `wiki` (a Forgejo wiki changed; number 0, action `changed`; R40).
     pub kind: &'static str,
     pub number: u64,
     /// `changed`, `deleted` or `comment_deleted:<comment id>`.
@@ -33,6 +33,9 @@ impl Dispatch {
 
     /// The hint `cfrg relay apply` reads: the dispatch in the relay's own type, so the two cannot drift apart.
     pub fn hint(&self) -> Result<Hint, String> {
+        if self.kind == "wiki" {
+            return Err("a wiki event is not a relay hint".into());
+        }
         let action = match self.action.as_str() {
             "changed" => HintAction::Changed,
             "deleted" => HintAction::Deleted,
@@ -159,11 +162,18 @@ pub fn github(headers: &HeaderMap, payload: &Value) -> Option<Dispatch> {
 }
 
 pub fn forgejo(headers: &HeaderMap, payload: &Value) -> Option<Dispatch> {
-    github_like(
-        Forge::Forgejo,
-        header(headers, &["x-forgejo-event", "x-gitea-event"])?,
-        payload,
-    )
+    let event = header(headers, &["x-forgejo-event", "x-gitea-event"])?;
+    if event == "wiki" {
+        // Any page created, edited or deleted: the wiki leg re-reads the wiki head, so only the repository matters.
+        return Some(Dispatch {
+            forge: Forge::Forgejo,
+            repository: id_text(payload.pointer("/repository/id")?)?,
+            kind: "wiki",
+            number: 0,
+            action: "changed".to_owned(),
+        });
+    }
+    github_like(Forge::Forgejo, event, payload)
 }
 
 /// GitLab: `object_kind` in the body (the header `X-Gitlab-Event` carries the same word as a title).
@@ -248,6 +258,20 @@ mod tests {
         assert_eq!((d.kind, d.number), ("contribution", 3));
         assert!(github(&with("x-github-event", "push"), &pull).is_none());
         assert!(github(&HeaderMap::new(), &pull).is_none());
+    }
+
+    #[test]
+    fn forgejo_wiki_hook_is_a_wiki_dispatch_and_only_there() {
+        let wiki =
+            json!({"action":"edited","repository":{"id":9},"page":"Home","sender":{"login":"x"}});
+        let d = forgejo(&with("x-forgejo-event", "wiki"), &wiki).unwrap();
+        assert_eq!(
+            (d.kind, d.number, d.action.as_str(), d.repository.as_str()),
+            ("wiki", 0, "changed", "9")
+        );
+        assert_eq!(d.inputs().len(), 5);
+        assert!(d.hint().is_err());
+        assert!(github(&with("x-github-event", "wiki"), &wiki).is_none());
     }
 
     #[test]
