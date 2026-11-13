@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cfrg", "cfrg-cli", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
+members = ["cfrg", "cfrg-cli", "cfrg-serve", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
 
 [workspace.package]
 edition = "2021"

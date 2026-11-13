@@ -1,0 +1,40 @@
+[package]
+name = "cfrg-serve"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Webhook receiver and release upload of the cfrg bridge: verify the signature, start the Forgejo workflow, upload releases to the copies"
+repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
+
+[[bin]]
+name = "cfrg-serve"
+path = "src/main.rs"
+
+[dependencies]
+cfrg.workspace = true
+base64 = "0.22"
+bytes = "1"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { version = "1.54.1", features = ["rt", "net", "process", "macros", "sync", "time", "fs", "io-util", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
