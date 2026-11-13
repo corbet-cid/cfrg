@@ -2,7 +2,7 @@
 //! `flush` is a dry run unless `--execute` is given. The write credential is read from the environment variable named by
 //! `--token-env` at the last moment and goes to git through the environment, never through arguments or files.
 use cfrg::{
-    gate::{self, Config, Deny, Entry, Kind, Ledger, Queued},
+    gate::{self, Config, Deny, Divergence, Entry, Hold, Kind, Ledger, Lfs, Queued},
     process::Runner,
     Environment, Result,
 };
@@ -212,6 +212,8 @@ fn status(config: &Config) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let mut diverged = gate::load_diverged(&config.state_dir)?;
+    diverged.retain(|name, _| config.repos.contains_key(name));
     let b = &config.budgets;
     let hour = now.saturating_sub(gate::HOUR);
     let day = now.saturating_sub(gate::DAY);
@@ -220,6 +222,9 @@ fn status(config: &Config) -> Result<Value> {
         "hold_tags": config.hold_tags,
         "paused": paused,
         "queue": queue,
+        "max_prune": config.max_prune,
+        // Repositories the gate holds back (diverged copy, too many copy-only branches, a rejected push): `diverged.json`.
+        "diverged": diverged,
         "pushes": {"hour": count(&entries, hour, Kind::Push), "hour_budget": b.pushes_per_hour,
                    "day": count(&entries, day, Kind::Push), "day_budget": b.pushes_per_day},
         "created": {"day": count(&entries, day, Kind::Create), "day_budget": b.new_repos_per_day},
@@ -252,30 +257,45 @@ fn auth_environment(token: &str) -> Environment {
     ])
 }
 
-/// refname to object name, from `for-each-ref` output or `ls-remote` output (peeled tag lines dropped).
+/// refname to object name, from `for-each-ref` output or `ls-remote` output (peeled tag lines and the `ref:` line of `--symref`
+/// dropped).
 fn refs(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter_map(|l| {
             let (sha, name) = l.split_once(char::is_whitespace)?;
             let name = name.trim();
-            (!name.ends_with("^{}")
+            (sha != "ref:"
+                && !name.ends_with("^{}")
                 && (name.starts_with("refs/heads/") || name.starts_with("refs/tags/")))
             .then(|| (name.to_string(), sha.to_string()))
         })
         .collect()
 }
 
-/// The forge router's namespace on a copy: the heads of its relay pull requests (ccid wiki "Forge-router" §4). The gate never
-/// pushes into it (the negative refspec also excludes a primary branch of that name) and never counts it, so a relay head on
-/// GitHub neither keeps a repository out of sync nor is touched by a push.
-const RELAY_PREFIX: &str = "refs/heads/cforge/";
-const RELAY_EXCLUDED: &str = "^refs/heads/cforge/*";
+/// The destination's default branch from `ls-remote --symref <url> HEAD`: the line `ref: refs/heads/main<TAB>HEAD`.
+fn default_branch(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+            ["ref:", target, "HEAD"] => Some(target.to_string()),
+            _ => None,
+        })
+}
+
+/// Whether the destination refused the push. `git push --porcelain` lists every refused ref on stdout as `!<TAB>from:to<TAB>[rejected]
+/// (reason)` or `[remote rejected] (reason)`, and `Runner` keeps that stdout behind the first line of the error. A transport failure
+/// in the middle of a push also exits 1 (a remote helper that dies does) but lists no ref, so the status lines are the signal, not
+/// the exit status: only a refusal is held until a ref changes, a network failure is tried again by the next flush.
+fn rejected(error: &str) -> bool {
+    error.lines().any(|l| {
+        l.starts_with("!\t") && (l.contains("[rejected]") || l.contains("[remote rejected]"))
+    })
+}
 
 /// The refs that count for a repository: branches and tags, or branches only while the operator holds tags; never the relay's
 /// namespace, on either side.
 fn counted(mut refs: BTreeMap<String, String>, hold_tags: bool) -> BTreeMap<String, String> {
     refs.retain(|name, _| {
-        !name.starts_with(RELAY_PREFIX) && !(hold_tags && name.starts_with("refs/tags/"))
+        !name.starts_with(gate::RELAY_PREFIX) && !(hold_tags && name.starts_with("refs/tags/"))
     });
     refs
 }
@@ -1069,6 +1089,13 @@ fn flush(
         Some(token) => auth_environment(token),
         None => git_env(&[]),
     };
+    let mut diverged = gate::load_diverged(&config.state_dir)?;
+    // A repository that left the configuration (held, renamed, retired) has no hold of its own any more.
+    let listed = diverged.len();
+    diverged.retain(|name, _| config.repos.contains_key(name));
+    if execute && diverged.len() != listed {
+        gate::save_diverged(&config.state_dir, &diverged)?;
+    }
     let mut report = Vec::new();
     for Queued { repo: name, .. } in order {
         let (org, repo) = gate::split(&name)?;
@@ -1095,7 +1122,8 @@ fn flush(
                 true,
             )?;
         let local = counted(refs(&local), config.hold_tags);
-        if local.is_empty() {
+        // A source without any branch pushes nothing and never prunes: an empty or broken copy must not empty a destination.
+        if !local.keys().any(|n| n.starts_with("refs/heads/")) {
             report.push(json!({"repo": name, "verdict": "source has no branches yet"}));
             continue;
         }
@@ -1110,15 +1138,18 @@ fn flush(
             &[
                 "git".into(),
                 "ls-remote".into(),
+                "--symref".into(),
                 url.clone(),
+                "HEAD".into(),
                 "refs/heads/*".into(),
                 "refs/tags/*".into(),
             ],
             true,
         )
-        .ok()
-        .map(|t| counted(refs(&t), config.hold_tags));
-        let mut remote = remote;
+        .ok();
+        // The destination's default branch is never pruned: GitHub refuses to delete it, which would fail the whole atomic push.
+        let default_branch = remote.as_deref().and_then(default_branch);
+        let mut remote = remote.map(|t| counted(refs(&t), config.hold_tags));
         let mut created = false;
         if remote.is_none() {
             // The destination does not exist. Creation is its own budgeted mutation; with --create the fill does it here.
@@ -1196,9 +1227,62 @@ fn flush(
                 continue;
             }
         }
-        if remote.as_ref() == Some(&local) {
+        let destination = remote.clone().unwrap_or_default();
+        // What a push would do, decided locally and without spending anything: a branch of the destination that is not an
+        // ancestor of the source's is a divergence, which the source's own object database tells (a tip it lacks cannot be one).
+        let plan = gate::plan(
+            &local,
+            &destination,
+            default_branch.as_deref(),
+            |theirs, ours| {
+                Runner::new(entry.source.clone(), git_env(&[]), Duration::from_secs(60))
+                    .and_then(|runner| {
+                        runner.with_stderr_events().without_child_stderr().run(
+                            &[
+                                "git".into(),
+                                "merge-base".into(),
+                                "--is-ancestor".into(),
+                                theirs.into(),
+                                ours.into(),
+                            ],
+                            true,
+                        )
+                    })
+                    .is_ok()
+            },
+        );
+        let fingerprint = plan.fingerprint(&local, &destination);
+        // R3: a copy that a push without force cannot bring to the primary's state has diverged. It is held and reported, and no
+        // push slot is spent on it (the 2026-11-13 ccvl copy burned 37 slots on a push that could only fail). Reading the
+        // destination is free, so the hold clears itself the flush after the cause is gone.
+        if let Some((hold, names)) = plan.hold(config.max_prune) {
+            let record = Divergence::new(diverged.get(&name), now(), hold, names, fingerprint);
+            report.push(json!({"repo": name, "verdict": format!("held: diverged from the primary ({}); not pushed, see status", hold.text()),
+                               "diverged": record}));
+            if execute {
+                diverged.insert(name.clone(), record);
+                gate::save_diverged(&config.state_dir, &diverged)?;
+            }
+            continue;
+        }
+        // The destination rejected exactly this push before: it is not repeated until a ref it names changes (R30: nothing
+        // retries on a clock; a new commit on the primary or a change on the destination is the event).
+        let rejected_before = diverged
+            .get(&name)
+            .filter(|d| d.hold == Hold::PushRejected && d.fingerprint == fingerprint)
+            .cloned();
+        // Whatever held the repository before is gone, except a rejection of this very push.
+        if rejected_before.is_none() && diverged.remove(&name).is_some() && execute {
+            gate::save_diverged(&config.state_dir, &diverged)?;
+        }
+        if plan.is_empty() {
             queue.retain(|q| q.repo != name);
             report.push(json!({"repo": name, "verdict": "in sync, dequeued"}));
+            continue;
+        }
+        if let Some(previous) = rejected_before {
+            report.push(json!({"repo": name, "verdict": "held: the destination rejected this exact push; not repeated until a ref changes",
+                               "diverged": previous}));
             continue;
         }
         let now = now();
@@ -1216,12 +1300,13 @@ fn flush(
             }
             continue;
         }
-        let changed = local
-            .iter()
-            .filter(|(k, v)| remote.as_ref().and_then(|r| r.get(*k)) != Some(*v))
-            .count();
+        let changed = plan.updates.len();
         if !execute {
-            report.push(json!({"repo": name, "verdict": "would push", "lane": entry.lane, "refs_changed": changed}));
+            let mut row = json!({"repo": name, "verdict": "would push", "lane": entry.lane, "refs_changed": changed});
+            if !plan.prune.is_empty() {
+                row["pruned"] = json!(plan.prune);
+            }
+            report.push(row);
             continue;
         }
         let token = token
@@ -1257,26 +1342,47 @@ fn flush(
             ensure_actions_disabled(config, org, &api, token, repo)?;
         }
         let environment = auth_environment(token);
-        let mut push_args: Vec<String> = vec![
-            "git".into(),
-            "push".into(),
-            "--quiet".into(),
-            url.clone(),
-            "refs/heads/*:refs/heads/*".into(),
-        ];
-        if !config.hold_tags {
-            push_args.push("refs/tags/*:refs/tags/*".into());
-        }
-        push_args.push(RELAY_EXCLUDED.into());
+        // Push exactly what was planned: every changed ref by its object name, so a branch the primary moves or recreates after the plan
+        // was made can neither slip in nor (a deletion refspec beats a glob for the same ref) be deleted by accident. The copy-only
+        // branches go in the same push as deletions (R3), each under a lease on the object the plan saw. Tags, `refs/pull/*` and the
+        // relay's namespace are never named.
+        //  --atomic     every ref or none: a rejected ref can no longer leave the copy half updated (the 2026-11-13 ccvl push
+        //               landed a tag and three branches while `main` failed)
+        //  --no-verify  no pre-push hook of the source: the one `git lfs install` writes would upload LFS payloads (R4)
+        //  --porcelain  the destination's refusals are listed per ref on stdout; `rejected` reads them
+        let mut push_args: Vec<String> = [
+            "git",
+            "push",
+            "--quiet",
+            "--porcelain",
+            "--atomic",
+            "--no-verify",
+        ]
+        .map(String::from)
+        .into();
+        push_args.extend(
+            plan.prune
+                .iter()
+                .map(|branch| format!("--force-with-lease={branch}:{}", destination[branch])),
+        );
+        push_args.push(url.clone());
+        push_args.extend(
+            plan.updates
+                .iter()
+                .map(|name| format!("{}:{name}", local[name])),
+        );
+        push_args.extend(plan.prune.iter().map(|branch| format!(":{branch}")));
         let pushed = Runner::new(
             entry.source.clone(),
             environment.clone(),
             Duration::from_secs(900),
         )?
         .with_stderr_events()
+        .with_output_in_errors()
         .run(&push_args, true);
-        // LFS objects do not travel with the ref push: without them the destination holds pointers only.
-        let lfs = if pushed.is_ok() {
+        // R4: LFS payloads are not replicated to a copy; the push carries the pointer files. Only a repository that declares
+        // `"lfs": "payload"` gets its objects uploaded after a successful push.
+        let lfs = if pushed.is_ok() && entry.lfs == Lfs::Payload {
             let listed = Runner::new(
                 entry.source.clone(),
                 environment.clone(),
@@ -1373,6 +1479,9 @@ fn flush(
             (Ok(_), Ok(())) => {
                 queue.retain(|q| q.repo != name);
                 let mut row = json!({"repo": name, "verdict": "pushed", "lane": entry.lane, "refs_changed": changed});
+                if !plan.prune.is_empty() {
+                    row["pruned"] = json!(plan.prune);
+                }
                 // R45: each tag that just reached GitHub may complete a release there; a failed hint never fails the push.
                 if let Some(hint) = &config.sync_hint {
                     let hints: Vec<Value> = arriving_tags(&local, remote.as_ref())
@@ -1389,14 +1498,37 @@ fn flush(
                 report.push(row);
             }
             (pushed, lfs) => {
+                let rejection = pushed
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| rejected(&e.to_string()));
                 let error = pushed
                     .err()
                     .or_else(|| lfs.err())
                     .map(|e| e.to_string())
                     .unwrap_or_default();
                 let text = error;
-                report.push(json!({"repo": name, "verdict": "push failed"}));
-                if blocked(&text) {
+                if rejection {
+                    // Nothing was pushed (atomic) and the destination said no: hold this exact push, keep the queue entry.
+                    let refs = plan.updates.iter().chain(&plan.prune).cloned().collect();
+                    let record = Divergence::new(
+                        diverged.get(&name),
+                        now,
+                        Hold::PushRejected,
+                        refs,
+                        fingerprint.clone(),
+                    );
+                    report.push(
+                        json!({"repo": name, "verdict": "push rejected; held until a ref changes",
+                                       "diverged": record}),
+                    );
+                    diverged.insert(name.clone(), record);
+                    gate::save_diverged(&config.state_dir, &diverged)?;
+                } else {
+                    report.push(json!({"repo": name, "verdict": "push failed"}));
+                }
+                // The first line only: the rest is the push's stdout (ref names, a branch called `fix-403`).
+                if blocked(text.lines().next().unwrap_or_default()) {
                     std::fs::create_dir_all(config.paused_dir.join(org))?;
                     gate::save_queue(&config.state_dir, &queue)?;
                     println!(
@@ -1447,6 +1579,23 @@ mod tests {
             names(counted(map, true)),
             ["refs/heads/cforgeish", "refs/heads/main"]
         );
+    }
+
+    #[test]
+    fn only_a_listed_refusal_is_a_rejection_not_a_failed_transport() {
+        // What `Runner` reports for `git push --porcelain` that the destination refused: the first line, then the status lines.
+        let refused = "git failed: exit status: 1\nTo https://github.com/o/r.git\n!\tabc:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n";
+        assert!(rejected(refused));
+        let hook =
+            "git failed: exit status: 1\n!\tabc:refs/heads/x\t[remote rejected] (hook declined)\n";
+        assert!(rejected(hook));
+        // A transport that dies mid-push exits 1 too, and lists nothing.
+        assert!(!rejected("git failed: exit status: 1"));
+        assert!(!rejected("git failed: exit status: 128"));
+        // A ref called like a refusal is not one: only a status line that starts with `!` counts.
+        assert!(!rejected(
+            "git failed: exit status: 1\n=\tabc:refs/heads/[rejected]\t[up to date]\n"
+        ));
     }
 
     #[test]

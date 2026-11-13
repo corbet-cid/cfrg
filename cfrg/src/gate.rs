@@ -93,6 +93,17 @@ pub struct Entry {
     pub lane: Lane,
 }
 
+/// What a flush does with the Git LFS objects of one repository (operating model R4).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Lfs {
+    /// The default: the push carries the pointer files and nothing else, because the free plans limit LFS storage.
+    #[default]
+    Pointers,
+    /// The explicit per-repository exception: after a successful push, the LFS objects the source references are uploaded too.
+    Payload,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -100,6 +111,9 @@ pub struct RepoConfig {
     pub lane: Lane,
     /// Bare repository whose newest state is pushed (the srv git copy).
     pub source: PathBuf,
+    /// LFS payloads are never replicated unless the repository declares `"lfs": "payload"` (R4). Default: pointers only.
+    #[serde(default)]
+    pub lfs: Lfs,
     /// Create the destination private. Copied from the primary; visibility is never changed afterwards.
     #[serde(default)]
     pub private: bool,
@@ -122,6 +136,10 @@ pub struct Config {
     /// already at the destination stay as they are. Default false.
     #[serde(default)]
     pub hold_tags: bool,
+    /// The most copy-only branches one push may delete (R3). A copy with more is held and reported as diverged: a person decides,
+    /// because a source that lost branches by accident must never empty a destination. Default 10.
+    #[serde(default = "max_prune_default")]
+    pub max_prune: usize,
     /// `org/repo` to its lane and source. A repository that is not listed is never pushed.
     pub repos: BTreeMap<String, RepoConfig>,
     /// Directory with ledger.jsonl and queue.json.
@@ -138,6 +156,10 @@ pub struct Config {
 
 fn quiet_fill_default() -> bool {
     true
+}
+
+fn max_prune_default() -> usize {
+    10
 }
 
 impl Config {
@@ -449,6 +471,195 @@ pub fn save_queue(state_dir: &Path, queue: &[Queued]) -> Result<()> {
     Ok(())
 }
 
+/// The forge router's namespace on a copy: the heads of its relay pull requests (ccid wiki "Forge-router" §4). The gate never
+/// pushes into it, never counts it and never deletes in it.
+pub const RELAY_PREFIX: &str = "refs/heads/cforge/";
+
+/// What one flush would do to one destination, decided from the two ref maps (refname to object name, branches and tags only, the
+/// relay namespace already left out). Everything that needs the object database is the caller's `descends`, so this stays pure.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// Refs the push creates or fast-forwards.
+    pub updates: Vec<String>,
+    /// Copy-only branches the push deletes (operating model R3: the copy matches the primary).
+    pub prune: Vec<String>,
+    /// Refs a push without force cannot bring to the destination.
+    pub conflicts: Vec<(String, Hold)>,
+    /// Refs on the destination that are left alone on purpose: copy-only tags, the relay namespace and the destination's default
+    /// branch (GitHub refuses to delete it, which would fail the whole atomic push).
+    pub kept: Vec<String>,
+}
+
+/// Why a repository is held back from a push.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Hold {
+    /// The destination's branch is not an ancestor of the source's: git answers non-fast-forward. The copy has diverged.
+    NonFastForward,
+    /// A tag stands at another object on the destination; a push without force never moves a tag.
+    MovedTag,
+    /// More copy-only branches than `max_prune`: a person decides.
+    PruneLimit,
+    /// The destination refused this exact push (a `[rejected]` status line); it is not repeated until a ref it names changes.
+    PushRejected,
+}
+
+impl Hold {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::NonFastForward => "a branch is not a fast-forward",
+            Self::MovedTag => "a tag stands at another object",
+            Self::PruneLimit => "more copy-only branches than max_prune",
+            Self::PushRejected => "the destination rejected the push",
+        }
+    }
+}
+
+/// `descends(theirs, ours)`: the destination's tip `theirs` is an ancestor of (or equal to) the source's tip `ours`.
+pub fn plan(
+    source: &BTreeMap<String, String>,
+    destination: &BTreeMap<String, String>,
+    default_branch: Option<&str>,
+    descends: impl Fn(&str, &str) -> bool,
+) -> Plan {
+    let mut plan = Plan::default();
+    for (name, ours) in source {
+        // The relay's namespace is the forge router's: a primary branch of that name is not pushed.
+        if name.starts_with(RELAY_PREFIX) {
+            continue;
+        }
+        match destination.get(name) {
+            None => plan.updates.push(name.clone()),
+            Some(theirs) if theirs == ours => {}
+            Some(_) if name.starts_with("refs/tags/") => {
+                plan.conflicts.push((name.clone(), Hold::MovedTag));
+            }
+            Some(theirs) if descends(theirs, ours) => plan.updates.push(name.clone()),
+            Some(_) => plan.conflicts.push((name.clone(), Hold::NonFastForward)),
+        }
+    }
+    for name in destination.keys().filter(|n| !source.contains_key(*n)) {
+        // Only a plain branch is ever deleted: never a tag, never the relay's namespace, never `refs/pull/*` or any other
+        // namespace, never the destination's default branch.
+        if name.starts_with("refs/heads/")
+            && !name.starts_with(RELAY_PREFIX)
+            && Some(name.as_str()) != default_branch
+        {
+            plan.prune.push(name.clone());
+        } else {
+            plan.kept.push(name.clone());
+        }
+    }
+    plan
+}
+
+impl Plan {
+    /// Nothing to push, nothing to delete and nothing in the way: the destination is in sync.
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.prune.is_empty() && self.conflicts.is_empty()
+    }
+
+    /// The reason to hold the repository before any push is spent, with the refs concerned.
+    pub fn hold(&self, max_prune: usize) -> Option<(Hold, Vec<String>)> {
+        if !self.conflicts.is_empty() {
+            let kind = if self
+                .conflicts
+                .iter()
+                .any(|(_, h)| *h == Hold::NonFastForward)
+            {
+                Hold::NonFastForward
+            } else {
+                Hold::MovedTag
+            };
+            return Some((
+                kind,
+                self.conflicts.iter().map(|(n, _)| n.clone()).collect(),
+            ));
+        }
+        (self.prune.len() > max_prune).then(|| (Hold::PruneLimit, self.prune.clone()))
+    }
+
+    /// Identifies this exact push: the refs it changes with their source and destination objects. A rejected push is not repeated
+    /// while the fingerprint is the same; any new commit on the primary or change on the destination makes it a different push.
+    pub fn fingerprint(
+        &self,
+        source: &BTreeMap<String, String>,
+        destination: &BTreeMap<String, String>,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let object = |map: &BTreeMap<String, String>, name: &str| {
+            map.get(name).cloned().unwrap_or_else(|| "-".into())
+        };
+        for name in &self.updates {
+            hasher.update(format!(
+                "+{name} {} {}\n",
+                object(source, name),
+                object(destination, name)
+            ));
+        }
+        for name in &self.prune {
+            hasher.update(format!("-{name} {}\n", object(destination, name)));
+        }
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+/// The most refs a [`Divergence`] lists (the total is kept beside them).
+pub const DIVERGENCE_REFS: usize = 20;
+
+/// A held repository: written by an executing flush into `diverged.json` of the state directory, shown by `cfrg gate status`
+/// (the nightwatch and the status page read it there). It clears itself when a flush finds the cause gone.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Divergence {
+    /// First flush that found this hold (kept while the same hold persists), and the latest one.
+    pub since: u64,
+    pub seen: u64,
+    pub hold: Hold,
+    pub refs: Vec<String>,
+    pub refs_total: usize,
+    pub fingerprint: String,
+}
+
+impl Divergence {
+    pub fn new(
+        previous: Option<&Divergence>,
+        now: u64,
+        hold: Hold,
+        refs: Vec<String>,
+        fingerprint: String,
+    ) -> Self {
+        let since = previous.filter(|p| p.hold == hold).map_or(now, |p| p.since);
+        let refs_total = refs.len();
+        Self {
+            since,
+            seen: now,
+            hold,
+            refs: refs.into_iter().take(DIVERGENCE_REFS).collect(),
+            refs_total,
+            fingerprint,
+        }
+    }
+}
+
+/// `org/repo` to its hold; absent file = nothing is held.
+pub fn load_diverged(state_dir: &Path) -> Result<BTreeMap<String, Divergence>> {
+    match fs::read_to_string(state_dir.join("diverged.json")) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn save_diverged(state_dir: &Path, held: &BTreeMap<String, Divergence>) -> Result<()> {
+    fs::create_dir_all(state_dir)?;
+    let target = state_dir.join("diverged.json");
+    let partial = state_dir.join("diverged.json.new");
+    fs::write(&partial, serde_json::to_string_pretty(held)?)?;
+    fs::rename(partial, target)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +875,7 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Bulk,
                         source: "/x".into(),
+                        lfs: Lfs::Pointers,
                         private: false,
                         description: String::new(),
                     },
@@ -673,6 +885,7 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Build,
                         source: "/x".into(),
+                        lfs: Lfs::Pointers,
                         private: false,
                         description: String::new(),
                     },
@@ -682,6 +895,7 @@ mod tests {
                     RepoConfig {
                         lane: Lane::Bulk,
                         source: "/x".into(),
+                        lfs: Lfs::Pointers,
                         private: false,
                         description: String::new(),
                     },
@@ -692,6 +906,7 @@ mod tests {
             kill_switch: "/k".into(),
             quiet_fill: true,
             hold_tags: false,
+            max_prune: 10,
             sync_hint: None,
         };
         let mut queue = Vec::new();
@@ -779,5 +994,174 @@ mod tests {
             decide(&b, &w, Lane::Bulk, "p", "y", Kind::Delete),
             Err(Deny::DeleteDaily)
         );
+    }
+
+    fn refs_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(n, o)| ((*n).to_string(), (*o).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_plan_creates_fast_forwards_and_prunes_copy_only_branches() {
+        let source = refs_of(&[
+            ("refs/heads/main", "b2"),
+            ("refs/heads/new", "n1"),
+            ("refs/tags/v1", "t1"),
+        ]);
+        let destination = refs_of(&[
+            ("refs/heads/main", "b1"),
+            ("refs/heads/stale", "s1"),
+            ("refs/tags/v1", "t1"),
+            ("refs/tags/old", "t0"),
+        ]);
+        let plan = plan(&source, &destination, None, |theirs, ours| {
+            (theirs, ours) == ("b1", "b2")
+        });
+        assert_eq!(plan.updates, ["refs/heads/main", "refs/heads/new"]);
+        assert_eq!(plan.prune, ["refs/heads/stale"]);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            plan.kept,
+            ["refs/tags/old"],
+            "a copy-only tag is never deleted"
+        );
+        assert!(plan.hold(10).is_none());
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn nothing_to_do_is_in_sync_even_with_copy_only_tags() {
+        let source = refs_of(&[("refs/heads/main", "b1")]);
+        let destination = refs_of(&[("refs/heads/main", "b1"), ("refs/tags/gh-only", "t")]);
+        let plan = plan(&source, &destination, None, |_, _| true);
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(plan.kept, ["refs/tags/gh-only"]);
+    }
+
+    #[test]
+    fn a_branch_that_is_not_a_fast_forward_and_a_moved_tag_are_conflicts() {
+        let source = refs_of(&[("refs/heads/main", "b2"), ("refs/tags/v1", "t2")]);
+        let destination = refs_of(&[("refs/heads/main", "b1"), ("refs/tags/v1", "t1")]);
+        let plan = plan(&source, &destination, None, |_, _| false);
+        assert_eq!(
+            plan.conflicts,
+            [
+                ("refs/heads/main".to_string(), Hold::NonFastForward),
+                ("refs/tags/v1".to_string(), Hold::MovedTag)
+            ]
+        );
+        let (kind, refs) = plan.hold(10).unwrap();
+        assert_eq!(kind, Hold::NonFastForward);
+        assert_eq!(refs, ["refs/heads/main", "refs/tags/v1"]);
+        // A moved tag alone is reported as that, even when every branch could fast-forward.
+        let tag_only = refs_of(&[("refs/tags/v1", "t2")]);
+        let plan = super::plan(
+            &tag_only,
+            &refs_of(&[("refs/tags/v1", "t1")]),
+            None,
+            |_, _| true,
+        );
+        assert_eq!(plan.hold(10).unwrap().0, Hold::MovedTag);
+    }
+
+    #[test]
+    fn pruning_never_reaches_the_relay_namespace_other_namespaces_or_the_default_branch() {
+        // A primary branch inside the relay's namespace is not pushed either.
+        let source = refs_of(&[("refs/heads/main", "b1"), ("refs/heads/cforge/own", "o1")]);
+        let destination = refs_of(&[
+            ("refs/heads/main", "b1"),
+            ("refs/heads/cforge/gitlab-7", "r1"),
+            ("refs/pull/1/head", "p1"),
+            ("refs/heads/legacy", "l1"),
+            ("refs/heads/stale", "s1"),
+        ]);
+        // Even if a caller forgot to leave the relay namespace out, the plan keeps it.
+        let plan = plan(&source, &destination, Some("refs/heads/legacy"), |_, _| {
+            true
+        });
+        assert!(plan.updates.is_empty(), "{plan:?}");
+        assert_eq!(plan.prune, ["refs/heads/stale"]);
+        assert_eq!(
+            plan.kept,
+            [
+                "refs/heads/cforge/gitlab-7",
+                "refs/heads/legacy",
+                "refs/pull/1/head"
+            ]
+        );
+    }
+
+    #[test]
+    fn too_many_copy_only_branches_hold_the_repository() {
+        let source = refs_of(&[("refs/heads/main", "b1")]);
+        let mut destination = refs_of(&[("refs/heads/main", "b1")]);
+        for i in 0..3 {
+            destination.insert(format!("refs/heads/gone-{i}"), "x".into());
+        }
+        let plan = plan(&source, &destination, None, |_, _| true);
+        assert!(plan.hold(3).is_none());
+        let (kind, refs) = plan.hold(2).unwrap();
+        assert_eq!(kind, Hold::PruneLimit);
+        assert_eq!(refs.len(), 3);
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_either_side_and_not_with_kept_refs() {
+        let source = refs_of(&[("refs/heads/main", "b2")]);
+        let destination = refs_of(&[("refs/heads/main", "b1"), ("refs/heads/stale", "s1")]);
+        let print = |s: &BTreeMap<String, String>, d: &BTreeMap<String, String>| {
+            plan(s, d, None, |_, _| true).fingerprint(s, d)
+        };
+        let base = print(&source, &destination);
+        assert_eq!(base, print(&source, &destination), "stable");
+        assert_ne!(
+            base,
+            print(&refs_of(&[("refs/heads/main", "b3")]), &destination)
+        );
+        let mut moved = destination.clone();
+        moved.insert("refs/heads/main".into(), "b0".into());
+        assert_ne!(base, print(&source, &moved));
+        let mut tagged = destination.clone();
+        tagged.insert("refs/tags/gh-only".into(), "t".into());
+        assert_eq!(base, print(&source, &tagged));
+    }
+
+    #[test]
+    fn a_divergence_keeps_its_first_time_while_the_same_hold_lasts_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Divergence::new(
+            None,
+            100,
+            Hold::NonFastForward,
+            vec!["refs/heads/main".into()],
+            "f".into(),
+        );
+        let again = Divergence::new(
+            Some(&first),
+            200,
+            Hold::NonFastForward,
+            vec!["refs/heads/main".into()],
+            "f".into(),
+        );
+        assert_eq!((again.since, again.seen), (100, 200));
+        let other = Divergence::new(Some(&first), 300, Hold::PushRejected, vec![], "g".into());
+        assert_eq!(
+            other.since, 300,
+            "another kind of hold starts its own clock"
+        );
+        let many: Vec<String> = (0..DIVERGENCE_REFS + 5)
+            .map(|i| format!("refs/tags/t{i}"))
+            .collect();
+        let long = Divergence::new(None, 1, Hold::MovedTag, many, "h".into());
+        assert_eq!(
+            (long.refs.len(), long.refs_total),
+            (DIVERGENCE_REFS, DIVERGENCE_REFS + 5)
+        );
+        assert!(load_diverged(dir.path()).unwrap().is_empty());
+        let held = BTreeMap::from([("o/r".to_string(), again)]);
+        save_diverged(dir.path(), &held).unwrap();
+        assert_eq!(load_diverged(dir.path()).unwrap(), held);
     }
 }

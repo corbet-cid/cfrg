@@ -28,6 +28,7 @@ pub struct Runner {
     pub(crate) deadline: Instant,
     events_to_stderr: bool,
     suppress_stderr: bool,
+    output_in_errors: bool,
 }
 #[cfg(unix)]
 struct OwnedChild(Box<dyn ChildWrapper>);
@@ -56,6 +57,7 @@ impl Runner {
             deadline,
             events_to_stderr: false,
             suppress_stderr: false,
+            output_in_errors: false,
         })
     }
     /// Keep machine-readable stdout separate from process timing diagnostics.
@@ -68,6 +70,13 @@ impl Runner {
     /// Retain exit status and timing, without forwarding the untrusted stream.
     pub fn without_child_stderr(mut self) -> Self {
         self.suppress_stderr = true;
+        self
+    }
+
+    /// Keep what a failed command wrote to stdout: it follows the first line of the error (at most 64 KiB). For callers that must
+    /// read what the command said before it failed, such as the per-ref status lines of `git push --porcelain`.
+    pub fn with_output_in_errors(mut self) -> Self {
+        self.output_in_errors = true;
         self
     }
 
@@ -244,13 +253,25 @@ impl Runner {
             json!({"event":"command", "executable":Path::new(&argv[0]).file_name().map(|s|s.to_string_lossy()), "seconds":started.elapsed().as_secs_f64(), "exit_code":status.code()}),
         );
         if !status.success() && prefix.is_none() {
-            return Err(failure(format!(
+            let mut text = format!(
                 "{} failed: {status}",
                 Path::new(&argv[0])
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-            )));
+            );
+            if self.output_in_errors {
+                if let Some(Ok(Ok(bytes))) = reader
+                    .as_ref()
+                    .map(|reader| reader.recv_timeout(Duration::from_secs(10)))
+                {
+                    text.push('\n');
+                    text.push_str(&String::from_utf8_lossy(
+                        &bytes[..bytes.len().min(64 * 1024)],
+                    ));
+                }
+            }
+            return Err(failure(text));
         }
         if let Some(reader) = reader {
             let bytes = reader.recv_timeout(Duration::from_secs(10)).map_err(|_| {
@@ -267,5 +288,34 @@ impl Runner {
             return Ok(bytes);
         }
         Ok(Vec::new())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn run(runner: Runner, script: &str) -> String {
+        let argv = ["sh".to_string(), "-c".into(), script.into()];
+        runner.run(&argv, true).unwrap_or_else(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_failed_command_keeps_its_stdout_only_when_asked() {
+        let new = || {
+            Runner::new(
+                std::env::temp_dir(),
+                std::env::vars_os().collect(),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .with_stderr_events()
+        };
+        let plain = run(new(), "echo said; exit 3");
+        assert!(plain.starts_with("sh failed: exit status: 3"), "{plain}");
+        assert!(!plain.contains("said"), "{plain}");
+        let kept = run(new().with_output_in_errors(), "echo said; exit 3");
+        assert_eq!(kept, "sh failed: exit status: 3\nsaid\n");
+        assert_eq!(run(new().with_output_in_errors(), "echo fine"), "fine");
     }
 }
