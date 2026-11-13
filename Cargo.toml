@@ -21,7 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 cfrg = { path = "cfrg" }
 clmr = { path = "clmr" }
-cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "6fe1b0f48cd23ee2c3972529b75e0cd508244be4" }
+cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "49c42586ea1d2fa0af7e234204056f46fa061628" }
 cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "b964fc9619b5187788cb9e28cfec9ce29d3c8c42" }
 cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "53441c2669a03f96772827fb81a16d397cdfea0f" }
 cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "a63d74b67df7df06534d6d6afa1a103823e5453d" }

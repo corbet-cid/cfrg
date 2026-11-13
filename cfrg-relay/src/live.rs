@@ -568,6 +568,9 @@ impl RouterForge for Forgejo {
             .map_err(forgejo_error)?;
         if !new.labels.is_empty() {
             self.rt
+                .block_on(self.driver.labels_ensure(&r, &new.labels))
+                .map_err(forgejo_error)?;
+            self.rt
                 .block_on(self.driver.labels_add(&r, c.number, &new.labels))
                 .map_err(forgejo_error)?;
         }
