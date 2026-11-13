@@ -6,33 +6,52 @@
 //! Never a rebase, never a squash, never a force push: the commits keep their identity, so the copies' pull requests close
 //! as merged once the mirroring carries the branch to them. A merge that conflicts is refused and nothing is pushed.
 use crate::gate::failure;
-use cfrg::Result;
+use cfrg::{
+    relay::{
+        model::{IssueState, ObjectState},
+        notice::{latest_review_head, ContributionMarker, ReviewComment},
+    },
+    Result,
+};
 use clap::Args;
 use std::{path::Path, process::Command};
 
 const AUTHOR_NAME: &str = "Julian Y. Richard Corbet";
 const AUTHOR_EMAIL: &str = "48553615+julian-corbet@users.noreply.github.com";
 
+/// `cfrg take-in <owner/repo>#<notice>`: everything else is read from the notice.
 #[derive(Args)]
 pub struct Options {
-    /// Git URL (or path) of the primary repository; pushed with the owner's own git credential.
-    #[arg(long)]
-    primary: String,
-    /// Branch of the primary that receives the contribution.
-    #[arg(long, default_value = "main")]
-    branch: String,
-    /// Git URL (or path) of the contribution's origin.
-    #[arg(long)]
-    origin: String,
-    /// Ref of the contribution at its origin (a branch, or a pull/merge request head ref).
-    #[arg(long = "ref")]
-    origin_ref: String,
-    /// The commit the review covered (40 lowercase hex); the take-in refuses if the origin's ref is elsewhere.
-    #[arg(long)]
-    reviewed: String,
+    /// The notice: `<owner/repo>#<number>` on the Forgejo primary.
+    target: String,
+    /// Forgejo API base.
+    #[arg(long, default_value = "https://forge.corbet.ch")]
+    forge: String,
+    /// Host that serves the primary's git URL (pushed with the owner's own git credential).
+    #[arg(long, default_value = "https://git.corbet.ch")]
+    primary_host: String,
+    /// Login whose review comments count.
+    #[arg(long, default_value = "julian-corbet")]
+    reviewer: String,
     /// Do everything except the push.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// What a take-in does, fully resolved: the notice gave `origin`, `origin_ref` and `reviewed`. Tests build it directly.
+#[derive(Debug)]
+pub struct Plan {
+    /// Git URL (or path) of the primary repository.
+    pub primary: String,
+    /// Branch of the primary that receives the contribution.
+    pub branch: String,
+    /// Git URL (or path) of the contribution's origin.
+    pub origin: String,
+    /// Ref of the contribution at its origin.
+    pub origin_ref: String,
+    /// The commit the review covered (40 lowercase hex); the take-in refuses if the origin's ref is elsewhere.
+    pub reviewed: String,
+    pub dry_run: bool,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
@@ -55,10 +74,6 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn is_sha(text: &str) -> bool {
-    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// What a take-in did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Landed {
@@ -66,35 +81,134 @@ pub enum Landed {
     Merge(String),
 }
 
+/// Reads what the notice says: where the commits are and which head the latest review covered. Refuses a notice that is
+/// not an open `contribution`, has no valid marker, has no review by `reviewer`, or whose newest head (the marker's `sha`)
+/// is not the reviewed one: a head that moved after the review needs a new review first.
+pub fn plan_from_notice(
+    notice: &ObjectState,
+    reviewer: &str,
+    primary: &str,
+    branch: &str,
+    dry_run: bool,
+) -> Result<Plan> {
+    if notice.snap.state != Some(IssueState::Open) || !notice.snap.labels.contains("contribution") {
+        return Err(failure("refused: not an open contribution notice"));
+    }
+    let marker = ContributionMarker::parse(&notice.snap.body)
+        .ok_or_else(|| failure("refused: the notice has no valid cfrg-contribution marker"))?;
+    let comments: Vec<ReviewComment> = notice
+        .comments
+        .iter()
+        .map(|c| ReviewComment {
+            author: c.author.login.clone(),
+            id: c.id,
+            body: c.body.clone(),
+        })
+        .collect();
+    let reviewed = latest_review_head(&comments, reviewer)
+        .ok_or_else(|| failure(format!("refused: no review by {reviewer} on the notice")))?;
+    if reviewed != marker.sha {
+        return Err(failure(format!(
+            "refused: the contribution moved since the review (reviewed {reviewed}, notice now {}); wait for the new review",
+            marker.sha
+        )));
+    }
+    Ok(Plan {
+        primary: primary.to_owned(),
+        branch: branch.to_owned(),
+        origin: marker.origin,
+        origin_ref: marker.reference,
+        reviewed,
+        dry_run,
+    })
+}
+
+/// The owner's Forgejo token: `CFRG_FORGEJO_TOKEN`, else the brain's sops file.
+fn forgejo_token() -> Result<String> {
+    if let Ok(token) = std::env::var("CFRG_FORGEJO_TOKEN") {
+        return Ok(token);
+    }
+    let file = std::env::var("CFRG_FORGEJO_SECRETS").unwrap_or_else(|_| {
+        format!(
+            "{}/agents/knowledge/secrets/forgejo.yml",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let out = Command::new("sops")
+        .args(["-d", "--extract", "[\"api_token\"]", &file])
+        .output()?;
+    if !out.status.success() {
+        return Err(failure(
+            "no Forgejo token: set CFRG_FORGEJO_TOKEN or make the sops file readable",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// The primary's default branch, asked of the primary itself.
+fn default_branch(primary: &str) -> Result<String> {
+    let out = Command::new("git")
+        .args(["ls-remote", "--symref", primary, "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_owned)
+        .ok_or_else(|| failure("cannot read the primary's default branch"))
+}
+
 pub fn run(options: Options) -> Result<()> {
+    let (repo, number) = options
+        .target
+        .split_once('#')
+        .and_then(|(r, n)| Some((r, n.parse::<i64>().ok()?)))
+        .ok_or_else(|| failure("expected <owner/repo>#<notice number>"))?;
+    let rt = cfrg_relay::live::runtime()?;
+    let token = forgejo_token()?;
+    let driver = cfgj::relay::ForgejoRelay::new(&options.forge, &cfgj::relay::Token::new(token))
+        .map_err(|e| failure(e.to_string()))?;
+    let forge_repo = cfgj::relay::Repo::parse(repo).map_err(|e| failure(e.to_string()))?;
+    let notice = rt
+        .block_on(driver.issue_read(&forge_repo, number))
+        .map_err(|e| failure(e.to_string()))?
+        .ok_or_else(|| failure("refused: the notice does not exist"))?;
+    let primary = format!("{}/{repo}.git", options.primary_host.trim_end_matches('/'));
+    let branch = default_branch(&primary)?;
+    let plan = plan_from_notice(
+        &notice,
+        &options.reviewer,
+        &primary,
+        &branch,
+        options.dry_run,
+    )?;
     let scratch = tempfile::tempdir()?;
-    let landed = take_in(&options, scratch.path())?;
-    match landed {
+    match take_in(&plan, scratch.path())? {
         Landed::FastForward(head) => println!("fast-forward to {head}"),
         Landed::Merge(head) => println!("merge commit {head}"),
     }
     Ok(())
 }
 
-pub fn take_in(options: &Options, scratch: &Path) -> Result<Landed> {
-    if !is_sha(&options.reviewed) {
-        return Err(failure("--reviewed must be a lowercase 40-hex commit"));
+pub fn take_in(plan: &Plan, scratch: &Path) -> Result<Landed> {
+    if !cfrg::relay::notice::is_sha(&plan.reviewed) {
+        return Err(failure(
+            "the reviewed commit must be a lowercase 40-hex commit",
+        ));
     }
-    for (name, value) in [
-        ("--primary", &options.primary),
-        ("--origin", &options.origin),
-    ] {
+    for (name, value) in [("primary", &plan.primary), ("origin", &plan.origin)] {
         if value.starts_with('-') {
             return Err(failure(format!("{name} must not start with a dash")));
         }
     }
-    let branch = options.branch.as_str();
+    let branch = plan.branch.as_str();
     if branch.starts_with('-') || branch.contains("..") {
-        return Err(failure("invalid --branch"));
+        return Err(failure("invalid branch"));
     }
     git(scratch, &["init", "--quiet", "."])?;
-    git(scratch, &["remote", "add", "primary", &options.primary])?;
-    git(scratch, &["remote", "add", "origin", &options.origin])?;
+    git(scratch, &["remote", "add", "primary", &plan.primary])?;
+    git(scratch, &["remote", "add", "origin", &plan.origin])?;
     git(
         scratch,
         &[
@@ -110,14 +224,14 @@ pub fn take_in(options: &Options, scratch: &Path) -> Result<Landed> {
             "fetch",
             "--quiet",
             "origin",
-            &format!("+{}:refs/take-in/head", options.origin_ref),
+            &format!("+{}:refs/take-in/head", plan.origin_ref),
         ],
     )?;
     let head = git(scratch, &["rev-parse", "refs/take-in/head"])?;
-    if head != options.reviewed {
+    if head != plan.reviewed {
         return Err(failure(format!(
             "refused: the contribution moved since the review (reviewed {}, origin now {head})",
-            options.reviewed
+            plan.reviewed
         )));
     }
     let base = format!("refs/remotes/primary/{branch}");
@@ -137,7 +251,7 @@ pub fn take_in(options: &Options, scratch: &Path) -> Result<Landed> {
         }
         Landed::Merge(git(scratch, &["rev-parse", "HEAD"])?)
     };
-    if options.dry_run {
+    if plan.dry_run {
         return Ok(landed);
     }
     // A plain push: if the primary moved meanwhile, git refuses and nothing is overwritten.
@@ -162,7 +276,11 @@ mod tests {
     }
 
     /// A bare primary with one commit, plus a contributor clone with one extra commit on a branch.
-    fn fixture(root: &Path, moved: bool) -> (Options, String) {
+    fn fixture_in(root: &Path) -> (Plan, String) {
+        fixture(root, false)
+    }
+
+    fn fixture(root: &Path, moved: bool) -> (Plan, String) {
         let primary = root.join("primary.git");
         std::fs::create_dir(&primary).unwrap();
         sh(
@@ -194,7 +312,7 @@ mod tests {
                 &["push", "--quiet", primary.to_str().unwrap(), "main"],
             );
         }
-        let options = Options {
+        let options = Plan {
             primary: primary.to_str().unwrap().into(),
             branch: "main".into(),
             origin: work.to_str().unwrap().into(),
@@ -253,5 +371,123 @@ mod tests {
         take_in(&options, scratch.path()).unwrap();
         let primary = root.path().join("primary.git");
         assert!(!sh(&primary, &["log", "--format=%s", "main"]).contains("feature"));
+    }
+
+    mod notice {
+        use super::super::*;
+        use super::fixture_in;
+        use cfrg::relay::model::{Actor, CommentState, Snap};
+
+        const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        fn marker(sha: &str) -> String {
+            ContributionMarker {
+                origin: "https://github.com/o/r.git".into(),
+                reference: "refs/pull/3/head".into(),
+                sha: sha.into(),
+            }
+            .attach("text")
+        }
+        fn review(id: u64, who: &str, sha: &str) -> CommentState {
+            CommentState {
+                id,
+                url: String::new(),
+                body: format!("<!-- cfrg-review head={sha} -->\nreport"),
+                author: Actor {
+                    id: "1".into(),
+                    login: who.into(),
+                },
+                created_at: id,
+            }
+        }
+        fn notice(body: String, comments: Vec<CommentState>) -> ObjectState {
+            ObjectState {
+                number: 5,
+                url: String::new(),
+                author: Actor {
+                    id: "9".into(),
+                    login: "relay".into(),
+                },
+                snap: Snap {
+                    title: "t".into(),
+                    body,
+                    state: Some(IssueState::Open),
+                    labels: ["contribution".to_owned()].into(),
+                    assignees: Default::default(),
+                },
+                confidential: false,
+                comments,
+                updated_at: 0,
+            }
+        }
+        fn plan(n: &ObjectState) -> Result<Plan> {
+            plan_from_notice(n, "me", "https://git/o/r.git", "main", false)
+        }
+
+        #[test]
+        fn takes_origin_ref_and_the_latest_reviewed_head_from_the_notice() {
+            let n = notice(marker(B), vec![review(1, "me", A), review(2, "me", B)]);
+            let p = plan(&n).unwrap();
+            assert_eq!(
+                (
+                    p.origin.as_str(),
+                    p.origin_ref.as_str(),
+                    p.reviewed.as_str()
+                ),
+                ("https://github.com/o/r.git", "refs/pull/3/head", B)
+            );
+        }
+
+        #[test]
+        fn refuses_when_the_head_moved_after_the_latest_review() {
+            let n = notice(marker(B), vec![review(1, "me", A)]);
+            assert!(plan(&n)
+                .unwrap_err()
+                .to_string()
+                .contains("moved since the review"));
+        }
+
+        #[test]
+        fn ignores_other_authors_and_refuses_without_a_review() {
+            let n = notice(marker(A), vec![review(1, "outsider", A)]);
+            assert!(plan(&n).unwrap_err().to_string().contains("no review"));
+        }
+
+        #[test]
+        fn refuses_closed_unlabelled_or_unmarked_notices() {
+            let mut n = notice(marker(A), vec![review(1, "me", A)]);
+            n.snap.state = Some(IssueState::Closed);
+            assert!(plan(&n).is_err());
+            let mut n = notice(marker(A), vec![review(1, "me", A)]);
+            n.snap.labels.clear();
+            assert!(plan(&n).is_err());
+            let n = notice("no marker here".into(), vec![review(1, "me", A)]);
+            assert!(plan(&n).unwrap_err().to_string().contains("marker"));
+        }
+
+        #[test]
+        fn a_notice_plan_lands_the_reviewed_commit() {
+            let root = tempfile::tempdir().unwrap();
+            let (mut base, sha) = fixture_in(root.path());
+            let n = notice(
+                ContributionMarker {
+                    origin: "https://x/y.git".into(),
+                    reference: "refs/heads/feature".into(),
+                    sha: sha.clone(),
+                }
+                .attach("t"),
+                vec![review(1, "me", &sha)],
+            );
+            let mut p = plan(&n).unwrap();
+            // the fake forge is the local fixture: swap in its paths, keep what the notice decided
+            p.primary = std::mem::take(&mut base.primary);
+            p.origin = std::mem::take(&mut base.origin);
+            let scratch = tempfile::tempdir().unwrap();
+            assert_eq!(
+                take_in(&p, scratch.path()).unwrap(),
+                Landed::FastForward(sha)
+            );
+        }
     }
 }

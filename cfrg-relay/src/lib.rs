@@ -27,6 +27,7 @@ use std::{
 
 pub mod heads_live;
 pub mod live;
+pub mod notices_live;
 
 /// Copy ids resolved from a path in one run, at most; the rest follow in the next runs (reads are cheap, a burst is not).
 pub const MAX_RESOLVES_PER_RUN: usize = 50;

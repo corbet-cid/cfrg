@@ -24,6 +24,7 @@ pub mod heads;
 pub mod marker;
 pub mod merge;
 pub mod model;
+pub mod notice;
 pub mod ops;
 pub mod pacing;
 pub mod pass;
