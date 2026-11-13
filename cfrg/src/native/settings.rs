@@ -74,6 +74,8 @@ pub struct Observed {
     pub ci: Option<bool>,
     /// Automatic dependency or security update tooling is on (R35).
     pub updates: Option<bool>,
+    /// Private vulnerability reporting is on (GitHub).
+    pub vulnerability_reporting: Option<bool>,
 }
 
 /// One setting. The declaration order is the order of application: a copy is unarchived
@@ -91,6 +93,7 @@ pub enum Field {
     Wiki,
     Ci,
     Updates,
+    VulnerabilityReporting,
     Archive,
 }
 
@@ -153,6 +156,8 @@ pub struct Capabilities {
     pub wiki: bool,
     /// Automatic update tooling can be switched off through the API.
     pub updates: bool,
+    /// Private vulnerability reporting can be switched on through the API.
+    pub vulnerability_reporting: bool,
     pub description_limit: usize,
     pub topic_limit: usize,
 }
@@ -166,6 +171,7 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             issues: true,
             wiki: true,
             updates: true,
+            vulnerability_reporting: true,
             description_limit: 350,
             topic_limit: 20,
         },
@@ -176,6 +182,7 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             issues: true,
             wiki: true,
             updates: false,
+            vulnerability_reporting: false,
             description_limit: 2000,
             topic_limit: usize::MAX,
         },
@@ -186,16 +193,24 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             issues: false,
             wiki: false,
             updates: false,
+            vulnerability_reporting: false,
             description_limit: usize::MAX,
             topic_limit: 0,
         },
     }
 }
 
-/// Whether the forge holds a wiki for this copy at no cost (R40). GitHub wikis of private
-/// repositories need a paid plan.
-pub fn wiki_free(provider: Provider, private: bool) -> bool {
-    !(provider == Provider::Github && private)
+/// Whether a copy of this forge carries a wiki. GitLab does (the Forgejo wiki is pushed
+/// there). GitHub does not: its wiki edit rights cannot be restricted through the API (a
+/// triage collaborator can edit a public wiki), so the copy links to the Forgejo wiki in
+/// its description instead (R40; decided by the owner's delegate 2026-11-13). Bitbucket
+/// has no wiki since 2026-08-20.
+pub fn wiki_wanted(provider: Provider) -> Option<bool> {
+    match provider {
+        Provider::Github => Some(false),
+        Provider::Gitlab => Some(true),
+        Provider::Bitbucket => None,
+    }
 }
 
 /// A topic as GitHub accepts it: lowercase letters, digits and hyphens, at most 50.
@@ -320,9 +335,23 @@ pub fn plan(provider: Provider, primary: &Primary, seen: &Observed, ci_declared:
     if caps.issues && seen.issues == Some(false) {
         change(&mut plan, Field::Issues, json!(false), json!(true));
     }
-    // The wiki is on where it is free (R40); where it is not, the copy links to it instead.
-    if caps.wiki && seen.wiki == Some(false) && wiki_free(provider, effective_private) {
-        change(&mut plan, Field::Wiki, json!(false), json!(true));
+    // The wiki is on GitLab only (R40); everywhere else the description links to it.
+    if let (Some(wanted), Some(live)) = (wiki_wanted(provider), seen.wiki) {
+        if caps.wiki && live != wanted {
+            change(&mut plan, Field::Wiki, json!(live), json!(wanted));
+        }
+    }
+    // Private vulnerability reporting is on for a public GitHub copy.
+    if caps.vulnerability_reporting
+        && !effective_private
+        && seen.vulnerability_reporting == Some(false)
+    {
+        change(
+            &mut plan,
+            Field::VulnerabilityReporting,
+            json!(false),
+            json!(true),
+        );
     }
     // No CI on a copy (R6), unless it is declared to run a broker's workflow.
     if seen.ci == Some(true) && !ci_declared {
@@ -383,16 +412,21 @@ mod tests {
             default_branch: Some("main".into()),
             archived: Some(false),
             issues: Some(true),
-            wiki: Some(true),
+            // The wiki differs by forge: tests set it where it matters.
+            wiki: None,
             ci: Some(false),
             updates: Some(false),
+            vulnerability_reporting: Some(true),
         }
     }
 
     #[test]
     fn a_matching_copy_is_converged() {
         for provider in [Provider::Github, Provider::Gitlab, Provider::Bitbucket] {
-            let plan = plan(provider, &primary(), &matching(), false);
+            let mut seen = matching();
+            // The wiki is off on GitHub, on on GitLab, absent on Bitbucket.
+            seen.wiki = wiki_wanted(provider);
+            let plan = plan(provider, &primary(), &seen, false);
             assert!(plan.changes.is_empty(), "{provider:?}: {plan:?}");
             assert!(plan.held.is_empty());
         }
@@ -501,21 +535,38 @@ mod tests {
     fn issues_wiki_ci_and_updates_follow_the_model() {
         let mut seen = matching();
         seen.issues = Some(false);
-        seen.wiki = Some(false);
+        seen.wiki = Some(true);
         seen.ci = Some(true);
         seen.updates = Some(true);
         let fields = |plan: Plan| plan.changes.iter().map(|c| c.field).collect::<Vec<_>>();
+        // GitHub: issues on, wiki OFF (its wiki edit rights cannot be restricted), CI off,
+        // update tooling off.
+        let github = plan_for(Provider::Github, &primary(), &seen);
         assert_eq!(
-            fields(plan_for(Provider::Github, &primary(), &seen)),
+            fields(github.clone()),
             [Field::Issues, Field::Wiki, Field::Ci, Field::Updates]
         );
+        let wiki = github
+            .changes
+            .iter()
+            .find(|c| c.field == Field::Wiki)
+            .unwrap();
+        assert_eq!(wiki.to, json!(false));
         // A declared CI destination keeps its CI.
         let kept = plan(Provider::Gitlab, &primary(), &seen, true);
         assert!(kept.changes.iter().all(|c| c.field != Field::Ci));
         // GitLab cannot switch update tooling off through the API.
-        assert!(plan(Provider::Gitlab, &primary(), &seen, true)
-            .unsupported
-            .contains(&Field::Updates));
+        assert!(kept.unsupported.contains(&Field::Updates));
+    }
+
+    #[test]
+    fn gitlab_keeps_its_wiki_on_and_turns_a_missing_one_on() {
+        let mut seen = matching();
+        seen.wiki = Some(false);
+        let plan = plan_for(Provider::Gitlab, &primary(), &seen);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].field, Field::Wiki);
+        assert_eq!(plan.changes[0].to, json!(true));
     }
 
     #[test]
@@ -531,22 +582,25 @@ mod tests {
     }
 
     #[test]
-    fn a_private_github_copy_gets_no_wiki_because_the_forge_charges_for_it() {
+    fn private_vulnerability_reporting_is_switched_on_for_a_public_github_copy_only() {
+        let mut seen = matching();
+        seen.wiki = Some(false);
+        seen.vulnerability_reporting = Some(false);
+        let plan = plan_for(Provider::Github, &primary(), &seen);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].field, Field::VulnerabilityReporting);
+        // A private copy has no use for it, and the other forges have no such switch.
         let mut p = primary();
         p.private = true;
-        let mut seen = matching();
-        seen.private = Some(true);
-        seen.wiki = Some(false);
-        assert!(plan_for(Provider::Github, &p, &seen).changes.is_empty());
-        assert_eq!(
-            plan_for(Provider::Gitlab, &p, &seen).changes[0].field,
-            Field::Wiki
-        );
-        // A public copy that is narrowed to private loses its free wiki on GitHub too.
-        let mut seen = matching();
-        seen.wiki = Some(false);
-        let plan = plan_for(Provider::Github, &p, &seen);
-        assert!(plan.changes.iter().all(|c| c.field != Field::Wiki));
+        let mut seen_private = seen.clone();
+        seen_private.private = Some(true);
+        assert!(plan_for(Provider::Github, &p, &seen_private)
+            .changes
+            .is_empty());
+        assert!(plan_for(Provider::Gitlab, &primary(), &seen)
+            .changes
+            .iter()
+            .all(|c| c.field != Field::VulnerabilityReporting));
     }
 
     #[test]

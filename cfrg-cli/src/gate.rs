@@ -623,11 +623,11 @@ fn create_repository(
         "name": repo,
         "private": private,
         "description": description,
-        // R38/R40/R42: issues are on everywhere; the wiki is on where GitHub holds it for free
-        // (public repositories). Projects stay off.
+        // R38/R40/R42: issues are on; the wiki stays off on GitHub (its edit rights cannot be
+        // restricted through the API, so the description links to the Forgejo wiki); projects off.
         "has_issues": true,
         "has_projects": false,
-        "has_wiki": !private,
+        "has_wiki": false,
         "auto_init": false,
     });
     let answer = github(

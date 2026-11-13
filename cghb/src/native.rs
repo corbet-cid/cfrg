@@ -121,9 +121,10 @@ pub fn ensure_destination_repo(
                 "POST",
                 &format!("/orgs/{}/repos", owner_of(dest)?),
                 Some(json!({
-                    // R38/R40/R42: issues on; the wiki on where GitHub holds it for free.
+                    // R38/R40/R42: issues on; no wiki on GitHub (the description links to the
+                    // Forgejo wiki, GitHub's wiki edit rights cannot be restricted).
                     "name":name, "private":repo.private, "has_issues":true,
-                    "has_projects":false, "has_wiki":!repo.private, "auto_init":false
+                    "has_projects":false, "has_wiki":false, "auto_init":false
                 })),
                 true,
             )?,

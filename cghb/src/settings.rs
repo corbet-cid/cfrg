@@ -61,6 +61,16 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         call(io, target, "GET", "/actions/permissions", None)?,
         &[200],
     )?;
+    // Private vulnerability reporting is only offered on public repositories.
+    let reporting = if repo["private"] == false {
+        expect(
+            call(io, target, "GET", "/private-vulnerability-reporting", None)?,
+            &[200],
+        )?["enabled"]
+            .as_bool()
+    } else {
+        None
+    };
     Ok(Some(Observed {
         private: repo["private"].as_bool(),
         description: Some(text(&repo["description"])),
@@ -75,6 +85,7 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         updates: repo["security_and_analysis"]["dependabot_security_updates"]["status"]
             .as_str()
             .map(|status| status == "enabled"),
+        vulnerability_reporting: reporting,
     }))
 }
 
@@ -214,7 +225,7 @@ pub fn apply(
                 together.push(Field::Issues);
             }
             Field::Wiki => {
-                fields.insert("has_wiki".into(), json!(true));
+                fields.insert("has_wiki".into(), json!(change.to == true));
                 together.push(Field::Wiki);
             }
             Field::DefaultBranch => {
@@ -256,6 +267,14 @@ pub fn apply(
                     &[204],
                 )?;
                 done.push(Applied::done(Field::Ci));
+            }
+            Field::VulnerabilityReporting => {
+                flush(io, &mut fields, &mut together, &mut done)?;
+                expect(
+                    call(io, target, "PUT", "/private-vulnerability-reporting", None)?,
+                    &[204],
+                )?;
+                done.push(Applied::done(Field::VulnerabilityReporting));
             }
             Field::Updates => {
                 flush(io, &mut fields, &mut together, &mut done)?;
@@ -346,6 +365,60 @@ mod tests {
             asked: vec![],
         };
         assert!(observe(&mut gone, &target()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_public_copy_also_reports_private_vulnerability_reporting() {
+        let mut io = Script {
+            answers: vec![
+                (
+                    200,
+                    json!({"full_name":"org/repo","private":false,"description":"","homepage":"","topics":[],
+                    "default_branch":"main","archived":false,"has_issues":true,"has_wiki":true}),
+                ),
+                (200, json!({"enabled":false})),
+                (200, json!({"enabled":false})),
+            ],
+            asked: vec![],
+        };
+        let seen = observe(&mut io, &target()).unwrap().unwrap();
+        assert_eq!(seen.vulnerability_reporting, Some(false));
+        assert_eq!(seen.wiki, Some(true));
+        assert_eq!(
+            io.asked[2].1,
+            "/repos/org/repo/private-vulnerability-reporting"
+        );
+        // Switching it on is one PUT without a body.
+        let changes = [Change {
+            field: Field::VulnerabilityReporting,
+            from: json!(false),
+            to: json!(true),
+        }];
+        let mut io = Script {
+            answers: vec![(204, Value::Null)],
+            asked: vec![],
+        };
+        apply(&mut io, &target(), &primary(), &changes).unwrap();
+        assert_eq!(io.asked[0].0, "PUT");
+        assert_eq!(
+            io.asked[0].1,
+            "/repos/org/repo/private-vulnerability-reporting"
+        );
+    }
+
+    #[test]
+    fn the_wiki_is_written_with_the_planned_value() {
+        let changes = [Change {
+            field: Field::Wiki,
+            from: json!(true),
+            to: json!(false),
+        }];
+        let mut io = Script {
+            answers: vec![(200, json!({}))],
+            asked: vec![],
+        };
+        apply(&mut io, &target(), &primary(), &changes).unwrap();
+        assert_eq!(io.asked[0].2, Some(json!({"has_wiki":false})));
     }
 
     #[test]

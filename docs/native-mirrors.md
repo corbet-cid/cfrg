@@ -139,9 +139,10 @@ somebody else's project is skipped (R11).
 | default branch | only once the branch is on the copy | same | same |
 | archived | yes, and only once the copy is at the primary's head | yes, same | none (`unsupported`) |
 | issues on (R38) | `has_issues` | `issues_access_level` | none: Bitbucket Cloud removed issues on 2026-08-20 |
-| wiki on where free (R40) | public repositories only (private needs a paid plan) | yes | none: removed on 2026-08-20 |
+| wiki (R40) | **off** (edit rights cannot be restricted through the API; the description links to the Forgejo wiki) | on (the Forgejo wiki is pushed there) | none: removed on 2026-08-20 |
 | CI off (R6) | Actions switch | `builds_access_level` | pipelines |
 | update tooling off (R35) | Dependabot security updates | none | none |
+| private vulnerability reporting | on, public copies only | none | none |
 
 Visibility has a direction. A copy more open than its primary is narrowed at once, the safe
 direction. A copy that would have to become public is **held and reported**
@@ -219,7 +220,7 @@ repository ID; `mirror_user` is the login of the account whose token is both the
 API credential (`token_env`) and the mirror credential (`password_env`). Reconcile:
 
 * Ensures the repository (a missing one is created in the organisation, private
-  as the primary is, with issues on, projects off and the wiki on when public (R38, R40, R42); creation is paced by the
+  as the primary is, with issues on, projects and wiki off (R38, R40, R42); creation is paced by the
   creation window) and switches GitHub Actions off on it unless it declares
   `"ci": true` (a remote CI broker runs the provider's workflow there).
 * Locks it as above. GitHub Free has rulesets for public repositories only: a

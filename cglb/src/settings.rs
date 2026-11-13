@@ -77,6 +77,7 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         wiki: level_on(&project["wiki_access_level"]),
         ci: level_on(&project["builds_access_level"]),
         updates: None,
+        vulnerability_reporting: None,
     }))
 }
 
@@ -170,7 +171,12 @@ pub fn apply(
                 together.push(Field::Issues);
             }
             Field::Wiki => {
-                fields.insert("wiki_access_level".into(), json!("enabled"));
+                let level = if change.to == true {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                fields.insert("wiki_access_level".into(), json!(level));
                 together.push(Field::Wiki);
             }
             Field::Ci => {
@@ -188,7 +194,7 @@ pub fn apply(
                     ));
                 }
             }
-            Field::Homepage | Field::Updates => {
+            Field::Homepage | Field::Updates | Field::VulnerabilityReporting => {
                 done.push(Applied::skipped(change.field, "GitLab cannot hold it"));
             }
             Field::Archive => {

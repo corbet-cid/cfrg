@@ -68,6 +68,7 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         wiki: None,
         ci,
         updates: None,
+        vulnerability_reporting: None,
     }))
 }
 
@@ -167,7 +168,11 @@ pub fn apply(
                 }
                 done.push(Applied::done(Field::Ci));
             }
-            Field::Topics | Field::Updates | Field::Archive | Field::Unarchive => {
+            Field::Topics
+            | Field::Updates
+            | Field::VulnerabilityReporting
+            | Field::Archive
+            | Field::Unarchive => {
                 done.push(Applied::skipped(change.field, "Bitbucket cannot hold it"));
             }
         }
