@@ -128,3 +128,71 @@ fn the_gate_pushes_the_newest_state_once_and_holds_the_next_push() {
         .unwrap()
         .contains("kill switch"));
 }
+
+#[test]
+fn held_tags_are_neither_pushed_nor_compared_while_branches_keep_flowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("dest/o")).unwrap();
+    git(root, &["init", "-q", "--bare", "src.git"]);
+    git(root, &["init", "-q", "work"]);
+    let work = root.join("work");
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+    git(&work, &["push", "-q", "../src.git", "HEAD:refs/heads/main"]);
+    git(root, &["init", "-q", "--bare", "dest/o/bulk.git"]);
+    let source = root.join("src.git");
+    let write_config = |hold_tags: bool| {
+        fs::write(
+            root.join("cfg.json"),
+            serde_json::json!({
+                "repos": {"o/bulk": {"lane": "bulk", "source": source}},
+                "budgets": {"repo_min_gap_secs": 0},
+                "state_dir": root.join("state"),
+                "paused_dir": root.join("paused"),
+                "kill_switch": root.join("kill"),
+                "quiet_fill": false,
+                "hold_tags": hold_tags
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write_config(true);
+
+    // A release tag arrives next to the branch: with the hold, the push carries the branch and leaves the tag behind.
+    git(&work, &["tag", "v1"]);
+    git(&work, &["push", "-q", "../src.git", "refs/tags/v1"]);
+    gate(root, &["enqueue", "o/bulk"], false);
+    let dry = gate(root, &["flush"], false);
+    assert_eq!(dry["flush"][0]["verdict"], "would push");
+    assert_eq!(
+        dry["flush"][0]["refs_changed"], 1,
+        "only the branch counts while tags are held"
+    );
+    assert_eq!(gate(root, &["status"], false)["hold_tags"], true);
+    let done = gate(root, &["flush", "--execute"], true);
+    assert_eq!(done["flush"][0]["verdict"], "pushed");
+    assert_eq!(
+        git(root, &["-C", "dest/o/bulk.git", "rev-parse", "main"]),
+        git(root, &["-C", "src.git", "rev-parse", "main"])
+    );
+    assert!(
+        git(root, &["-C", "dest/o/bulk.git", "tag", "--list"]).is_empty(),
+        "no tag reaches the destination while tags are held"
+    );
+
+    // The tag alone does not make the repository differ: the branches are in sync.
+    gate(root, &["enqueue", "o/bulk"], false);
+    let again = gate(root, &["flush", "--execute"], true);
+    assert_eq!(again["flush"][0]["verdict"], "in sync, dequeued");
+
+    // Lifting the hold pushes the tag that was waiting (the declared hold is a switch, nothing is forgotten).
+    write_config(false);
+    gate(root, &["enqueue", "o/bulk"], false);
+    let lifted = gate(root, &["flush", "--execute"], true);
+    assert_eq!(lifted["flush"][0]["verdict"], "pushed");
+    assert_eq!(
+        git(root, &["-C", "dest/o/bulk.git", "tag", "--list"]).trim(),
+        "v1"
+    );
+}

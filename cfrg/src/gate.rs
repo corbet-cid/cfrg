@@ -117,6 +117,11 @@ pub struct Config {
     /// cannot start runs from the workflow files those old commits still carry. Default true; only a test turns it off.
     #[serde(default = "quiet_fill_default")]
     pub quiet_fill: bool,
+    /// Push and compare branches only: no tag is pushed, and tags are ignored when the source is compared with the destination.
+    /// A tag on GitHub can start a release workflow, so an operator can hold every tag while branches keep flowing; the tags
+    /// already at the destination stay as they are. Default false.
+    #[serde(default)]
+    pub hold_tags: bool,
     /// `org/repo` to its lane and source. A repository that is not listed is never pushed.
     pub repos: BTreeMap<String, RepoConfig>,
     /// Directory with ledger.jsonl and queue.json.
@@ -679,6 +684,7 @@ mod tests {
             paused_dir: "/p".into(),
             kill_switch: "/k".into(),
             quiet_fill: true,
+            hold_tags: false,
         };
         let mut queue = Vec::new();
         enqueue(&mut queue, "o/bulk-new", 30);

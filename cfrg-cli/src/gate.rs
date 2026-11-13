@@ -217,6 +217,7 @@ fn status(config: &Config) -> Result<Value> {
     let day = now.saturating_sub(gate::DAY);
     Ok(json!({
         "kill_switch": config.kill_switch.exists(),
+        "hold_tags": config.hold_tags,
         "paused": paused,
         "queue": queue,
         "pushes": {"hour": count(&entries, hour, Kind::Push), "hour_budget": b.pushes_per_hour,
@@ -262,6 +263,14 @@ fn refs(text: &str) -> BTreeMap<String, String> {
             .then(|| (name.to_string(), sha.to_string()))
         })
         .collect()
+}
+
+/// The refs that count for a repository: branches and tags, or branches only while the operator holds tags.
+fn counted(mut refs: BTreeMap<String, String>, hold_tags: bool) -> BTreeMap<String, String> {
+    if hold_tags {
+        refs.retain(|name, _| !name.starts_with("refs/tags/"));
+    }
+    refs
 }
 
 fn base64(input: &[u8]) -> String {
@@ -1066,7 +1075,7 @@ fn flush(
                 ],
                 true,
             )?;
-        let local = refs(&local);
+        let local = counted(refs(&local), config.hold_tags);
         if local.is_empty() {
             report.push(json!({"repo": name, "verdict": "source has no branches yet"}));
             continue;
@@ -1089,7 +1098,7 @@ fn flush(
             true,
         )
         .ok()
-        .map(|t| refs(&t));
+        .map(|t| counted(refs(&t), config.hold_tags));
         let mut remote = remote;
         let mut created = false;
         if remote.is_none() {
@@ -1229,23 +1238,23 @@ fn flush(
             ensure_actions_disabled(config, org, &api, token, repo)?;
         }
         let environment = auth_environment(token);
+        let mut push_args: Vec<String> = vec![
+            "git".into(),
+            "push".into(),
+            "--quiet".into(),
+            url.clone(),
+            "refs/heads/*:refs/heads/*".into(),
+        ];
+        if !config.hold_tags {
+            push_args.push("refs/tags/*:refs/tags/*".into());
+        }
         let pushed = Runner::new(
             entry.source.clone(),
             environment.clone(),
             Duration::from_secs(900),
         )?
         .with_stderr_events()
-        .run(
-            &[
-                "git".into(),
-                "push".into(),
-                "--quiet".into(),
-                url.clone(),
-                "refs/heads/*:refs/heads/*".into(),
-                "refs/tags/*:refs/tags/*".into(),
-            ],
-            true,
-        );
+        .run(&push_args, true);
         // LFS objects do not travel with the ref push: without them the destination holds pointers only.
         let lfs = if pushed.is_ok() {
             let listed = Runner::new(
