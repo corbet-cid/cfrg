@@ -288,9 +288,16 @@ fn rejected(error: &str) -> bool {
 
 /// The refs that count for a repository: branches and tags, or branches only while the operator holds tags; never the relay's
 /// namespace, on either side.
-fn counted(mut refs: BTreeMap<String, String>, hold_tags: bool) -> BTreeMap<String, String> {
+fn counted(
+    mut refs: BTreeMap<String, String>,
+    hold_tags: bool,
+    source: bool,
+) -> BTreeMap<String, String> {
+    // The bot's branches are dropped from the source (never pushed) and kept on the destination (the plan prunes them).
     refs.retain(|name, _| {
-        !name.starts_with(gate::RELAY_PREFIX) && !(hold_tags && name.starts_with("refs/tags/"))
+        !name.starts_with(gate::RELAY_PREFIX)
+            && !(source && name.starts_with(gate::BOT_PREFIX))
+            && !(hold_tags && name.starts_with("refs/tags/"))
     });
     refs
 }
@@ -1072,7 +1079,7 @@ fn flush(
                 ],
                 true,
             )?;
-        let local = counted(refs(&local), config.hold_tags);
+        let local = counted(refs(&local), config.hold_tags, true);
         // A source without any branch pushes nothing and never prunes: an empty or broken copy must not empty a destination.
         if !local.keys().any(|n| n.starts_with("refs/heads/")) {
             report.push(json!({"repo": name, "verdict": "source has no branches yet"}));
@@ -1100,7 +1107,7 @@ fn flush(
         .ok();
         // The destination's default branch is never pruned: GitHub refuses to delete it, which would fail the whole atomic push.
         let default_branch = remote.as_deref().and_then(default_branch);
-        let mut remote = remote.map(|t| counted(refs(&t), config.hold_tags));
+        let mut remote = remote.map(|t| counted(refs(&t), config.hold_tags, false));
         let mut created = false;
         if remote.is_none() {
             // The destination does not exist. Creation is its own budgeted mutation; with --create the fill does it here.
@@ -1538,11 +1545,11 @@ mod tests {
         let map = refs("a refs/heads/main\nb refs/heads/cforge/gitlab-7\nc refs/heads/cforgeish\nd refs/tags/v1\n");
         let names = |m: BTreeMap<String, String>| m.into_keys().collect::<Vec<_>>();
         assert_eq!(
-            names(counted(map.clone(), false)),
+            names(counted(map.clone(), false, true)),
             ["refs/heads/cforgeish", "refs/heads/main", "refs/tags/v1"]
         );
         assert_eq!(
-            names(counted(map, true)),
+            names(counted(map, true, true)),
             ["refs/heads/cforgeish", "refs/heads/main"]
         );
     }

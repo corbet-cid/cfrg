@@ -475,6 +475,10 @@ pub fn save_queue(state_dir: &Path, queue: &[Queued]) -> Result<()> {
 /// pushes into it, never counts it and never deletes in it.
 pub const RELAY_PREFIX: &str = "refs/heads/cforge/";
 
+/// The dependency bot's transient branches (`renovate/*`): bot activity, never pushed to a copy and removed from a copy that has
+/// them (they would burn the daily push budget). The opposite direction of the relay namespace.
+pub const BOT_PREFIX: &str = "refs/heads/renovate/";
+
 /// What one flush would do to one destination, decided from the two ref maps (refname to object name, branches and tags only, the
 /// relay namespace already left out). Everything that needs the object database is the caller's `descends`, so this stays pure.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -525,7 +529,7 @@ pub fn plan(
     let mut plan = Plan::default();
     for (name, ours) in source {
         // The relay's namespace is the forge router's: a primary branch of that name is not pushed.
-        if name.starts_with(RELAY_PREFIX) {
+        if name.starts_with(RELAY_PREFIX) || name.starts_with(BOT_PREFIX) {
             continue;
         }
         match destination.get(name) {
@@ -538,7 +542,10 @@ pub fn plan(
             Some(_) => plan.conflicts.push((name.clone(), Hold::NonFastForward)),
         }
     }
-    for name in destination.keys().filter(|n| !source.contains_key(*n)) {
+    for name in destination
+        .keys()
+        .filter(|n| !source.contains_key(*n) || n.starts_with(BOT_PREFIX))
+    {
         // Only a plain branch is ever deleted: never a tag, never the relay's namespace, never `refs/pull/*` or any other
         // namespace, never the destination's default branch.
         if name.starts_with("refs/heads/")
@@ -1091,6 +1098,15 @@ mod tests {
                 "refs/pull/1/head"
             ]
         );
+    }
+
+    #[test]
+    fn the_bots_branches_are_never_pushed_and_are_pruned_from_a_copy() {
+        let source = refs_of(&[("refs/heads/main", "b2"), ("refs/heads/renovate/x", "n1")]);
+        let destination = refs_of(&[("refs/heads/main", "b1"), ("refs/heads/renovate/old", "n0")]);
+        let plan = plan(&source, &destination, None, |_, _| true);
+        assert_eq!(plan.updates, ["refs/heads/main"]);
+        assert_eq!(plan.prune, ["refs/heads/renovate/old"]);
     }
 
     #[test]
