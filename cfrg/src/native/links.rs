@@ -72,6 +72,8 @@ pub struct Facts<'a> {
     pub wiki: bool,
     /// See [`PublicGithub`]. Only read for a public Bitbucket copy.
     pub github: Option<PublicGithub<'a>>,
+    /// GitHub only: the copy holds the wiki (public and its wiki repository exists).
+    pub copy_wiki: bool,
 }
 
 fn forgejo(facts: &Facts, kind: Kind) -> String {
@@ -111,7 +113,7 @@ pub fn links(facts: &Facts) -> Vec<Link> {
     let (needs_issues, needs_wiki) = match facts.provider {
         Provider::Gitlab => (false, false),
         // A public GitHub copy holds the wiki itself (R40); a private one links to Forgejo.
-        Provider::Github => (false, facts.private),
+        Provider::Github => (false, facts.private || !facts.copy_wiki),
         Provider::Bitbucket => (true, true),
     };
     let mut out = Vec::new();
@@ -171,6 +173,7 @@ mod tests {
             issues: true,
             wiki: true,
             github: None,
+            copy_wiki: true,
         }
     }
 
@@ -198,6 +201,13 @@ mod tests {
         assert_eq!(copy_description("A tool", &f), "A tool");
         let mut f = facts(Provider::Github, true);
         f.github = visible(true, true);
+        assert_eq!(
+            copy_description("A tool", &f),
+            "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+        );
+        // A public copy whose wiki repository is not initialised links like a private one.
+        let mut f = facts(Provider::Github, false);
+        f.copy_wiki = false;
         assert_eq!(
             copy_description("A tool", &f),
             "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"

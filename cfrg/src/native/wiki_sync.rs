@@ -688,23 +688,6 @@ impl<'a> Session<'a> {
             return Err("GitHub copy identity or visibility differs from the primary".into());
         }
         count.copies += 1;
-        if repo["has_wiki"] != true {
-            *count.held.entry("copy-wiki-off".into()).or_default() += 1;
-            return Ok(
-                json!({"state":"held", "reason":"copy-wiki-off", "note":"the settings sync (R42) switches it on"}),
-            );
-        }
-        if state.head.is_none() {
-            let text = git(
-                self.scratch.path(),
-                self.source_env.clone(),
-                &["ls-remote", "--symref", "--", &state.wiki_url, "HEAD"],
-                60,
-            )?;
-            state.head =
-                Some(wiki::read_source_head(&text).ok_or("The Forgejo wiki has no readable HEAD")?);
-        }
-        let (branch, source_head) = state.head.clone().ok_or("No source head")?;
         let origin = "https://github.com";
         let copy_url = format!("{origin}/{path}.wiki.git");
         let copy_env = || -> Result<Environment> {
@@ -731,21 +714,32 @@ impl<'a> Session<'a> {
         let text = match listed {
             Ok(text) => text,
             Err(error) => {
-                // GitHub creates `<repo>.wiki.git` only after a first page exists. Writing that page is a
-                // web-UI act (R9), so the copy is reported, never forced.
+                // GitHub creates `<repo>.wiki.git` only after a first page exists, a web-UI act nobody
+                // scripts (R9). The copy is then treated like a private one (wiki off, description link):
+                // no hold, and the first run that finds the repository switches to the copy.
                 let why = error.to_string();
                 if why.contains("not found") || why.contains("Repository not found") {
-                    *count
-                        .held
-                        .entry("copy-wiki-repository-not-initialised".into())
-                        .or_default() += 1;
-                    return Ok(
-                        json!({"state":"held", "reason":"copy-wiki-repository-not-initialised"}),
-                    );
+                    *self.link_counts.entry("github".into()).or_default() += 1;
+                    return Ok(json!({"state":"link", "reason":"wiki-repository-not-initialised"}));
                 }
                 return Err(error);
             }
         };
+        if repo["has_wiki"] != true {
+            // The repository exists but the wiki is off: the settings sync switches it on first.
+            return Ok(json!({"state":"waiting-for-settings", "reason":"copy-wiki-off"}));
+        }
+        if state.head.is_none() {
+            let text = git(
+                self.scratch.path(),
+                self.source_env.clone(),
+                &["ls-remote", "--symref", "--", &state.wiki_url, "HEAD"],
+                60,
+            )?;
+            state.head =
+                Some(wiki::read_source_head(&text).ok_or("The Forgejo wiki has no readable HEAD")?);
+        }
+        let (branch, source_head) = state.head.clone().ok_or("No source head")?;
         let copy = wiki::read_copy(&text, &branch);
         let ancestor = match &copy {
             Copy::At(at) if *at != source_head => {

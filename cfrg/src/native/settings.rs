@@ -235,6 +235,17 @@ fn normalized(topics: &[String]) -> Vec<String> {
 
 /// Decide what a copy needs.
 pub fn plan(provider: Provider, primary: &Primary, seen: &Observed) -> Plan {
+    plan_with_wiki_repo(provider, primary, seen, true)
+}
+
+/// [`plan`] with GitHub's `<repo>.wiki.git` state: GitHub creates it with the first page, a
+/// web-UI act nobody scripts (R9), so an uninitialised one counts as no wiki (like a private copy).
+pub fn plan_with_wiki_repo(
+    provider: Provider,
+    primary: &Primary,
+    seen: &Observed,
+    wiki_repo: bool,
+) -> Plan {
     let caps = capabilities(provider);
     let mut plan = Plan::default();
     let change = |plan: &mut Plan, field, from: Value, to: Value| {
@@ -336,7 +347,12 @@ pub fn plan(provider: Provider, primary: &Primary, seen: &Observed) -> Plan {
         change(&mut plan, Field::Issues, json!(false), json!(true));
     }
     // The wiki is on wherever it is copied (R40); a private GitHub copy links to it instead.
-    if let (Some(wanted), Some(live)) = (wiki_wanted(provider, effective_private), seen.wiki) {
+    let wiki_wanted_here = wiki_wanted(provider, effective_private).map(|w| {
+        // A GitHub copy holds the wiki only while its wiki repository exists; otherwise it is
+        // treated like a private copy (wiki off, the description links to Forgejo).
+        w && (provider != Provider::Github || wiki_repo)
+    });
+    if let (Some(wanted), Some(live)) = (wiki_wanted_here, seen.wiki) {
         if caps.wiki && live != wanted {
             change(&mut plan, Field::Wiki, json!(live), json!(wanted));
         }
@@ -418,6 +434,23 @@ mod tests {
             updates: Some(false),
             vulnerability_reporting: Some(true),
         }
+    }
+
+    #[test]
+    fn an_uninitialised_github_wiki_is_treated_like_a_private_copy() {
+        let mut seen = matching();
+        seen.wiki = Some(true);
+        let plan = plan_with_wiki_repo(Provider::Github, &primary(), &seen, false);
+        let wiki = plan
+            .changes
+            .iter()
+            .find(|c| c.field == Field::Wiki)
+            .unwrap();
+        assert_eq!(wiki.to, json!(false));
+        // Once a human made the first page the next run keeps the wiki on, no hold state.
+        assert!(plan_for(Provider::Github, &primary(), &seen)
+            .changes
+            .is_empty());
     }
 
     #[test]

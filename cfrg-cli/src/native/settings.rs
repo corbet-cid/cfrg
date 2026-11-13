@@ -200,6 +200,9 @@ pub fn run(options: &Options) -> Result<()> {
                     );
                 };
                 count.copies += 1;
+                let wiki_repo = provider != Provider::Github
+                    || seen.private != Some(false)
+                    || github_wiki_repo_exists(&path);
                 if provider == Provider::Github
                     && seen.private == Some(false)
                     && !options
@@ -217,6 +220,8 @@ pub fn run(options: &Options) -> Result<()> {
                             .inspect_err(|_| on_primary = true)?,
                     );
                 }
+                let copy_wiki =
+                    provider == Provider::Github && seen.private == Some(false) && wiki_repo;
                 let facts = links::Facts {
                     provider,
                     private: primary.settings.private,
@@ -229,10 +234,11 @@ pub fn run(options: &Options) -> Result<()> {
                         issues: *issues,
                         wiki: false,
                     }),
+                    copy_wiki,
                 };
                 let mut wanted = primary.settings.clone();
                 wanted.description = links::copy_description(&primary.settings.description, &facts);
-                let mut plan = settings::plan(provider, &wanted, &seen);
+                let mut plan = settings::plan_with_wiki_repo(provider, &wanted, &seen, wiki_repo);
                 // A copy is archived only once it carries everything the primary has.
                 if plan.changes.iter().any(|c| c.field == Field::Archive) {
                     let want = cfgj::native::branch_head(
@@ -396,6 +402,30 @@ fn row(
         row["applied"] = applied;
     }
     row
+}
+
+/// Whether `<repo>.wiki.git` of a public GitHub copy can be read (anonymous `git ls-remote`, no
+/// credential; GitHub creates the repository with the first wiki page). Any failure counts as
+/// "not there", so the copy is treated like a private one until a later run sees it.
+fn github_wiki_repo_exists(path: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--",
+            &format!("https://github.com/{path}.wiki.git"),
+            "HEAD",
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Why a write must wait, if it must. GitHub honours the write gate's files.
