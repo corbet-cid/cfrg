@@ -5,7 +5,7 @@
 //!   renovate     runs `--renovate-command` when the credential `renovate-forgejo` is in the credentials directory
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
-//!   gitlab-key   the GitLab key renewal: no-op until it lands
+//!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`, B11), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
 //! (the Secret forge-bridge-db) and handed to the child as `CFRG_RELAY_DATABASE`; it never appears in an argument or in the output.
@@ -37,6 +37,12 @@ pub struct Options {
     /// The Renovate runner (tools/renovate/run in the infra repository).
     #[arg(long, default_value = "/bin/renovate-run")]
     renovate_command: PathBuf,
+    /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
+    #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
+    gitlab_key_script: PathBuf,
+    /// Where the renewal parks a new key until it is persisted (a persistent volume: it must survive a pod crash).
+    #[arg(long, default_value = "/pending/pending")]
+    pending: PathBuf,
     /// Look only: every step plans or tests, nothing is written.
     #[arg(long, env = "DAILY_DRY_RUN")]
     dry: bool,
@@ -230,6 +236,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
 pub fn run(options: Options) -> Result<()> {
     let exe = std::env::current_exe()?;
     fs::create_dir_all(&options.state).ok();
+    fs::create_dir_all("/work/gitlab-key").ok();
     let steps = plan(&options, &exe);
     let failed = run_steps(&steps);
     if failed.is_empty() {
@@ -297,6 +304,8 @@ mod tests {
             state: "/work/state".into(),
             ca: "/ca/ca.crt".into(),
             renovate_command: "/bin/renovate-run".into(),
+            gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
+            pending: "/pending/pending".into(),
             dry,
         }
     }
@@ -323,10 +332,21 @@ mod tests {
             ("password", "p'w\\x"),
             ("renovate-forgejo", "tok"),
             ("native-env", "A=1\nB=2\n"),
+            ("gitlab_token", "g"),
+            ("forgejo_push", "f"),
+            ("gitlab_token", "g"),
+            ("forgejo_push", "f"),
         ] {
             fs::write(dir.path().join(k), v).unwrap();
         }
         let steps = plan(&options(dir.path(), true), Path::new("/bin/cfrg"));
+        let Action::Command { args, env, .. } = &steps[3].action else {
+            panic!("gitlab-key must run")
+        };
+        assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
+        assert_eq!(env["THRESHOLD_DAYS"], "0");
+        assert_eq!(env["PENDING"], "/pending/pending");
+        assert!(!env.values().any(|v| v.contains("p'w")));
         for step in &steps[..3] {
             let Action::Command { args, env, .. } = &step.action else {
                 panic!("{} must run", step.name)
