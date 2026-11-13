@@ -22,7 +22,7 @@ The placement document (`lib/placement.json`, the one declared placement) lists 
 |---|---|
 | `name` | A plain lowercase name, unique; the list is in strictly ascending order. |
 | `upstream` | The project's own repository. |
-| `forks` | Optional. Our copies of it on any forge, ours included. |
+| `forks` | Optional. Other locations of the same project: our copies on any forge (ours under every host spelling it is cloned by), or a second home of the project itself. |
 
 Every location is spelled `https://<host>/<owner>/<repo>` exactly: lowercase host, no user name,
 port, query, trailing slash or `.git`. A location belongs to one project; owner and repository match

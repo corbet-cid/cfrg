@@ -32,7 +32,7 @@ pub struct Placement {
     pub contributed: Vec<ContributedProject>,
 }
 
-/// One contributed project: its own repository, and our copies of it on any forge (ours included).
+/// One contributed project: its own repository and the other places the same project is found (our copies, a second home).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContributedProject {
@@ -40,6 +40,8 @@ pub struct ContributedProject {
     pub name: String,
     /// `https://host/owner/repo` of the project itself.
     pub upstream: String,
+    /// Other locations of the same project: our copies on any forge (ours under every host spelling it is cloned by), or a second
+    /// home of the project itself (the Tor project's own repository beside the fork we follow).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forks: Vec<String>,
 }

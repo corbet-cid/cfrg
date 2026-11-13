@@ -114,7 +114,9 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     let contributed = cfrg::contributed::Contributed::from_placement(&placement, &[])?;
     let contributed_paths = contributed.source_paths();
     if options.repository.as_ref().is_some_and(|path| {
-        !placement.repositories.iter().any(|r| r.path == *path) && !contributed_paths.contains(path)
+        !placement.repositories.iter().any(|r| r.path == *path)
+            // Forgejo paths are case-insensitive and the contributed list is held in lowercase.
+            && !contributed_paths.iter().any(|p| p.eq_ignore_ascii_case(path))
     }) {
         return Err("Selected repository is not declared".into());
     }
@@ -583,7 +585,7 @@ fn contributed_actions(
     let mut open = false;
     for path in paths
         .iter()
-        .filter(|path| only.is_none_or(|only| only == path.as_str()))
+        .filter(|path| only.is_none_or(|only| only.eq_ignore_ascii_case(path)))
     {
         match cfgj::native::contributed_actions(io, source, path, write) {
             Ok(state) => {
@@ -1228,7 +1230,8 @@ mod tests {
     #[test]
     fn one_repository_can_be_selected() {
         let mut io = forge(&["me/a", "me/b"], &[]);
-        let (left_on, report) = pass(&mut io, Operation::Reconcile, true, Some("me/b"));
+        // Forgejo paths are case-insensitive: the selection may be written as the repository is named.
+        let (left_on, report) = pass(&mut io, Operation::Reconcile, true, Some("Me/B"));
         assert!(!left_on);
         assert_eq!(
             report,
