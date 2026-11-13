@@ -22,6 +22,7 @@ use std::{
 };
 
 mod contents;
+mod daily;
 mod delete;
 mod gate;
 mod land;
@@ -55,6 +56,8 @@ enum Action {
     Release(release::Options),
     /// Switch the primary of one repository to the forge the placement now names; plan by default.
     Switch(switch::Options),
+    /// The one daily run of the bridge: Renovate, native drift reconcile, relay sweep, GitLab key renewal; each step alone.
+    Daily(daily::Options),
     /// The issue relay: apply one event from a forge, or sweep what stayed pending.
     Relay(relay::Options),
     /// Long-running mode: signed webhooks and a periodic reconcile drive landing and mirror verification.
@@ -416,6 +419,7 @@ fn run(action: Action) -> Result<()> {
         Action::Land(options) => land::run(options)?,
         Action::Release(options) => release::run(options)?,
         Action::Observe(options) => observe::run(options)?,
+        Action::Daily(options) => daily::run(options)?,
         Action::Relay(options) => relay::run(options)?,
         Action::Serve(options) => serve::run(options)?,
         Action::Switch(options) => switch::run(options)?,
