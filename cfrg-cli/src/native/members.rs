@@ -71,7 +71,7 @@ pub fn run(options: &Options) -> Result<()> {
                     .filter(|row| {
                         !matches!(
                             row["state"].as_str(),
-                            Some("absent" | "error" | "contributed-project")
+                            Some("absent" | "error" | "contributed-project" | "provider-stopped")
                         )
                     })
                     .filter_map(|row| {

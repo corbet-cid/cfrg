@@ -164,8 +164,8 @@ run writes to at most `--max-writes` copies (default 20). GitHub writes also hon
 gate's files: `--github-kill-switch DIR` (no GitHub copy is written while it exists) and
 `--github-paused-dir DIR` (`DIR/<org>` pauses that organisation); an `--apply` that reaches
 GitHub refuses to start without both. The first 401, 402, 403,
-429 or server error stops that forge for the rest of the run (no retry, the window is
-recorded in the state). The report carries `totals` and `by_organisation` counts per
+429 or server error of a copy's forge stops that forge for the rest of the run (no retry,
+the window is recorded in the state); a failed read of the Forgejo primary fails its row only. The report carries `totals` and `by_organisation` counts per
 provider: copies, absent, converged, to change, held, unsupported, and the changes by field.
 
 Dependabot's version updates cannot be switched off through an API: they start from

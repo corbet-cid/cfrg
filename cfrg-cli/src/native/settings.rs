@@ -189,6 +189,9 @@ pub fn run(options: &Options) -> Result<()> {
                 endpoint,
                 path: path.clone(),
             };
+            // A failed read of our own primary (Forgejo) fails this row only: it is no refusal
+            // by the copy's forge, so that forge keeps going.
+            let mut on_primary = false;
             let outcome = (|| -> Result<Value> {
                 let Some(seen) = observe(&mut io, &target)? else {
                     count.absent += 1;
@@ -209,11 +212,10 @@ pub fn run(options: &Options) -> Result<()> {
                 // ONE writer of descriptions: the wanted text, links included, comes from
                 // `links::copy_description`; the planner only compares it.
                 if provider != Provider::Gitlab && primary.has_wiki && wiki_pages.is_none() {
-                    wiki_pages = Some(cfgj::native::wiki_exists(
-                        &mut io,
-                        &placement.source,
-                        &primary.path,
-                    )?);
+                    wiki_pages = Some(
+                        cfgj::native::wiki_exists(&mut io, &placement.source, &primary.path)
+                            .inspect_err(|_| on_primary = true)?,
+                    );
                 }
                 let facts = links::Facts {
                     provider,
@@ -238,7 +240,8 @@ pub fn run(options: &Options) -> Result<()> {
                         &placement.source,
                         &primary.path,
                         &primary.settings.default_branch,
-                    )?;
+                    )
+                    .inspect_err(|_| on_primary = true)?;
                     let has = head(&mut io, &target, &primary.settings.default_branch)?;
                     if want.is_none() || want != has {
                         plan.changes.retain(|c| c.field != Field::Archive);
@@ -320,10 +323,14 @@ pub fn run(options: &Options) -> Result<()> {
                     // the rest of the run: no retry, the window is recorded in the state.
                     // (`expect` failures, like a 422 on one repository, name the status too but
                     // are no refusal: only the transport's "stopped without retry" is.)
-                    if message.contains("stopped without retry") || message.contains("hold for") {
+                    if !on_primary
+                        && (message.contains("stopped without retry")
+                            || message.contains("hold for"))
+                    {
                         stopped.insert(name, message.clone());
                     }
-                    rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"error", "error":message}));
+                    let side = if on_primary { "primary" } else { "copy" };
+                    rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"error", "on":side, "error":message}));
                 }
             }
         }
