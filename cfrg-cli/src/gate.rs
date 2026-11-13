@@ -61,13 +61,10 @@ enum Action {
         #[arg(long)]
         execute: bool,
     },
-    /// Switch GitHub Actions on (the steady state) or off for one listed repository. A dry run without --execute.
+    /// Switch GitHub Actions OFF for one listed repository (R6: the gate never turns them on). A dry run without --execute.
     Actions {
         /// `org/repo` listed in the gate configuration.
         repository: String,
-        /// Switch Actions off instead of on.
-        #[arg(long)]
-        disable: bool,
         #[arg(long)]
         execute: bool,
     },
@@ -152,14 +149,12 @@ pub fn run(options: Options) -> Result<()> {
         )?,
         Action::Actions {
             repository,
-            disable,
             execute,
         } => actions(
             &config,
             &options.token_env,
             &options.api,
             &repository,
-            !disable,
             execute,
         )?,
         Action::Dispatch {
@@ -691,8 +686,7 @@ fn create_repository(
 
 /// Switch GitHub Actions at repository level. A fill disables them for the first push, because a new
 /// destination receives every historical branch and tag: those commits still carry the old workflow
-/// files, and a tag push would start release runs. Steady state stays enabled (Julian: regulation lives
-/// in the code, not in a switched-off Actions tab).
+/// files, and a tag push would start release runs. The gate only ever switches Actions off (R6), never on.
 fn actions_enabled(config: &Config, org: &str, api: &str, token: &str, repo: &str) -> Result<bool> {
     let answer = github(
         config,
@@ -731,7 +725,7 @@ fn ensure_actions_disabled(
         if !actions_enabled(config, org, api, token, repo)? {
             return Ok(());
         }
-        set_actions_enabled(config, org, api, token, repo, false)?;
+        switch_actions_off(config, org, api, token, repo)?;
         if attempt < 4 {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
@@ -741,13 +735,12 @@ fn ensure_actions_disabled(
     )))
 }
 
-fn set_actions_enabled(
+fn switch_actions_off(
     config: &Config,
     org: &str,
     api: &str,
     token: &str,
     repo: &str,
-    enabled: bool,
 ) -> Result<()> {
     let path = format!("/repos/{org}/{repo}/actions/permissions");
     let answer = github(
@@ -757,13 +750,12 @@ fn set_actions_enabled(
         token,
         "PUT",
         &path,
-        Some(&json!({"enabled": enabled})),
+        Some(&json!({"enabled": false})),
     )?;
     if !matches!(answer.status, 200 | 204) {
         return Err(failure(format!(
-            "GitHub API HTTP {} switching Actions {}",
-            answer.status,
-            if enabled { "on" } else { "off" }
+            "GitHub API HTTP {} switching Actions off",
+            answer.status
         )));
     }
     Ok(())
@@ -861,16 +853,9 @@ fn initial_scan(
     Ok(scan)
 }
 
-/// Switch Actions for one listed repository through the gate: the steady state is enabled (Julian: regulation lives in the
-/// code), a first push runs with them off. Refuses while the kill switch is set or the organisation is paused.
-fn actions(
-    config: &Config,
-    token_env: &str,
-    api: &str,
-    name: &str,
-    enabled: bool,
-    execute: bool,
-) -> Result<()> {
+/// Switch Actions OFF for one listed repository through the gate. The gate never turns Actions on (R6: no CI on any copy).
+/// Refuses while the kill switch is set or the organisation is paused.
+fn actions(config: &Config, token_env: &str, api: &str, name: &str, execute: bool) -> Result<()> {
     let (org, repo) = gate::split(name)?;
     if !config.repos.contains_key(name) {
         return Err(failure(format!(
@@ -886,7 +871,7 @@ fn actions(
     if !execute {
         println!(
             "{}",
-            json!({"repo": name, "verdict": if enabled { "would enable Actions" } else { "would disable Actions" }})
+            json!({"repo": name, "verdict": "would disable Actions"})
         );
         return Ok(());
     }
@@ -901,17 +886,13 @@ fn actions(
         )));
     }
     let api = api_base(api)?;
-    set_actions_enabled(config, org, &api, &token, repo, enabled)?;
-    if actions_enabled(config, org, &api, &token, repo)? != enabled {
+    switch_actions_off(config, org, &api, &token, repo)?;
+    if actions_enabled(config, org, &api, &token, repo)? {
         return Err(failure(format!(
-            "Actions could not be switched {} at {org}/{repo}",
-            if enabled { "on" } else { "off" }
+            "Actions could not be switched off at {org}/{repo}"
         )));
     }
-    println!(
-        "{}",
-        json!({"repo": name, "verdict": if enabled { "Actions enabled" } else { "Actions disabled" }})
-    );
+    println!("{}", json!({"repo": name, "verdict": "Actions disabled"}));
     Ok(())
 }
 
@@ -1001,42 +982,10 @@ fn dispatch(
         .and_then(Value::as_bool)
         .ok_or_else(|| failure("GitHub Actions permissions response lacks enabled"))?;
     if !enabled {
-        let enabled_answer = github(
-            config,
-            org,
-            &api,
-            &token,
-            "PUT",
-            &permissions_path,
-            Some(&json!({"enabled": true, "allowed_actions": "selected"})),
-        )?;
-        if enabled_answer.status != 204 {
-            return Err(failure(format!(
-                "GitHub API HTTP {} enabling Actions",
-                enabled_answer.status
-            )));
-        }
-        let selected_path = format!("/repos/{org}/{repo}/actions/permissions/selected-actions");
-        let selected = github(
-            config,
-            org,
-            &api,
-            &token,
-            "PUT",
-            &selected_path,
-            Some(&json!({
-                "github_owned_allowed": true,
-                "verified_allowed": false,
-                "patterns_allowed": []
-            })),
-        )?;
-        if selected.status != 204 {
-            return Err(failure(format!(
-                "GitHub API HTTP {} selecting Actions",
-                selected.status
-            )));
-        }
-        println!("{}", json!({"repo": name, "verdict": "actions enabled"}));
+        // R6: the gate never turns Actions on. A dispatch on a repository whose Actions are off is refused.
+        return Err(failure(format!(
+            "Actions are off at {org}/{repo}; the gate never switches them on, nothing was dispatched"
+        )));
     }
 
     let dispatch_path = format!("/repos/{org}/{repo}/actions/workflows/{workflow}/dispatches");
@@ -1337,7 +1286,7 @@ fn flush(
         }
         // A fresh destination receives every historical branch and tag. Those commits still carry the old workflow files, so a tag
         // push would start release runs and branch pushes could start branch CI. The first push runs with Actions verifiably off;
-        // they are enabled again afterwards and `actions/runs` must stay empty. The steady state stays enabled.
+        // they stay off afterwards (R6) and `actions/runs` must stay empty.
         let initial =
             config.quiet_fill && (created || remote.as_ref().is_some_and(|r| r.is_empty()));
         if initial {
@@ -1469,12 +1418,9 @@ fn flush(
                                "workflow_runs": scan.offending_runs,
                                "dependabot_runs": scan.dependabot_runs,
                                "bot_pulls": scan.bot_pulls}));
-            // Always restore the steady state, even after a failed push: a disabled Actions tab is not the regulation.
-            set_actions_enabled(config, org, &api, token, repo, true)?;
-            if !actions_enabled(config, org, &api, token, repo)? {
-                return Err(failure(format!(
-                    "Actions could not be switched back on at {org}/{repo}"
-                )));
+            // R6: Actions stay off after the push; the gate only ever switches them off. Verify that they still are.
+            if actions_enabled(config, org, &api, token, repo)? {
+                switch_actions_off(config, org, &api, token, repo)?;
             }
         }
         match (pushed, lfs) {
@@ -1549,6 +1495,24 @@ fn flush(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gate_never_turns_actions_on() {
+        // R6 guard: no production code in this file may send an enabling body to the Actions permissions endpoint.
+        let source = include_str!("gate.rs");
+        let production = source.split("\nmod tests {").next().unwrap();
+        for forbidden in [
+            "\"enabled\": true",
+            "\"enabled\":true",
+            "json!({\"enabled\": enabled",
+            "set_actions_enabled",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the gate must never enable Actions: found {forbidden}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

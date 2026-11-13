@@ -200,14 +200,14 @@ pub fn capabilities(provider: Provider) -> Capabilities {
     }
 }
 
-/// Whether a copy of this forge carries a wiki. GitLab does (the Forgejo wiki is pushed
-/// there). GitHub does not: its wiki edit rights cannot be restricted through the API (a
-/// triage collaborator can edit a public wiki), so the copy links to the Forgejo wiki in
-/// its description instead (R40; decided by the owner's delegate 2026-11-13). Bitbucket
-/// has no wiki since 2026-08-20.
-pub fn wiki_wanted(provider: Provider) -> Option<bool> {
+/// Whether a copy of this forge carries a wiki (owner rule R40: the wiki is copied wherever
+/// that is free). GitLab does. A PUBLIC GitHub copy does (the Forgejo wiki is pushed to its
+/// `<repo>.wiki.git` through the App installation token, fast-forward only); a PRIVATE GitHub
+/// copy does not, and its description links to the Forgejo wiki. Bitbucket has no wiki since
+/// 2026-08-20.
+pub fn wiki_wanted(provider: Provider, private: bool) -> Option<bool> {
     match provider {
-        Provider::Github => Some(false),
+        Provider::Github => Some(!private),
         Provider::Gitlab => Some(true),
         Provider::Bitbucket => None,
     }
@@ -330,12 +330,13 @@ pub fn plan(provider: Provider, primary: &Primary, seen: &Observed) -> Plan {
         }
     }
 
-    // Issues are on everywhere (R38).
-    if caps.issues && seen.issues == Some(false) {
+    // Issues are on everywhere (R38), except on GitHub: those switch on in one pass once the
+    // relay's contribution and issue flows are live (owner decision 2026-11-13).
+    if caps.issues && provider != Provider::Github && seen.issues == Some(false) {
         change(&mut plan, Field::Issues, json!(false), json!(true));
     }
-    // The wiki is on GitLab only (R40); everywhere else the description links to it.
-    if let (Some(wanted), Some(live)) = (wiki_wanted(provider), seen.wiki) {
+    // The wiki is on wherever it is copied (R40); a private GitHub copy links to it instead.
+    if let (Some(wanted), Some(live)) = (wiki_wanted(provider, effective_private), seen.wiki) {
         if caps.wiki && live != wanted {
             change(&mut plan, Field::Wiki, json!(live), json!(wanted));
         }
@@ -424,7 +425,7 @@ mod tests {
         for provider in [Provider::Github, Provider::Gitlab, Provider::Bitbucket] {
             let mut seen = matching();
             // The wiki is off on GitHub, on on GitLab, absent on Bitbucket.
-            seen.wiki = wiki_wanted(provider);
+            seen.wiki = wiki_wanted(provider, primary().private);
             let plan = plan(provider, &primary(), &seen);
             assert!(plan.changes.is_empty(), "{provider:?}: {plan:?}");
             assert!(plan.held.is_empty());
@@ -534,23 +535,22 @@ mod tests {
     fn issues_wiki_ci_and_updates_follow_the_model() {
         let mut seen = matching();
         seen.issues = Some(false);
-        seen.wiki = Some(true);
+        seen.wiki = Some(false);
         seen.ci = Some(true);
         seen.updates = Some(true);
         let fields = |plan: Plan| plan.changes.iter().map(|c| c.field).collect::<Vec<_>>();
-        // GitHub: issues on, wiki OFF (its wiki edit rights cannot be restricted), CI off,
-        // update tooling off.
+        // GitHub: issues untouched for now, a public copy's wiki ON, CI off, update tooling off.
         let github = plan_for(Provider::Github, &primary(), &seen);
         assert_eq!(
             fields(github.clone()),
-            [Field::Issues, Field::Wiki, Field::Ci, Field::Updates]
+            [Field::Wiki, Field::Ci, Field::Updates]
         );
         let wiki = github
             .changes
             .iter()
             .find(|c| c.field == Field::Wiki)
             .unwrap();
-        assert_eq!(wiki.to, json!(false));
+        assert_eq!(wiki.to, json!(true));
         // CI goes off on every forge that reports it; nothing can keep it on.
         let gitlab = plan_for(Provider::Gitlab, &primary(), &seen);
         assert!(gitlab
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn private_vulnerability_reporting_is_switched_on_for_a_public_github_copy_only() {
         let mut seen = matching();
-        seen.wiki = Some(false);
+        seen.wiki = Some(true);
         seen.vulnerability_reporting = Some(false);
         let plan = plan_for(Provider::Github, &primary(), &seen);
         assert_eq!(plan.changes.len(), 1);
@@ -596,6 +596,7 @@ mod tests {
         p.private = true;
         let mut seen_private = seen.clone();
         seen_private.private = Some(true);
+        seen_private.wiki = Some(false);
         assert!(plan_for(Provider::Github, &p, &seen_private)
             .changes
             .is_empty());

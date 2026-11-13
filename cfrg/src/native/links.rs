@@ -8,7 +8,7 @@
 //! | Copy | Issues | Wiki (only when the primary has wiki pages) |
 //! |---|---|---|
 //! | GitLab | on the copy (R38): no link | copied by `cfrg native --operation wiki`: no link |
-//! | GitHub | on the copy (R38): no link | never copied (a GitHub wiki repository exists only after a first page is made in the web UI, and R9 rules out UI writes): link to Forgejo |
+//! | GitHub | issues left as they are for now | public: pushed to `<repo>.wiki.git` by the wiki sync, no link; private: no wiki, link to Forgejo |
 //! | Bitbucket | none (Bitbucket Cloud removed Issues on 2026-08-20): link | none (Wikis removed the same day): link |
 //!
 //! A link from a public Bitbucket copy goes to the GitHub copy where the public can see that
@@ -110,7 +110,8 @@ fn target(facts: &Facts, kind: Kind) -> String {
 pub fn links(facts: &Facts) -> Vec<Link> {
     let (needs_issues, needs_wiki) = match facts.provider {
         Provider::Gitlab => (false, false),
-        Provider::Github => (false, true),
+        // A public GitHub copy holds the wiki itself (R40); a private one links to Forgejo.
+        Provider::Github => (false, facts.private),
         Provider::Bitbucket => (true, true),
     };
     let mut out = Vec::new();
@@ -121,7 +122,7 @@ pub fn links(facts: &Facts) -> Vec<Link> {
         });
     }
     if needs_wiki && facts.wiki {
-        // A GitHub copy never holds the wiki itself, so its link always goes to Forgejo.
+        // Only a private GitHub copy gets here, and it never holds the wiki: the link goes to Forgejo.
         let url = if facts.provider == Provider::Github {
             forgejo(facts, Kind::Wiki)
         } else {
@@ -191,15 +192,16 @@ mod tests {
     }
 
     #[test]
-    fn github_links_the_wiki_to_forgejo_whatever_its_visibility() {
-        for private in [false, true] {
-            let mut f = facts(Provider::Github, private);
-            f.github = visible(true, true);
-            assert_eq!(
-                copy_description("A tool", &f),
-                "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
-            );
-        }
+    fn a_public_github_copy_holds_the_wiki_and_a_private_one_links_to_forgejo() {
+        let mut f = facts(Provider::Github, false);
+        f.github = visible(true, true);
+        assert_eq!(copy_description("A tool", &f), "A tool");
+        let mut f = facts(Provider::Github, true);
+        f.github = visible(true, true);
+        assert_eq!(
+            copy_description("A tool", &f),
+            "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+        );
     }
 
     #[test]
@@ -261,7 +263,7 @@ mod tests {
 
     #[test]
     fn the_origin_may_end_with_a_slash() {
-        let mut f = facts(Provider::Github, false);
+        let mut f = facts(Provider::Github, true);
         f.forge_origin = "https://forge.corbet.ch/";
         assert_eq!(
             links(&f)[0].url,

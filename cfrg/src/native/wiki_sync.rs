@@ -2,8 +2,10 @@
 //! `cfrg native --operation wiki` (all repositories) and `cfrg-serve` (one repository, when the
 //! Forgejo `wiki` system hook arrives) run the same code. The decisions are [`super::wiki`].
 //!
-//! Only declared GitLab destinations receive a push; GitHub and Bitbucket copies are counted as
-//! `link` and carry the link through the settings sync's description ([`super::links`]). A
+//! Declared GitLab destinations and PUBLIC GitHub destinations receive a push; private GitHub
+//! and Bitbucket copies are counted as `link` and carry the link through the settings sync's
+//! description ([`super::links`]). The GitHub leg pushes over HTTPS with the installation token
+//! and honours the write gate's kill switch and pause folder. A
 //! contributed project has no declared copies (R11), so it is never touched.
 //!
 //! Reads go over HTTPS with the API credentials of the placement, handed to git as an extra
@@ -356,6 +358,9 @@ pub struct WikiOptions {
     pub write: bool,
     /// The id of the deploy key on GitLab, once it exists anywhere: copies enable it by id.
     pub key_id: Option<u64>,
+    /// GitHub writes: the write gate's kill switch and pause folder. A GitHub push needs both.
+    pub github_kill_switch: Option<PathBuf>,
+    pub github_paused_dir: Option<PathBuf>,
 }
 
 /// One run over any number of repositories.
@@ -447,7 +452,7 @@ impl<'a> Session<'a> {
                 continue;
             }
             let path = live.destination_path(dest);
-            if wiki::leg(dest.provider) == Leg::Link {
+            if wiki::leg(dest.provider, declared.private) == Leg::Link {
                 *self.link_counts.entry(name.into()).or_default() += 1;
                 continue;
             }
@@ -470,8 +475,11 @@ impl<'a> Session<'a> {
                 continue;
             }
             let mut count = std::mem::take(self.push_counts.entry(key.clone()).or_default());
-            let outcome =
-                self.destination(io, &mut state, &mut count, dest, &path, declared.private);
+            let outcome = if dest.provider == Provider::Github {
+                self.github_destination(io, &mut state, &mut count, dest, &path)
+            } else {
+                self.destination(io, &mut state, &mut count, dest, &path, declared.private)
+            };
             self.push_counts.insert(key, count);
             let mut row = match outcome {
                 Ok(row) => row,
@@ -644,6 +652,189 @@ impl<'a> Session<'a> {
         count.pushed += 1;
         row["pushed"] = json!(true);
         row["key"] = json!(key);
+        Ok(row)
+    }
+
+    /// A public GitHub copy: the same decision as GitLab, but the copy is read through the REST
+    /// API, and read and push go over HTTPS with the installation token (no deploy key).
+    /// Every write waits for the gate's files: a kill switch or a paused organisation holds it.
+    fn github_destination(
+        &mut self,
+        io: &mut dyn Transport,
+        state: &mut RepoState,
+        count: &mut Count,
+        dest: &Destination,
+        path: &str,
+    ) -> Result<Value> {
+        let found = io.send(Request {
+            endpoint: dest.endpoint.clone(),
+            auth: Auth::Bearer,
+            method: "GET",
+            path: format!("/repos/{path}"),
+            body: None,
+            scope: format!("{}/repos", dest.endpoint.origin),
+            creation: false,
+        })?;
+        if found.status == 404 {
+            count.absent += 1;
+            return Ok(json!({"state":"copy-absent"}));
+        }
+        let repo = expect(found, &[200])?;
+        if repo["full_name"]
+            .as_str()
+            .is_none_or(|p| !p.eq_ignore_ascii_case(path))
+            || repo["private"] != false
+        {
+            return Err("GitHub copy identity or visibility differs from the primary".into());
+        }
+        count.copies += 1;
+        if repo["has_wiki"] != true {
+            *count.held.entry("copy-wiki-off".into()).or_default() += 1;
+            return Ok(
+                json!({"state":"held", "reason":"copy-wiki-off", "note":"the settings sync (R42) switches it on"}),
+            );
+        }
+        if state.head.is_none() {
+            let text = git(
+                self.scratch.path(),
+                self.source_env.clone(),
+                &["ls-remote", "--symref", "--", &state.wiki_url, "HEAD"],
+                60,
+            )?;
+            state.head =
+                Some(wiki::read_source_head(&text).ok_or("The Forgejo wiki has no readable HEAD")?);
+        }
+        let (branch, source_head) = state.head.clone().ok_or("No source head")?;
+        let origin = "https://github.com";
+        let copy_url = format!("{origin}/{path}.wiki.git");
+        let copy_env = || -> Result<Environment> {
+            Ok(https_env(
+                origin,
+                format!(
+                    "Authorization: Basic {}",
+                    base64(
+                        format!(
+                            "x-access-token:{}",
+                            (self.secrets)(&dest.endpoint.token_env)?
+                        )
+                        .as_bytes()
+                    )
+                ),
+            ))
+        };
+        let listed = git(
+            self.scratch.path(),
+            copy_env()?,
+            &["ls-remote", "--", &copy_url, "refs/heads/*"],
+            60,
+        );
+        let text = match listed {
+            Ok(text) => text,
+            Err(error) => {
+                // GitHub creates `<repo>.wiki.git` only after a first page exists. Writing that page is a
+                // web-UI act (R9), so the copy is reported, never forced.
+                let why = error.to_string();
+                if why.contains("not found") || why.contains("Repository not found") {
+                    *count
+                        .held
+                        .entry("copy-wiki-repository-not-initialised".into())
+                        .or_default() += 1;
+                    return Ok(
+                        json!({"state":"held", "reason":"copy-wiki-repository-not-initialised"}),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let copy = wiki::read_copy(&text, &branch);
+        let ancestor = match &copy {
+            Copy::At(at) if *at != source_head => {
+                if state.fetched.is_none() {
+                    state.fetched = Some(Source::fetch(
+                        &state.wiki_url,
+                        &self.source_env,
+                        &branch,
+                        &source_head,
+                    )?);
+                }
+                state.fetched.as_ref().and_then(|s| s.ancestor(at))
+            }
+            _ => None,
+        };
+        let action = wiki::decide(&source_head, &copy, ancestor);
+        let copy_head = match &copy {
+            Copy::At(at) => Some(at.clone()),
+            _ => None,
+        };
+        let mut row = json!({"state": action, "branch": branch, "source_head": source_head, "copy_head": copy_head});
+        match action {
+            Action::InSync => count.in_sync += 1,
+            Action::Seed => count.seed += 1,
+            Action::FastForward => count.fast_forward += 1,
+            Action::Held(reason) => {
+                *count.held.entry(reason.into()).or_default() += 1;
+                row["state"] = json!("held");
+                row["reason"] = json!(reason);
+            }
+        }
+        if !(self.options.write && action.writes()) {
+            return Ok(row);
+        }
+        let org = path.split('/').next().unwrap_or_default();
+        let (Some(kill), Some(paused)) = (
+            &self.options.github_kill_switch,
+            &self.options.github_paused_dir,
+        ) else {
+            return Err(
+                "a GitHub wiki push needs the write gate's kill switch and pause folder".into(),
+            );
+        };
+        if kill.exists() || paused.join(org).exists() {
+            row["pushed"] = json!(false);
+            row["note"] = json!("held by the write gate (kill switch or paused organisation)");
+            return Ok(row);
+        }
+        if self.pushes >= self.options.max_pushes {
+            row["pushed"] = json!(false);
+            row["note"] = json!("--wiki-max-pushes reached; the next run continues");
+            return Ok(row);
+        }
+        if state.fetched.is_none() {
+            state.fetched = Some(Source::fetch(
+                &state.wiki_url,
+                &self.source_env,
+                &branch,
+                &source_head,
+            )?);
+        }
+        let src = state.fetched.as_ref().ok_or("No fetched source")?;
+        if self.pushes > 0 {
+            std::thread::sleep(self.options.push_gap);
+        }
+        self.pushes += 1;
+        let target = format!("{}:refs/heads/{}", src.head, src.branch);
+        git(
+            src.dir.path(),
+            copy_env()?,
+            &["push", "--quiet", "--no-verify", "--", &copy_url, &target],
+            300,
+        )?;
+        let after = git(
+            self.scratch.path(),
+            copy_env()?,
+            &[
+                "ls-remote",
+                "--",
+                &copy_url,
+                &format!("refs/heads/{}", src.branch),
+            ],
+            60,
+        )?;
+        if wiki::read_copy(&after, &src.branch) != Copy::At(src.head.clone()) {
+            return Err("The copy wiki does not show the pushed commit".into());
+        }
+        count.pushed += 1;
+        row["pushed"] = json!(true);
         Ok(row)
     }
 

@@ -6,7 +6,8 @@
 //! | Copy | Leg | Why |
 //! |---|---|---|
 //! | GitLab | push | free for public and private projects; a project deploy key with `can_push` may push the wiki (probe RW1, 2026-11-13) |
-//! | GitHub | link | a GitHub wiki repository exists only after a first page is made in the web UI, and R9 rules out UI writes; the copy keeps `has_wiki` off |
+//! | GitHub, public | push | the owner rule R40 (wiki copied wherever free): `<repo>.wiki.git` over HTTPS with the App installation token, fast-forward only, held on divergence, paced; the copy has `has_wiki` on |
+//! | GitHub, private | link | the copy keeps `has_wiki` off and its description links to the Forgejo wiki |
 //! | Bitbucket | link | Bitbucket Cloud removed Wikis on 2026-08-20 |
 //!
 //! The push is a fast-forward or nothing. A copy wiki that carries a commit Forgejo does
@@ -22,9 +23,10 @@ pub enum Leg {
     Link,
 }
 
-pub fn leg(provider: Provider) -> Leg {
+pub fn leg(provider: Provider, private: bool) -> Leg {
     match provider {
         Provider::Gitlab => Leg::Push,
+        Provider::Github if !private => Leg::Push,
         Provider::Github | Provider::Bitbucket => Leg::Link,
     }
 }
@@ -121,9 +123,10 @@ mod tests {
 
     #[test]
     fn only_gitlab_receives_the_wiki_the_others_link() {
-        assert_eq!(leg(Provider::Gitlab), Leg::Push);
-        assert_eq!(leg(Provider::Github), Leg::Link);
-        assert_eq!(leg(Provider::Bitbucket), Leg::Link);
+        assert_eq!(leg(Provider::Gitlab, true), Leg::Push);
+        assert_eq!(leg(Provider::Github, false), Leg::Push);
+        assert_eq!(leg(Provider::Github, true), Leg::Link);
+        assert_eq!(leg(Provider::Bitbucket, false), Leg::Link);
     }
 
     #[test]

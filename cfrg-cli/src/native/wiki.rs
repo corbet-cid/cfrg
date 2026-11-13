@@ -34,6 +34,8 @@ pub fn run(options: &Options) -> Result<()> {
             provider: options.provider.clone(),
             write: options.apply,
             key_id: options.wiki_key_id,
+            github_kill_switch: options.github_kill_switch.clone(),
+            github_paused_dir: options.github_paused_dir.clone(),
         },
         &secret,
     )?;
