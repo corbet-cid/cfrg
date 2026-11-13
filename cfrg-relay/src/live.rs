@@ -28,7 +28,6 @@ use tokio::runtime::Runtime;
 pub const FORGEJO_TOKEN: &str = "forgejo-token";
 pub const GITLAB_TOKEN: &str = "gitlab-token";
 pub const GITHUB_APP_ID: &str = "github-app-id";
-pub const GITHUB_INSTALLATION_ID: &str = "github-installation-id";
 pub const GITHUB_APP_KEY: &str = "github-app-key";
 
 /// The directory used when none is configured: `$CREDENTIALS_DIRECTORY` (a systemd unit), else none.
@@ -146,41 +145,34 @@ pub fn open_gitlab(dir: &Option<PathBuf>, rt: &Rc<Runtime>) -> Option<cglb::rela
 }
 
 pub fn open_github(dir: &Option<PathBuf>, rt: &Rc<Runtime>) -> Option<cghb::relay::GithubRelay> {
-    let app = (
+    // The installation of each repository owner is resolved by the driver (the App is installed per organisation).
+    match (
         credential(dir, GITHUB_APP_ID),
-        credential(dir, GITHUB_INSTALLATION_ID),
         credential(dir, GITHUB_APP_KEY),
-    );
-    match app {
-        (Some(app_id), Some(installation_id), Some(key)) => {
-            match (app_id.parse::<u64>(), installation_id.parse::<u64>()) {
-                (Ok(app_id), Ok(installation_id)) => {
-                    let creds = cghb::relay::AppCredentials {
-                        app_id,
-                        installation_id,
-                        private_key_pem: cghb::relay::Redacted::new(key),
-                    };
-                    match rt.block_on(async {
-                        cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
-                    }) {
-                        Ok(driver) => Some(driver),
-                        Err(why) => {
-                            eprintln!("relay: github refused: {why}");
-                            None
-                        }
+    ) {
+        (Some(app_id), Some(key)) => match app_id.parse::<u64>() {
+            Ok(app_id) => {
+                let creds = cghb::relay::AppCredentials {
+                    app_id,
+                    private_key_pem: cghb::relay::Redacted::new(key),
+                };
+                match rt.block_on(async {
+                    cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
+                }) {
+                    Ok(driver) => Some(driver),
+                    Err(why) => {
+                        eprintln!("relay: github refused: {why}");
+                        None
                     }
                 }
-                _ => {
-                    eprintln!("relay: github refused: {GITHUB_APP_ID} and {GITHUB_INSTALLATION_ID} must be numbers");
-                    None
-                }
             }
-        }
+            Err(_) => {
+                eprintln!("relay: github refused: {GITHUB_APP_ID} must be a number");
+                None
+            }
+        },
         _ => {
-            refused(
-                "github",
-                &[GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_APP_KEY],
-            );
+            refused("github", &[GITHUB_APP_ID, GITHUB_APP_KEY]);
             None
         }
     }

@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "cghb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=3d9d66738eaa745255703cc2fa6c7d59b5290ab3#3d9d66738eaa745255703cc2fa6c7d59b5290ab3"
+source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=cbe36b82947c6ffc7e9951b8416d3f7d5083b4ca#cbe36b82947c6ffc7e9951b8416d3f7d5083b4ca"
 dependencies = [
  "cfrg",
  "cqlt",

@@ -218,16 +218,12 @@ impl HeadHost for GitlabHeads {
 pub struct GithubHeads {
     pub rt: Rc<Runtime>,
     pub driver: cghb::relay::GithubRelay,
-    token: cghb::relay::Redacted,
 }
 
 impl GithubHeads {
-    /// Builds the host and fetches the installation token for pushes.
+    /// Builds the host. The installation token for a push is fetched per copy (the App is installed per organisation).
     pub fn new(rt: Rc<Runtime>, driver: cghb::relay::GithubRelay) -> Result<Self, ForgeError> {
-        let token = rt
-            .block_on(driver.installation_token())
-            .map_err(github_error)?;
-        Ok(Self { rt, driver, token })
+        Ok(Self { rt, driver })
     }
 
     fn repo(r: &str) -> Result<cghb::relay::Repo, ForgeError> {
@@ -251,12 +247,16 @@ impl HeadHost for GithubHeads {
     }
 
     fn site(&mut self, copy_repo: &str) -> Result<Site, ForgeError> {
-        Self::repo(copy_repo)?;
+        let repo = Self::repo(copy_repo)?;
+        let token = self
+            .rt
+            .block_on(self.driver.installation_token(&repo))
+            .map_err(github_error)?;
         Ok(Site {
             repo: copy_repo.into(),
             push_url: format!(
                 "https://x-access-token:{}@github.com/{copy_repo}.git",
-                self.token.expose()
+                token.expose()
             ),
         })
     }
@@ -453,9 +453,20 @@ impl LiveGit {
         let host = rest.split('/').next().unwrap_or("");
         if host == "github.com" {
             if let Some(driver) = &self.github {
+                let path = rest.split_once('/').map_or("", |(_, p)| p);
+                let repo = cghb::relay::Repo::parse(
+                    &path
+                        .trim_end_matches('/')
+                        .trim_end_matches(".git")
+                        .split('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+                .map_err(github_error)?;
                 let token = self
                     .rt
-                    .block_on(driver.installation_token())
+                    .block_on(driver.installation_token(&repo))
                     .map_err(github_error)?;
                 return Ok(format!("https://x-access-token:{}@{rest}", token.expose()));
             }

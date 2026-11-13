@@ -35,7 +35,7 @@ standard error, no request is made to it, and the engine treats it as an outage 
 |---|---|
 | Forgejo (the placement source) | `forgejo-token` |
 | GitLab (`gitlab.com`) | `gitlab-token` |
-| GitHub | `github-app-id`, `github-installation-id` (decimal numbers), `github-app-key` (the PEM private key of the App) |
+| GitHub | `github-app-id` (a decimal number), `github-app-key` (the PEM private key of the App); the installation of each repository owner is resolved with the App JWT (`GET /repos/{owner}/{repo}/installation`) and cached in memory |
 
 **Library API** (crate `cfrg-relay`; `cfrg relay` and `cfrg serve` run the same code):
 
