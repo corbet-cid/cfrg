@@ -54,6 +54,10 @@ pub fn run(options: Options) -> Result<()> {
         );
     }
     config.repos = repos_from_placement(&placement, &contributed);
+    // The store is connected first: a refused sweep still proves the database login (the daily dry run is that test).
+    let database =
+        std::env::var("CFRG_RELAY_DATABASE").map_err(|_| "CFRG_RELAY_DATABASE is not set")?;
+    let mut store = PgStore::connect(&database)?;
     if let Err(why) = config.validate() {
         // Not ready (typically: the relay identity ids of the forges are not configured yet). The sweep refuses cleanly
         // with exit 0; an apply holds (non-zero) so the job is re-run once the configuration is complete.
@@ -63,9 +67,6 @@ pub fn run(options: Options) -> Result<()> {
             Action::Apply { .. } => Err(why),
         };
     }
-    let database =
-        std::env::var("CFRG_RELAY_DATABASE").map_err(|_| "CFRG_RELAY_DATABASE is not set")?;
-    let mut store = PgStore::connect(&database)?;
     // One small current-thread runtime for the whole process; a forge without its systemd credential gets no adapter
     // and is an outage for the engine (exit 0 for the sweep, non-zero for apply).
     let runtime = relay_live::runtime()?;
