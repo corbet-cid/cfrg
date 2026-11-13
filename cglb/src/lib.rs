@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod native;
+pub mod relay;
 pub mod replica;
 
 /// Declared landing and release capability of this adapter. Never guessed:
