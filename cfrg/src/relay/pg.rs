@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS relay_ledger (id uuid PRIMARY KEY, ts bigint NOT NULL
 CREATE INDEX IF NOT EXISTS relay_ledger_ts ON relay_ledger (ts);
 CREATE TABLE IF NOT EXISTS relay_pace (forge text NOT NULL, namespace text NOT NULL, next_any bigint NOT NULL, next_create bigint NOT NULL, PRIMARY KEY (forge, namespace));
 CREATE TABLE IF NOT EXISTS relay_holds (forge text NOT NULL, namespace text NOT NULL, doc jsonb NOT NULL, PRIMARY KEY (forge, namespace));
+CREATE TABLE IF NOT EXISTS relay_copy_ids (forge text NOT NULL, path text NOT NULL, repo_id text NOT NULL, resolved_at bigint NOT NULL, PRIMARY KEY (forge, path));
 ";
 
 pub struct PgStore {
@@ -329,5 +330,38 @@ impl Store for PgStore {
             &[&forge.as_str(), &namespace],
         )?;
         Ok(changed > 0)
+    }
+}
+
+impl super::copyid::CopyIds for PgStore {
+    fn load(&mut self) -> Result<std::collections::BTreeMap<(Forge, String), String>> {
+        let rows = self
+            .client
+            .borrow_mut()
+            .query("SELECT forge, path, repo_id FROM relay_copy_ids", &[])?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in &rows {
+            if let Ok(forge) = Forge::parse(row.get::<_, &str>(0)) {
+                out.insert((forge, row.get::<_, String>(1)), row.get::<_, String>(2));
+            }
+        }
+        Ok(out)
+    }
+
+    fn put(&mut self, forge: Forge, path: &str, repo_id: &str, now: u64) -> Result<()> {
+        self.run(
+            "INSERT INTO relay_copy_ids (forge, path, repo_id, resolved_at) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (forge, path) DO UPDATE SET repo_id = EXCLUDED.repo_id, resolved_at = EXCLUDED.resolved_at",
+            &[&forge.as_str(), &path, &repo_id, &int(now)],
+        )?;
+        Ok(())
+    }
+
+    fn drop_id(&mut self, forge: Forge, repo_id: &str) -> Result<()> {
+        self.run(
+            "DELETE FROM relay_copy_ids WHERE forge = $1 AND repo_id = $2",
+            &[&forge.as_str(), &repo_id],
+        )?;
+        Ok(())
     }
 }

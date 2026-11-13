@@ -30,8 +30,50 @@ fn host_of(origin: &str) -> String {
     host.strip_prefix("api.").map(str::to_owned).unwrap_or(host)
 }
 
-/// The repository sets of `placement`, sorted by name.
+/// The repository sets of `placement`, sorted by name. Only copies the placement knows by id are members.
 pub fn repos_from_placement(placement: &Placement, contributed: &Contributed) -> Vec<RepoSet> {
+    repos_from_placement_with(placement, contributed, &|_, _| None)
+}
+
+/// The copies of the relayed repositories whose immutable id the placement does not know and `known` (the resolved
+/// ids, by forge and path) does not either: the ones that still have to be resolved from their path.
+pub fn unresolved_copies(
+    placement: &Placement,
+    contributed: &Contributed,
+    known: &dyn Fn(Forge, &str) -> Option<String>,
+) -> Vec<(Forge, String)> {
+    let with = repos_from_placement_with(placement, contributed, known);
+    let have: BTreeSet<(Forge, String)> = with
+        .iter()
+        .flat_map(|s| s.members.iter().map(|(f, m)| (*f, m.path.clone())))
+        .collect();
+    let mut out = Vec::new();
+    for set in &with {
+        let Some(repo) = placement.repositories.iter().find(|r| r.path == set.name) else {
+            continue;
+        };
+        for copy in repo.destinations.iter().filter(|d| !d.absent) {
+            let forge = match copy.provider {
+                Provider::Github => Forge::Github,
+                Provider::Gitlab => Forge::Gitlab,
+                _ => continue,
+            };
+            if !have.contains(&(forge, copy.path.clone())) {
+                out.push((forge, copy.path.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Like [`repos_from_placement`], with `known` supplying the id of a copy the placement does not know (the ids
+/// resolved from the path and kept in the relay database). A repository whose only copies are unresolved is still
+/// listed; [`unresolved_copies`] names what is missing.
+pub fn repos_from_placement_with(
+    placement: &Placement,
+    contributed: &Contributed,
+    known: &dyn Fn(Forge, &str) -> Option<String>,
+) -> Vec<RepoSet> {
     let source_host = host_of(&placement.source.origin);
     let skip: BTreeSet<String> = contributed.source_paths().into_iter().collect();
     let mut sets = Vec::new();
@@ -57,16 +99,23 @@ pub fn repos_from_placement(placement: &Placement, contributed: &Contributed) ->
             },
         );
         for copy in copies {
-            let (forge, id) = match (&copy.provider, &copy.repository_id) {
-                (Provider::Github, Some(id)) => (Forge::Github, id),
-                (Provider::Gitlab, Some(id)) => (Forge::Gitlab, id),
+            let forge = match copy.provider {
+                Provider::Github => Forge::Github,
+                Provider::Gitlab => Forge::Gitlab,
                 _ => continue,
+            };
+            let Some(id) = copy
+                .repository_id
+                .clone()
+                .or_else(|| known(forge, &copy.path))
+            else {
+                continue;
             };
             members.insert(
                 forge,
                 RepoRef {
                     host: host_of(&copy.endpoint.origin),
-                    id: id.clone(),
+                    id,
                     path: copy.path.clone(),
                 },
             );

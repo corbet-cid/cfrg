@@ -148,3 +148,88 @@ impl Screen for HoldAll {
         ScreenVerdict::Hold("no abuse screen is attached".into())
     }
 }
+
+/// Maps an HTTP status of a failed call to the router's error classes. A 404 or 410 is NOT mapped to `Gone` here:
+/// only the read and delete calls of a driver treat it as such, after looking at the object they asked for.
+pub fn from_status(status: u16, detail: String) -> ForgeError {
+    let lower = detail.to_ascii_lowercase();
+    match status {
+        401 => ForgeError::Refused(Refusal::Unauthorized, detail),
+        402 => ForgeError::Refused(Refusal::PaymentRequired, detail),
+        403 if lower.contains("abuse") || lower.contains("spam") => {
+            ForgeError::Refused(Refusal::Abuse, detail)
+        }
+        403 if lower.contains("rate limit") => ForgeError::Refused(Refusal::RateLimited, detail),
+        403 => ForgeError::Refused(Refusal::Forbidden, detail),
+        429 => ForgeError::Refused(Refusal::RateLimited, detail),
+        408 | 500..=599 => ForgeError::Unavailable(format!("{status}: {detail}")),
+        _ => ForgeError::Rejected(format!("{status}: {detail}")),
+    }
+}
+
+/// `2026-11-13T09:30:00Z` (also with fractions and numeric offsets) as seconds since the Unix epoch; 0 when it does
+/// not parse. The forges' timestamps are all RFC 3339.
+pub fn parse_rfc3339(text: &str) -> u64 {
+    fn num(s: &str) -> Option<i64> {
+        s.parse().ok()
+    }
+    let parse = || -> Option<i64> {
+        let (date, rest) = text.split_once(['T', 't', ' '])?;
+        let mut d = date.split('-');
+        let (y, m, day) = (num(d.next()?)?, num(d.next()?)?, num(d.next()?)?);
+        let split = rest.find(['Z', 'z', '+', '-']).unwrap_or(rest.len());
+        let (clock, zone) = rest.split_at(split);
+        let mut c = clock.split(':');
+        let (h, mi) = (num(c.next()?)?, num(c.next()?)?);
+        let s = c
+            .next()
+            .map(|s| s.split('.').next().unwrap_or("0"))
+            .and_then(num)
+            .unwrap_or(0);
+        let offset = match zone.chars().next() {
+            Some(sign @ ('+' | '-')) => {
+                let (oh, om) = zone[1..].split_once(':').unwrap_or((&zone[1..], "0"));
+                let secs = num(oh)? * 3600 + num(om)? * 60;
+                if sign == '+' {
+                    secs
+                } else {
+                    -secs
+                }
+            }
+            _ => 0,
+        };
+        // Days from civil (Howard Hinnant).
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days * 86_400 + h * 3600 + mi * 60 + s - offset)
+    };
+    parse().and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
+}
+
+/// Is `marker` one whole line of `body` (the lost-response recovery of [`RouterForge::find_by_marker`])?
+pub fn has_marker_line(body: &str, marker: &str) -> bool {
+    body.lines().any(|l| l.trim() == marker)
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_and_statuses() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(parse_rfc3339("2026-11-13T09:30:00Z"), 1_794_562_200);
+        assert_eq!(parse_rfc3339("2026-11-13T10:30:00.123+01:00"), 1_794_562_200);
+        assert_eq!(parse_rfc3339("garbage"), 0);
+        assert!(matches!(
+            from_status(403, "You have exceeded a secondary rate limit".into()),
+            ForgeError::Refused(Refusal::RateLimited, _)
+        ));
+        assert!(matches!(from_status(404, "x".into()), ForgeError::Rejected(_)));
+        assert!(matches!(from_status(502, "x".into()), ForgeError::Unavailable(_)));
+    }
+}
