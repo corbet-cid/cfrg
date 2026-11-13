@@ -17,6 +17,7 @@ use cfrg::{
 };
 use std::{fs, path::PathBuf};
 
+pub mod heads_live;
 pub mod live;
 
 /// Everything a run needs. Nothing here is a provider credential.

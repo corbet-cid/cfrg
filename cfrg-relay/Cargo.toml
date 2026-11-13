@@ -12,10 +12,8 @@ cfgj.workspace = true
 cglb.workspace = true
 cghb.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
-
-[dev-dependencies]
 tempfile.workspace = true
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 
 [lints]
 workspace = true
