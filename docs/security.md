@@ -7,8 +7,8 @@ convention.
 
 | Guard | Evidence |
 |---|---|
-| GitHub: Actions and Dependabot alerts and security updates are switched off by every reconcile, with no way to keep them on | `cghb/src/native.rs` (`disable_actions`, `disable_dependabot`); test `actions_and_dependabot_are_switched_off_with_no_way_to_keep_them_on` |
-| GitLab pipelines and Bitbucket Pipelines are switched off on every destination | [native mirrors](native-mirrors.md); `cglb/src/native.rs`, `cbkt/src/native.rs` |
+| GitHub: Actions and Dependabot alerts and security updates are switched off by every reconcile, with no way to keep them on | `src/native.rs` of the [cghb](https://git.corbet.ch/corbet-libre/cghb) repository (`disable_actions`, `disable_dependabot`); test `actions_and_dependabot_are_switched_off_with_no_way_to_keep_them_on` |
+| GitLab pipelines and Bitbucket Pipelines are switched off on every destination | [native mirrors](native-mirrors.md); `src/native.rs` of the [cglb](https://git.corbet.ch/corbet-libre/cglb) repository, `src/native.rs` of the [cbkt](https://git.corbet.ch/corbet-libre/cbkt) repository |
 | The placement has no CI field; a document carrying one is refused | `cfrg/tests/it/zero_ci.rs` (`no_destination_of_any_provider_can_declare_ci_on_or_off`, `one_declaration_of_ci_among_many_destinations_refuses_the_whole_placement`) |
 | No CI executor outside our own compute can be modelled; provider-hosted and paid executors do not parse, and the own CI of a mirror forge is refused as a driver | [repository policy](repository-policy.md); `cfrg/tests/it/forge_policy.rs` |
 | A fresh GitHub destination is created with Actions off and the first push waits for a verified off state | [gate](gate.md) "Quiet first push"; `cfrg-cli/tests/it/gate_create.rs` |

@@ -34,10 +34,10 @@ documented ([switch](docs/switch.md)) but cfrg is designed around Forgejo.
 
 | Capability | State | Evidence |
 |---|---|---|
-| Push mirrors from Forgejo to GitLab and Bitbucket, created and reconciled per repository | built | [native mirrors](docs/native-mirrors.md); `cfgj/src/native.rs`, `cglb/src/native.rs`, `cbkt/src/native.rs` |
+| Push mirrors from Forgejo to GitLab and Bitbucket, created and reconciled per repository | built | [native mirrors](docs/native-mirrors.md); `src/native.rs` of the [cfgj](https://git.corbet.ch/corbet-libre/cfgj) repository, `src/native.rs` of the [cglb](https://git.corbet.ch/corbet-libre/cglb) repository, `src/native.rs` of the [cbkt](https://git.corbet.ch/corbet-libre/cbkt) repository |
 | Copy settings (visibility, description, topics, default branch, links back to the primary) | built | `cfrg/src/native/links.rs` unit tests |
 | Receiver lock: only the mirror may write the default branch of a copy | built | [native mirrors](docs/native-mirrors.md#the-receiver-lock-protects-the-default-branch-only) |
-| CI and Dependabot switched off on every copy, with no way to switch them on | built | `cghb/src/native.rs` test `actions_and_dependabot_are_switched_off_with_no_way_to_keep_them_on`; `cfrg/tests/it/zero_ci.rs` |
+| CI and Dependabot switched off on every copy, with no way to switch them on | built | `src/native.rs` of the [cghb](https://git.corbet.ch/corbet-libre/cghb) repository test `actions_and_dependabot_are_switched_off_with_no_way_to_keep_them_on`; `cfrg/tests/it/zero_ci.rs` |
 | GitHub copies fed through one paced writer with budgets, kill switch and ledger | built | [gate](docs/gate.md); tests in `cfrg-cli/tests/it/gate_*.rs` |
 | Merge only exact green commits into the primary | built | [land](docs/land.md) |
 | Webhook-driven long-running mode for landing and mirror verification | built | [serve](docs/serve.md); `cfrg/src/serve.rs` tests |

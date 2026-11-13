@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cfrg", "cfrg-relay", "cfrg-cli", "cfrg-serve", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
+members = ["cfrg", "cfrg-relay", "cfrg-cli", "cfrg-serve", "clmr"]
 
 [workspace.package]
 edition = "2021"
@@ -21,10 +21,10 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 cfrg = { path = "cfrg" }
 clmr = { path = "clmr" }
-cfgj = { path = "cfgj" }
-cglb = { path = "cglb" }
-cbkt = { path = "cbkt" }
-cghb = { path = "cghb" }
+cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "c7fdd878add78e40308be51ec9d6c99c59251325" }
+cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "a858b2101540bc385bf15d73a4e6bd4aebb86207" }
+cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "53441c2669a03f96772827fb81a16d397cdfea0f" }
+cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "4d13411a224859148cc35a9ecbcb234063d789d4" }
 cfrg-relay = { path = "cfrg-relay" }
 
 [workspace.lints.rust]
@@ -35,3 +35,7 @@ unused_must_use = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+# The driver repositories depend on cfrg by git revision; one cfrg for the whole graph.
+[patch."https://git.corbet.ch/corbet-cid/cfrg"]
+cfrg = { path = "cfrg" }
