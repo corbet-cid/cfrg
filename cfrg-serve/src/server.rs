@@ -211,10 +211,16 @@ impl Bridge {
                 .map_err(|e| e.to_string())
                 .and_then(|r| r);
                 match result {
-                    Ok(report) => log(
-                        "done",
-                        json!({"kind": "wiki", "repository": repository, "report": report}),
-                    ),
+                    Ok(report) => {
+                        let held = report["rows"]
+                            .as_array()
+                            .is_some_and(|rows| rows.iter().any(|r| r["state"] == "held"));
+                        // A held copy (diverged, or its wiki switched off) is reported, never forced.
+                        log(
+                            if held { "held" } else { "done" },
+                            json!({"kind": "wiki", "repository": repository, "report": report}),
+                        );
+                    }
                     Err(error) => log(
                         "failed",
                         json!({"kind": "wiki", "repository": repository, "error": error}),

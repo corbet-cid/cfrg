@@ -93,6 +93,9 @@ impl State {
     }
 }
 
+/// Resolves a token by the endpoint's `token_env` name.
+pub type SecretFn = Box<dyn Fn(&str) -> Result<String> + Send>;
+
 pub struct Http {
     state_path: PathBuf,
     lock_path: PathBuf,
@@ -100,6 +103,8 @@ pub struct Http {
     count: u32,
     apply: bool,
     pacing: Pacing,
+    /// Where a token comes from when it is not in the process environment (a credentials directory).
+    secrets: Option<SecretFn>,
 }
 
 pub fn now() -> Result<u64> {
@@ -133,12 +138,18 @@ impl Http {
                 count: 0,
                 apply,
                 pacing: Pacing::default(),
+                secrets: None,
             }),
             Err(e) => {
                 fs::remove_file(&lock_path)?;
                 Err(e.into())
             }
         }
+    }
+    /// Resolve tokens through `secrets` (by the endpoint's `token_env` name) instead of the environment.
+    pub fn with_secrets(mut self, secrets: SecretFn) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
     /// Use a tighter or looser request spacing than the conservative default.
     pub fn paced(mut self, pacing: Pacing) -> Self {
@@ -226,10 +237,11 @@ impl Transport for Http {
             );
         }
         let mut env = environment();
-        env.insert(
-            "CFRG_NATIVE_TOKEN".into(),
-            token(&request.endpoint.token_env)?.into(),
-        );
+        let secret = match &self.secrets {
+            Some(resolve) => resolve(&request.endpoint.token_env)?,
+            None => token(&request.endpoint.token_env)?,
+        };
+        env.insert("CFRG_NATIVE_TOKEN".into(), secret.into());
         let runner = Runner::new(std::env::current_dir()?, env, Duration::from_secs(45))?
             .with_stderr_events()
             .without_child_stderr();
