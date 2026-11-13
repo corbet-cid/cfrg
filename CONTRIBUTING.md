@@ -38,6 +38,11 @@ Contributions made with AI assistance are accepted under the same rules as any
 other, provided you understand and stand behind the change and have the right to
 contribute it.
 
+## Rule numbers in comments
+
+Comments cite R-numbers (the [operating model](https://forge.corbet.ch/corbet-cid/ccid/wiki/Operating-model)) and
+RD-numbers (the [bridge design](https://forge.corbet.ch/corbet-cid/cfrg/wiki/Bridge-design)).
+
 ## License of contributions
 
 By contributing you agree that your contribution is licensed under
