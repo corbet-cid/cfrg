@@ -4,6 +4,8 @@
 //! failed, so the Job fails. A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
 //!   renovate     runs `--renovate-command` when the credential `renovate-forgejo` is in the credentials directory
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
+//!   settings     `cfrg native --operation settings --apply` (R42 copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
+//!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
 //!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`, B11), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
@@ -40,6 +42,12 @@ pub struct Options {
     /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
+    /// The GitHub write gate's directory (its volume): `<dir>/kill-switch` is the kill switch, `<dir>/paused` the pause folder. Without the directory the `settings` and `wiki` steps refuse.
+    #[arg(long, default_value = "/gate")]
+    gate_dir: PathBuf,
+    /// Writes of one `settings` run and pushes of one `wiki` run (bounded per run).
+    #[arg(long, default_value_t = 20)]
+    max_writes: usize,
     /// Look only: every step plans or tests, nothing is written.
     #[arg(long, env = "DAILY_DRY_RUN")]
     dry: bool,
@@ -197,6 +205,69 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             Action::Command { program: exe.to_owned(), args, env }
         }
     };
+    // settings and wiki: the copies of the R42 settings and the copy wikis, only behind the gate's files (kill switch, pause folder) and, for the wiki, the deploy key.
+    let gate_missing = if options.gate_dir.join("paused").is_dir() {
+        None
+    } else {
+        Some(format!(
+            "the GitHub gate's pause folder {} is missing",
+            options.gate_dir.join("paused").display()
+        ))
+    };
+    let gated = |operation: &str, extra: Vec<String>| -> Action {
+        let Some(mut env) = env_file(dir, "native-env") else {
+            return Action::Noop("the provider credentials of cfrg native (native-env) are not in the credentials directory yet".into());
+        };
+        if let Some(why) = &gate_missing {
+            return Action::Noop(format!("refused: {why}"));
+        }
+        common(&mut env);
+        let mut args: Vec<String> = ["native", "--placement"].map(String::from).to_vec();
+        args.push(options.placement.display().to_string());
+        args.extend([
+            "--state".into(),
+            options.state.display().to_string(),
+            "--operation".into(),
+            operation.into(),
+        ]);
+        args.extend([
+            "--github-kill-switch".into(),
+            options.gate_dir.join("kill-switch").display().to_string(),
+        ]);
+        args.extend([
+            "--github-paused-dir".into(),
+            options.gate_dir.join("paused").display().to_string(),
+        ]);
+        args.extend(extra);
+        if !dry {
+            args.push("--apply".into());
+        }
+        Action::Command {
+            program: exe.to_owned(),
+            args,
+            env,
+        }
+    };
+    let settings = gated(
+        "settings",
+        vec!["--max-writes".into(), options.max_writes.to_string()],
+    );
+    let wiki = match (credential(dir, "wiki_deploy_key"), credential(dir, "wiki_known_hosts"), credential(dir, "wiki_key_id").and_then(|id| id.parse::<u64>().ok())) {
+        (Some(_), Some(_), Some(id)) => gated(
+            "wiki",
+            vec![
+                "--wiki-key".into(),
+                dir.join("wiki_deploy_key").display().to_string(),
+                "--wiki-known-hosts".into(),
+                dir.join("wiki_known_hosts").display().to_string(),
+                "--wiki-key-id".into(),
+                id.to_string(),
+                "--wiki-max-pushes".into(),
+                options.max_writes.to_string(),
+            ],
+        ),
+        _ => Action::Noop("refused: the wiki credentials (wiki_deploy_key, wiki_known_hosts, wiki_key_id) are not all in the credentials directory".into()),
+    };
     let sweep = match database(dir, &options.ca) {
         None => Action::Noop("the database credentials (host port dbname username password) are not in the credentials directory".into()),
         Some(url) => {
@@ -255,6 +326,14 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         Step {
             name: "native",
             action: native,
+        },
+        Step {
+            name: "settings",
+            action: settings,
+        },
+        Step {
+            name: "wiki",
+            action: wiki,
         },
         Step {
             name: "sweep",
@@ -339,6 +418,8 @@ mod tests {
             ca: "/ca/ca.crt".into(),
             renovate_command: "/bin/renovate-run".into(),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
+            gate_dir: "/nonexistent-gate".into(),
+            max_writes: 20,
             dry,
         }
     }
@@ -349,7 +430,14 @@ mod tests {
         let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
-            ["renovate", "native", "sweep", "gitlab-key"]
+            [
+                "renovate",
+                "native",
+                "settings",
+                "wiki",
+                "sweep",
+                "gitlab-key"
+            ]
         );
         assert!(steps.iter().all(|s| matches!(s.action, Action::Noop(_))));
     }
@@ -373,13 +461,13 @@ mod tests {
             fs::write(dir.path().join(k), v).unwrap();
         }
         let steps = plan(&options(dir.path(), true), Path::new("/bin/cfrg"));
-        let Action::Command { args, env, .. } = &steps[3].action else {
+        let Action::Command { args, env, .. } = &steps[5].action else {
             panic!("gitlab-key must run")
         };
         assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
         assert_eq!(env["THRESHOLD_DAYS"], "0");
         assert!(!env.values().any(|v| v.contains("p'w")));
-        for step in &steps[..3] {
+        for step in [&steps[0], &steps[1], &steps[4]] {
             let Action::Command { args, env, .. } = &step.action else {
                 panic!("{} must run", step.name)
             };
@@ -391,7 +479,7 @@ mod tests {
                     || env.get("RENOVATE_DRY_RUN").map(String::as_str) == Some("full")
             );
         }
-        let Action::Command { args, env, .. } = &steps[2].action else {
+        let Action::Command { args, env, .. } = &steps[4].action else {
             unreachable!()
         };
         assert_eq!(args, &["relay", "sweep", "--older-than", "315360000"]);
@@ -405,6 +493,98 @@ mod tests {
                 && !args.contains(&"--apply".to_string())
         );
         assert_eq!(env["A"], "1");
+    }
+
+    fn gate_world(dir: &Path, gate: &Path, wiki: bool) {
+        for (k, v) in [("native-env", "A=1"), ("host", "db")] {
+            fs::write(dir.join(k), v).unwrap();
+        }
+        if wiki {
+            for (k, v) in [
+                ("wiki_deploy_key", "k"),
+                ("wiki_known_hosts", "h"),
+                ("wiki_key_id", "77"),
+            ] {
+                fs::write(dir.join(k), v).unwrap();
+            }
+        }
+        fs::create_dir_all(gate.join("paused")).unwrap();
+    }
+
+    #[test]
+    fn settings_and_wiki_run_behind_the_gate_files_with_bounded_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = tempfile::tempdir().unwrap();
+        gate_world(dir.path(), gate.path(), true);
+        let mut o = options(dir.path(), false);
+        o.gate_dir = gate.path().to_owned();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        assert_eq!(
+            steps.iter().map(|s| s.name).collect::<Vec<_>>(),
+            [
+                "renovate",
+                "native",
+                "settings",
+                "wiki",
+                "sweep",
+                "gitlab-key"
+            ]
+        );
+        let Action::Command { args, .. } = &steps[2].action else {
+            panic!("settings must run")
+        };
+        assert!(
+            args.windows(2).any(|w| w == ["--operation", "settings"])
+                && args.contains(&"--apply".to_string())
+        );
+        assert!(args.windows(2).any(|w| w == ["--max-writes", "20"]));
+        assert!(
+            args.contains(&"--github-kill-switch".to_string())
+                && args.contains(&"--github-paused-dir".to_string())
+        );
+        let Action::Command { args, .. } = &steps[3].action else {
+            panic!("wiki must run")
+        };
+        assert!(
+            args.windows(2).any(|w| w == ["--operation", "wiki"])
+                && args.contains(&"--apply".to_string())
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--wiki-max-pushes", "20"])
+                && args.windows(2).any(|w| w == ["--wiki-key-id", "77"])
+        );
+        // dry: neither writes
+        o.dry = true;
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        for i in [2, 3] {
+            let Action::Command { args, .. } = &steps[i].action else {
+                panic!()
+            };
+            assert!(!args.contains(&"--apply".to_string()));
+        }
+    }
+
+    #[test]
+    fn without_the_gate_or_the_wiki_credentials_these_steps_refuse_with_a_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = tempfile::tempdir().unwrap();
+        gate_world(dir.path(), gate.path(), false);
+        let mut o = options(dir.path(), false);
+        o.gate_dir = gate.path().to_owned();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        assert!(matches!(steps[2].action, Action::Command { .. }));
+        let Action::Noop(why) = &steps[3].action else {
+            panic!("wiki without credentials must refuse")
+        };
+        assert!(why.starts_with("refused"));
+        o.gate_dir = "/nonexistent-gate".into();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        for i in [2, 3] {
+            let Action::Noop(why) = &steps[i].action else {
+                panic!("no gate: refuse")
+            };
+            assert!(why.starts_with("refused"), "{why}");
+        }
     }
 
     #[test]
