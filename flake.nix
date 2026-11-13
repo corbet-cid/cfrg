@@ -19,6 +19,10 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes."cqlt-0.1.0" = "sha256-CNoV6S+339tZGgSCU57kDc1F8r7T0RWc7Ee9nrHkf34=";
+            outputHashes."cglb-0.1.0" = "sha256-JjiroSMe3+Va4ytu4mxRQFpc/DW099qpuemYln4+iuM=";
+            outputHashes."cghb-0.1.0" = "sha256-knNwPEBUcX/m693gWTWyyXbQXZji0hoPveJMMOPgx24=";
+            outputHashes."cfgj-0.1.0" = "sha256-RiOocvcPKA8oZIitLahym2mz4amPGKvPblnlxZdcwSc=";
+            outputHashes."cbkt-0.1.0" = "sha256-BuSpc2CDzo5b816b5w2oAd54idHtfzPOqDWi3Nb71rk=";
           };
           cargoBuildFlags = [ "-p" package ];
           env = pkgs.lib.optionalAttrs (self ? rev) { CFRG_SOURCE_REVISION = self.rev; };
