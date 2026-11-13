@@ -199,6 +199,8 @@ pub struct RouterConfig {
     /// Immutable user ids of the relay identity (`corbet-forge`) per forge. Guard RD4(a) and the
     /// RD9 marker trust compare ids, never logins.
     pub relay: BTreeMap<Forge, Vec<String>>,
+    /// Left out in production: the sets come from the placement ([`super::derive::repos_from_placement`]).
+    #[serde(default)]
     pub repos: Vec<RepoSet>,
     #[serde(default)]
     pub people: Vec<Person>,

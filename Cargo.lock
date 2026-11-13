@@ -398,6 +398,7 @@ dependencies = [
  "ctrlc",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
 ]
 

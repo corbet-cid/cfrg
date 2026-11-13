@@ -2,11 +2,13 @@
 //!
 //! The mapping lives in the PostgreSQL database named by `CFRG_RELAY_DATABASE` (a libpq connection string; it carries
 //! a credential, so it is never an argument). Every outcome is one JSON line on standard output.
+use crate::relay_live;
 use cfrg::{
     contributed::Contributed,
     native::Placement,
     relay::{
-        pacing::SystemClock, pg::PgStore, Engine, Forges, Hint, HoldAll, Outcome, RouterConfig,
+        derive::repos_from_placement, pacing::SystemClock, pg::PgStore, Engine, Hint, HoldAll,
+        Outcome, RouterConfig,
     },
     Result,
 };
@@ -40,16 +42,34 @@ enum Action {
 }
 
 pub fn run(options: Options) -> Result<()> {
-    let config = RouterConfig::parse(&fs::read_to_string(&options.config)?)?;
-    let contributed = Contributed::from_placement(
-        &Placement::from_document(&fs::read(&options.placement)?)?,
-        &[],
-    )?;
+    let mut config = RouterConfig::parse(&fs::read_to_string(&options.config)?)?;
+    let placement = Placement::from_document(&fs::read(&options.placement)?)?;
+    let contributed = Contributed::from_placement(&placement, &[])?;
+    // The repository set is the placement's, never a hand list (R44): every Forgejo primary with a GitHub or GitLab
+    // copy, without contributed projects and without Bitbucket.
+    if !config.repos.is_empty() {
+        return Err(
+            "the relay configuration must not list repositories: they come from the placement"
+                .into(),
+        );
+    }
+    config.repos = repos_from_placement(&placement, &contributed);
+    if let Err(why) = config.validate() {
+        // Not ready (typically: the relay identity ids of the forges are not configured yet). The sweep refuses cleanly
+        // with exit 0; an apply holds (non-zero) so the job is re-run once the configuration is complete.
+        eprintln!("relay: refused: {why}");
+        return match options.action {
+            Action::Sweep { .. } => Ok(()),
+            Action::Apply { .. } => Err(why),
+        };
+    }
     let database =
         std::env::var("CFRG_RELAY_DATABASE").map_err(|_| "CFRG_RELAY_DATABASE is not set")?;
     let mut store = PgStore::connect(&database)?;
-    // The live drivers (cghb, cglb, cfgj) are added here by the workflow task; a forge without one is an outage.
-    let mut forges = Forges::new();
+    // One small current-thread runtime for the whole process; a forge without its systemd credential gets no adapter
+    // and is an outage for the engine (exit 0 for the sweep, non-zero for apply).
+    let runtime = relay_live::runtime()?;
+    let mut forges = relay_live::forges(&runtime, &config, &placement.source.origin);
     let clock = SystemClock;
     let holder = format!("cfrg-relay-{}", std::process::id());
     let mut engine = Engine {

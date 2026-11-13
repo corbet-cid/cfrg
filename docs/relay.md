@@ -15,6 +15,33 @@ Both take `--config` (`CFRG_RELAY_CONFIG`, the relay configuration JSON) and `--
 `contributed` list is asked first). The database is the libpq connection string in `CFRG_RELAY_DATABASE`; it carries a
 credential, so it is never an argument.
 
+## Repositories and credentials
+
+**The repository set** is derived from the placement on every run (`relay::derive`), never from a hand list; a `repos`
+list in the relay configuration is refused. A repository is relayed when it is a Forgejo primary with at least one
+GitHub or GitLab copy. Contributed projects (`native.contributed`, R10, R11) and Bitbucket (git mirror only) never take
+part. A copy is a member only when the placement knows its immutable `repository_id`; the Forgejo primary is addressed
+by its `source_id`. The relay identities (`relay`: the user ids of `corbet-forge` per forge) stay in the configuration;
+while a forge has members but no identity the run refuses: `sweep` logs `relay: refused: ...` and exits 0, `apply`
+exits non-zero.
+
+**Credentials** are read only from systemd credentials, the files `$CREDENTIALS_DIRECTORY/<name>` (no environment
+variable, no path argument, no fallback to a personal token). A missing, unreadable or empty file means that forge has
+no adapter: one line `relay: <forge> refused: credential <names> is not provided to this unit` goes to standard error,
+no request is made to it, and the engine treats it as an outage (the sweep exits 0, an apply exits non-zero).
+
+| Forge | Credential file(s) |
+|---|---|
+| Forgejo (the placement source) | `forgejo-token` |
+| GitLab (`gitlab.com`) | `gitlab-token` |
+| GitHub | `github-app-id`, `github-installation-id` (decimal numbers), `github-app-key` (the PEM private key of the App) |
+
+The process owns one current-thread tokio runtime; the synchronous engine calls the async drivers through it.
+
+**Driver coverage.** The B3 drivers write (create an issue, comment, add labels, close). The adapters answer every other
+engine call (`read`, `update_comment`, deletions, marker search; a patch that edits text, reopens or removes labels)
+with `Unavailable`, so the intent stays pending and nothing is written twice. The read side is the next driver task.
+
 ## Order of an `apply`
 
 1. Policy: the repository must be listed, the actor must not be the relay identity (RD4a).
