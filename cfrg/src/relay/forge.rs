@@ -223,13 +223,22 @@ mod helper_tests {
     fn timestamps_and_statuses() {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), 0);
         assert_eq!(parse_rfc3339("2026-11-13T09:30:00Z"), 1_794_562_200);
-        assert_eq!(parse_rfc3339("2026-11-13T10:30:00.123+01:00"), 1_794_562_200);
+        assert_eq!(
+            parse_rfc3339("2026-11-13T10:30:00.123+01:00"),
+            1_794_562_200
+        );
         assert_eq!(parse_rfc3339("garbage"), 0);
         assert!(matches!(
             from_status(403, "You have exceeded a secondary rate limit".into()),
             ForgeError::Refused(Refusal::RateLimited, _)
         ));
-        assert!(matches!(from_status(404, "x".into()), ForgeError::Rejected(_)));
-        assert!(matches!(from_status(502, "x".into()), ForgeError::Unavailable(_)));
+        assert!(matches!(
+            from_status(404, "x".into()),
+            ForgeError::Rejected(_)
+        ));
+        assert!(matches!(
+            from_status(502, "x".into()),
+            ForgeError::Unavailable(_)
+        ));
     }
 }
