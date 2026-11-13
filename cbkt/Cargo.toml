@@ -2,7 +2,7 @@
 name = "cbkt"
 edition.workspace = true
 version.workspace = true
-license-file = "LICENSE.md"
+license.workspace = true
 description = "Bitbucket adapter for cfrg: roles, grants, status, profile"
 repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 

@@ -5,6 +5,7 @@ members = ["cfrg", "cfrg-cli", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
 
 [workspace.dependencies]
 cqlt = { git = "https://git.corbet.ch/corbet-cid/cqlt", rev = "0849b9721947eac943e121204a02129b6dd4bedd" }

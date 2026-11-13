@@ -2,7 +2,7 @@
 name = "clmr"
 edition.workspace = true
 version.workspace = true
-license-file = "LICENSE.md"
+license.workspace = true
 description = "Resolver over declared stores: pure pinned/moving selection, no topology in code"
 repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 

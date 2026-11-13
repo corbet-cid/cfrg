@@ -2,7 +2,7 @@
 name = "cfgj"
 edition.workspace = true
 version.workspace = true
-license-file = "LICENSE.md"
+license.workspace = true
 description = "Forgejo adapter for cfrg: roles, grants, status, evidence, profile"
 repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 

@@ -39,7 +39,7 @@ same pass every `interval_seconds` until the queue is settled; `cfrg land
 
 The status gate applies to pull request merges only. A user who may push can
 still push to the protected branch directly: enforcement is SOFT and `cfrg land
---protect` never restricts pushes. (Julian's decision on strictness is pending;
+--protect` never restricts pushes. (the maintainer's decision on strictness is pending;
 nothing stricter exists.) Forgejo 15 protected branches always refuse force
 pushes and branch deletion.
 

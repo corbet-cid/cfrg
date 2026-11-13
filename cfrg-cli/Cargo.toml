@@ -2,7 +2,7 @@
 name = "cfrg-cli"
 edition.workspace = true
 version.workspace = true
-license-file = "LICENSE.md"
+license.workspace = true
 description = "cfrg command line over core and forge adapters"
 repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
 

@@ -133,7 +133,7 @@ every repository the source lists an SSH push mirror to one plain git host, so a
 covered too. Forgejo does the transfer (sync on commit, plus the interval as a safety net); cfrg provisions.
 
 ```json
-"copy": {"host": "10.0.42.6", "user": "richc", "admin_key_env": "CFRG_COPY_KEY",
+"copy": {"host": "git-host.example", "user": "mirror", "admin_key_env": "CFRG_COPY_KEY",
          "known_hosts_env": "CFRG_COPY_KNOWN_HOSTS", "interval_seconds": 600}
 ```
 
