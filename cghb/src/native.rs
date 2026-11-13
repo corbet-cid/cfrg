@@ -83,9 +83,9 @@ fn verify(value: Value, repo: &Repository, dest: &Destination) -> Result<Value> 
 }
 
 /// GET first: an existing repository never touches the creation scope. GitHub
-/// Actions is switched off on the destination (a mirror carries workflow files
-/// that must not run there) unless the destination declares `ci`: then a remote
-/// CI broker runs the provider's workflow and the switch is left as it is.
+/// Actions and Dependabot's alerts and security updates are switched off on every
+/// destination, always (operating model R6, R7, R9, R35, R42): a mirror carries
+/// workflow files that must not run there, and no declaration keeps them on.
 pub fn ensure_destination_repo(
     io: &mut dyn Transport,
     repo: &Repository,
@@ -130,10 +130,66 @@ pub fn ensure_destination_repo(
         )?;
         verify(created, repo, dest)?
     };
-    if !dest.ci {
-        disable_actions(io, dest, apply)?;
-    }
+    disable_actions(io, dest, apply)?;
+    disable_dependabot(io, dest, apply)?;
     Ok(Some(value))
+}
+
+/// Dependabot's alerts and security updates off (operating model R35, R42, section 3.5). Reads first and writes only on drift:
+/// 204 means alerts are on, 404 means off, and with alerts off there are no security updates either. Version updates have no
+/// switch of their own: they follow `.github/dependabot.yml`, which a copy carries only because its primary does.
+fn disable_dependabot(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<()> {
+    let alerts = call(
+        io,
+        dest,
+        "GET",
+        &format!("/repos/{}/vulnerability-alerts", dest.path),
+        None,
+        false,
+    )?;
+    if alerts.status == 404 {
+        return Ok(());
+    }
+    expect(alerts, &[204])?;
+    if !apply {
+        return Ok(());
+    }
+    let fixes = expect(
+        call(
+            io,
+            dest,
+            "GET",
+            &format!("/repos/{}/automated-security-fixes", dest.path),
+            None,
+            false,
+        )?,
+        &[200],
+    )?;
+    if fixes["enabled"] == true {
+        expect(
+            call(
+                io,
+                dest,
+                "DELETE",
+                &format!("/repos/{}/automated-security-fixes", dest.path),
+                None,
+                false,
+            )?,
+            &[204],
+        )?;
+    }
+    expect(
+        call(
+            io,
+            dest,
+            "DELETE",
+            &format!("/repos/{}/vulnerability-alerts", dest.path),
+            None,
+            false,
+        )?,
+        &[204],
+    )?;
+    Ok(())
 }
 
 fn disable_actions(io: &mut dyn Transport, dest: &Destination, apply: bool) -> Result<()> {
@@ -664,11 +720,12 @@ mod tests {
             ),
             (200, json!({"enabled":true})),
             (204, Value::Null),
+            (404, Value::Null),
         ]);
         assert!(ensure_destination_repo(&mut io, &repo, &dest, true, false)
             .unwrap()
             .is_some());
-        assert_eq!(io.methods(), ["GET", "GET", "PUT"]);
+        assert_eq!(io.methods(), ["GET", "GET", "PUT", "GET"]);
         assert_eq!(io.asked[2].2, Some(json!({"enabled":false})));
         // A repository that disappeared is never replaced; an undeclared one is created.
         let mut io = Script::new(vec![(404, Value::Null)]);
@@ -681,24 +738,65 @@ mod tests {
         assert_eq!(io.methods(), ["GET"]);
     }
 
-    #[test]
-    fn a_declared_ci_destination_keeps_actions_as_they_are() {
-        let (repo, mut dest) = dest(false, Some("7"));
-        dest.ci = true;
-        let mut io = Script::new(vec![(
+    fn existing_repository() -> (u16, Value) {
+        (
             200,
             json!({"id":7,"full_name":"Team/Repo","private":false,"archived":false}),
-        )]);
+        )
+    }
+
+    #[test]
+    fn actions_and_dependabot_are_switched_off_with_no_way_to_keep_them_on() {
+        // Both are on: Actions get the PUT, then the security updates and the alerts are deleted, in that order.
+        let (repo, dest) = dest(false, Some("7"));
+        let mut io = Script::new(vec![
+            existing_repository(),
+            (200, json!({"enabled":true})),
+            (204, Value::Null),
+            (204, Value::Null),
+            (200, json!({"enabled":true,"paused":false})),
+            (204, Value::Null),
+            (204, Value::Null),
+        ]);
         assert!(ensure_destination_repo(&mut io, &repo, &dest, true, false)
             .unwrap()
             .is_some());
-        assert_eq!(io.methods(), ["GET"]);
-        assert!(
-            io.asked
-                .iter()
-                .all(|(_, path, _)| !path.contains("actions/permissions")),
-            "a declared CI destination is not switched off"
+        assert_eq!(
+            io.methods(),
+            ["GET", "GET", "PUT", "GET", "GET", "DELETE", "DELETE"]
         );
+        assert_eq!(
+            io.asked[5].1, "/repos/team/repo/automated-security-fixes",
+            "the security updates go before the alerts they depend on"
+        );
+        assert_eq!(io.asked[6].1, "/repos/team/repo/vulnerability-alerts");
+
+        // Alerts on, security updates already off: only the alerts are deleted.
+        let mut io = Script::new(vec![
+            existing_repository(),
+            (200, json!({"enabled":false})),
+            (204, Value::Null),
+            (200, json!({"enabled":false,"paused":false})),
+            (204, Value::Null),
+        ]);
+        ensure_destination_repo(&mut io, &repo, &dest, true, false).unwrap();
+        assert_eq!(io.methods(), ["GET", "GET", "GET", "GET", "DELETE"]);
+
+        // Everything already off: reads only, nothing is written (also what a plan does with apply = false).
+        let mut io = Script::new(vec![
+            existing_repository(),
+            (200, json!({"enabled":false})),
+            (404, Value::Null),
+        ]);
+        ensure_destination_repo(&mut io, &repo, &dest, true, false).unwrap();
+        assert_eq!(io.methods(), ["GET", "GET", "GET"]);
+        let mut io = Script::new(vec![
+            existing_repository(),
+            (200, json!({"enabled":true})),
+            (204, Value::Null),
+        ]);
+        ensure_destination_repo(&mut io, &repo, &dest, false, false).unwrap();
+        assert_eq!(io.methods(), ["GET", "GET", "GET"], "a plan writes nothing");
     }
 
     fn dest_without_id() -> (Repository, Destination) {

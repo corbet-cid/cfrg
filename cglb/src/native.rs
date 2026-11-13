@@ -86,7 +86,7 @@ pub fn ensure_destination_repo(
     )?;
     if response.status == 200 {
         let mut value = verify(response.body, repo, dest)?;
-        if !dest.ci && value["builds_access_level"] != "disabled" && apply {
+        if value["builds_access_level"] != "disabled" && apply {
             value = verify(
                 expect(
                     call(
@@ -127,9 +127,7 @@ pub fn ensure_destination_repo(
         "visibility":if repo.private {"private"} else {"public"},
         "initialize_with_readme":false
     });
-    if !dest.ci {
-        body["builds_access_level"] = json!("disabled");
-    }
+    body["builds_access_level"] = json!("disabled");
     let value = expect(
         call(io, dest, "POST", "/projects".into(), Some(body), true)?,
         &[201],
@@ -819,21 +817,30 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_ci_destination_keeps_gitlab_pipelines_enabled() {
+    fn gitlab_pipelines_are_switched_off_and_no_declaration_keeps_them_on() {
         let repo: Repository = serde_json::from_value(json!({"path":"team/repo","source_id":1,"private":true,"default_branch":"main","content":"native-git","destinations":[]})).unwrap();
-        let mut dest = wanted("team/repo", Some("7"));
-        dest.ci = true;
-        let mut io = Script::new(vec![(
-            200,
-            json!({"id":7,"path_with_namespace":"team/repo","visibility":"private","builds_access_level":"enabled"}),
-        )]);
+        let dest = wanted("team/repo", Some("7"));
+        let project = |level: &str| json!({"id":7,"path_with_namespace":"team/repo","visibility":"private","builds_access_level":level});
+        // Pipelines are on: the reconcile writes the switch-off and reads it back.
+        let mut io = Script::new(vec![(200, project("enabled")), (200, project("disabled"))]);
         let value = ensure_destination_repo(&mut io, &repo, &dest, true, false)
             .unwrap()
             .unwrap();
-        assert_eq!(value["builds_access_level"], "enabled");
-        assert_eq!(io.asked.len(), 1, "no PUT for a declared CI destination");
-        assert_eq!(io.asked[0].0, "GET");
+        assert_eq!(value["builds_access_level"], "disabled");
+        assert_eq!(io.asked.len(), 2);
+        assert_eq!(io.asked[1].0, "PUT");
+        assert_eq!(
+            io.asked[1].2,
+            Some(json!({"builds_access_level":"disabled"}))
+        );
+        // A plan (apply = false) only reads, and an answer that stays enabled is an error, never accepted.
+        let mut io = Script::new(vec![(200, project("enabled"))]);
+        ensure_destination_repo(&mut io, &repo, &dest, false, false).unwrap();
+        assert_eq!(io.asked.len(), 1, "a plan writes nothing");
+        let mut io = Script::new(vec![(200, project("enabled")), (200, project("enabled"))]);
+        assert!(ensure_destination_repo(&mut io, &repo, &dest, true, false).is_err());
     }
+
     /// Plays back canned answers and records what was asked.
     struct Script {
         answers: Vec<(u16, Value)>,

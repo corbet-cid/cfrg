@@ -82,9 +82,14 @@ pipelines before enrollment. No accounts, namespaces or workspaces are created.
 Leading-dot GitLab profiles, declared LFS/profile content, and explicit holds
 remain exceptions. Content classification must come from reviewed source
 inventory; this controller does not inspect Git objects. There is no LFS fallback.
-Declare `"ci": true` on a GitHub or GitLab destination whose provider CI must keep
-running (a remote broker dispatches its workflow): the reconcile leaves GitHub
-Actions or GitLab pipelines as they are instead of switching them off.
+A copy never runs CI and never runs Dependabot (operating model R6, R7, R9, R35, R42):
+the reconcile always switches off GitHub Actions, GitHub's Dependabot alerts and
+security updates, GitLab pipelines and Bitbucket Pipelines, on every destination.
+There is no `ci` field any more; a placement file that still carries `"ci": ...`
+on a destination is refused when it is loaded (`deny_unknown_fields`), so no
+declaration can keep a copy's CI on. Dependabot version updates have no switch
+of their own: they follow `.github/dependabot.yml`, which a copy carries only
+because its primary does.
 
 ## The receiver lock protects the default branch only
 
@@ -164,8 +169,8 @@ API credential (`token_env`) and the mirror credential (`password_env`). Reconci
 
 * Ensures the repository (a missing one is created in the organisation, private
   as the primary is, with issues, projects and wiki off; creation is paced by the
-  creation window) and switches GitHub Actions off on it unless it declares
-  `"ci": true` (a remote CI broker runs the provider's workflow there).
+  creation window) and always switches GitHub Actions off on it, and the
+  Dependabot alerts and security updates (reads first, writes only on drift).
 * Locks it as above. GitHub Free has rulesets for public repositories only: a
   private destination in a free organisation cannot be locked and is reported as
   `destination-or-protection-required`, never mirrored unprotected, unless the
