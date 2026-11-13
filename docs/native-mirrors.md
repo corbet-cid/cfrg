@@ -132,6 +132,9 @@ Administrative changes and destination tags are outside these branch checks.
 
 ## Settings of a copy: `--operation settings`
 
+A copy is written only when one of our Forgejo push mirrors points at it (ownership is derived from Forgejo's mirror list,
+`cfrg::native::owned_by`); any other copy is reported as not owned and left untouched.
+
 `cfrg native --placement placement.json --state native-state.json --operation settings`
 brings every copy in line with its Forgejo primary. It reads only
 unless `--apply` is given. Copies are found from the primaries, not from the placement:
