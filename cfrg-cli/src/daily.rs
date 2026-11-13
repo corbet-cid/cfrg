@@ -33,8 +33,8 @@ pub struct Options {
     /// Persistent state of `cfrg native`.
     #[arg(long, default_value = "/work/state")]
     state: PathBuf,
-    /// CA file the database certificate is verified against.
-    #[arg(long, env = "SSL_CERT_FILE", default_value = "/ca/ca.crt")]
+    /// CA file the database certificate is verified against (NOT `SSL_CERT_FILE`: that stays the public roots, which the providers and the key renewal need).
+    #[arg(long, env = "CFRG_DAILY_CA", default_value = "/ca/ca.crt")]
     ca: PathBuf,
     /// The Renovate runner (tools/renovate/run in the infra repository).
     #[arg(long, default_value = "/bin/renovate-run")]
