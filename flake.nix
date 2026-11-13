@@ -14,15 +14,15 @@
       mk = pkgs: { pname, package, extraNative ? [ ] }:
         pkgs.rustPlatform.buildRustPackage {
           inherit pname;
-          version = "0.1.0-${builtins.substring 0 8 rev}";
+          version = "0.2.0-${builtins.substring 0 8 rev}";
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes."cqlt-0.1.0" = "sha256-CNoV6S+339tZGgSCU57kDc1F8r7T0RWc7Ee9nrHkf34=";
-            outputHashes."cglb-0.1.0" = "sha256-JjiroSMe3+Va4ytu4mxRQFpc/DW099qpuemYln4+iuM=";
-            outputHashes."cghb-0.1.0" = "sha256-E8wkOZZjEapEepkPafKN+Tcooz6VQcMfbLuF6JLVYQc=";
-            outputHashes."cfgj-0.1.0" = "sha256-RiOocvcPKA8oZIitLahym2mz4amPGKvPblnlxZdcwSc=";
-            outputHashes."cbkt-0.1.0" = "sha256-BuSpc2CDzo5b816b5w2oAd54idHtfzPOqDWi3Nb71rk=";
+            outputHashes."cglb-0.1.0" = "sha256-x5LDSo21BSsh/NbNzFkpn2IeXX4oglkHjXcPQrpTRno=";
+            outputHashes."cghb-0.1.0" = "sha256-hJ8V41lvqBVbvhIMqbFAyjzKYY1la7jwXXLe/trLL6k=";
+            outputHashes."cfgj-0.1.0" = "sha256-AP7zM++9wRllDIhq/eMTizeRAKgkpRqe1rGpqu6wajk=";
+            outputHashes."cbkt-0.1.0" = "sha256-JbcmeI3ZjpQuIzmXboW0bcXNRvyKOz7h+WQfQmK5448=";
           };
           cargoBuildFlags = [ "-p" package ];
           env = pkgs.lib.optionalAttrs (self ? rev) { CFRG_SOURCE_REVISION = self.rev; };
@@ -45,7 +45,7 @@
           default = cfrg;
           # The receiver image: the binary and the CA bundle, nothing else.
           cfrg-serve-image = pkgs.dockerTools.buildLayeredImage {
-            name = "corbet/cfrg-serve";
+            name = "cfrg/cfrg-serve";
             tag = builtins.substring 0 8 rev;
             contents = [ cfrg-serve pkgs.cacert pkgs.dockerTools.fakeNss ];
             extraCommands = "mkdir -m 1777 tmp";

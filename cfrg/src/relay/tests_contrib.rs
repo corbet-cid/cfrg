@@ -140,7 +140,7 @@ fn a_github_pull_request_shows_on_gitlab_and_as_one_notice() {
         A
     );
     let mr = c.h.gl.borrow_mut().issue(GL, 1);
-    assert_eq!(mr.author.login, "corbet-forge");
+    assert_eq!(mr.author.login, "relay-bot");
     assert!(
         mr.snap
             .body
@@ -427,7 +427,7 @@ fn the_relays_own_requests_are_never_origins() {
     // The webhook of the sibling the relay itself opened.
     let relay = Actor {
         id: "300".into(),
-        login: "corbet-forge".into(),
+        login: "relay-bot".into(),
     };
     let report = c.event(Forge::Gitlab, 1, &relay);
     assert!(matches!(report.outcome, Outcome::Dropped(_)), "{report:?}");

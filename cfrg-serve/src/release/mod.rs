@@ -1,4 +1,4 @@
-//! The release upload (operating model R45), ported from the Python bridge with its tests as the parity contract.
+//! The release upload (operating model R45).
 //!
 //! A published Forgejo release goes to the GitHub and GitLab copies by API. The request is a hint, never an
 //! instruction: the module is told "OWNER/REPO TAG" and reads everything else from Forgejo. Per copy, one pass:

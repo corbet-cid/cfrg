@@ -16,22 +16,19 @@ use cfrg::{
 use clap::Args;
 use std::{path::Path, process::Command};
 
-const AUTHOR_NAME: &str = "Julian Y. Richard Corbet";
-const AUTHOR_EMAIL: &str = "48553615+julian-corbet@users.noreply.github.com";
-
 /// `cfrg take-in <owner/repo>#<notice>`: everything else is read from the notice.
 #[derive(Args)]
 pub struct Options {
     /// The notice: `<owner/repo>#<number>` on the Forgejo primary.
     target: String,
-    /// Forgejo API base.
-    #[arg(long, default_value = "https://forge.corbet.ch")]
+    /// Forgejo API base, for example `https://forge.example.org`.
+    #[arg(long)]
     forge: String,
     /// Host that serves the primary's git URL (pushed with the owner's own git credential).
-    #[arg(long, default_value = "https://git.corbet.ch")]
+    #[arg(long)]
     primary_host: String,
     /// Login whose review comments count.
-    #[arg(long, default_value = "julian-corbet")]
+    #[arg(long)]
     reviewer: String,
     /// Do everything except the push.
     #[arg(long)]
@@ -54,16 +51,43 @@ pub struct Plan {
     pub dry_run: bool,
 }
 
+/// A neutral commit identity, used only when git has none configured (the operator's own configured identity wins).
+fn fallback_identity(dir: &Path, key: &str, value: &str) -> Option<(String, String)> {
+    let configured = Command::new("git")
+        .current_dir(dir)
+        .args(["config", "--get", key])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace))
+        .unwrap_or(false);
+    let (author, committer) = if key == "user.name" {
+        ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")
+    } else {
+        ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")
+    };
+    let unset = |var: &str| std::env::var_os(var).is_none();
+    (!configured && unset(author) && unset(committer)).then(|| (key.to_owned(), value.to_owned()))
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
-        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
-        .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
-        .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
-        .output()?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for (key, value) in [
+        ("user.name", "cfrg take-in"),
+        ("user.email", "take-in@example.invalid"),
+    ] {
+        if let Some((key, value)) = fallback_identity(dir, key, value) {
+            let (author, committer) = if key == "user.name" {
+                ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")
+            } else {
+                ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL")
+            };
+            command.env(author, &value).env(committer, &value);
+        }
+    }
+    let out = command.output()?;
     if !out.status.success() {
         return Err(failure(format!(
             "git {} failed: {}",
@@ -123,26 +147,12 @@ pub fn plan_from_notice(
     })
 }
 
-/// The owner's Forgejo token: `CFRG_FORGEJO_TOKEN`, else the brain's sops file.
+/// The Forgejo token that reads the notice: `CFRG_FORGEJO_TOKEN` (an environment variable only, never an argument).
 fn forgejo_token() -> Result<String> {
-    if let Ok(token) = std::env::var("CFRG_FORGEJO_TOKEN") {
-        return Ok(token);
+    match std::env::var("CFRG_FORGEJO_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(token.trim().to_owned()),
+        _ => Err(failure("no Forgejo token: set CFRG_FORGEJO_TOKEN")),
     }
-    let file = std::env::var("CFRG_FORGEJO_SECRETS").unwrap_or_else(|_| {
-        format!(
-            "{}/agents/knowledge/secrets/forgejo.yml",
-            std::env::var("HOME").unwrap_or_default()
-        )
-    });
-    let out = Command::new("sops")
-        .args(["-d", "--extract", "[\"api_token\"]", &file])
-        .output()?;
-    if !out.status.success() {
-        return Err(failure(
-            "no Forgejo token: set CFRG_FORGEJO_TOKEN or make the sops file readable",
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// The primary's default branch, asked of the primary itself.

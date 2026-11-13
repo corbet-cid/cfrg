@@ -36,7 +36,7 @@ package registry is immutable per version, which is what a content hash needs.
 
 | Property | Verified on Forgejo 15.0.9 |
 |---|---|
-| URL | `https://forge.corbet.ch/api/packages/<owner>/generic/<package>/<commit>/<file>` |
+| URL | `https://forge.example.org/api/packages/<owner>/generic/<package>/<commit>/<file>` |
 | Immutable | first `PUT` 201, any later `PUT` 409, also with different bytes |
 | Anonymous download | yes for public owners, no token needed |
 | Hash | the files listing carries the forge-computed SHA-256; `publish` compares it with the local file |
@@ -53,8 +53,8 @@ pkgs.fetchurl { url = "<url>"; hash = "sha256-..."; executable = true; }
 
 ```json
 {"schema": 1, "forge": "forgejo",
- "endpoint": {"origin": "https://forge.corbet.ch", "token_env": "CFRG_RELEASE_TOKEN"},
- "owner": "corbet-cid", "package": "cfrg"}
+ "endpoint": {"origin": "https://forge.example.org", "token_env": "CFRG_RELEASE_TOKEN"},
+ "owner": "example-org", "package": "cfrg"}
 ```
 
 The token needs package write for the owner. Other forges answer `unsupported`

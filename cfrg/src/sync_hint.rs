@@ -115,12 +115,12 @@ mod tests {
 
     #[test]
     fn the_body_and_its_signature_are_what_the_bridge_verifies() {
-        let body = body("corbet-fsl/ccvl", "v0.1.0");
-        assert_eq!(body, r#"{"repository":"corbet-fsl/ccvl","tag":"v0.1.0"}"#);
+        let body = body("example-fsl/ccvl", "v0.1.0");
+        assert_eq!(body, r#"{"repository":"example-fsl/ccvl","tag":"v0.1.0"}"#);
         // `printf %s "$body" | openssl dgst -sha256 -hmac k -hex`
         assert_eq!(
             signature(b"k", &body),
-            "1d20e3008a8429315606c939d537a45152c61b4bbcb6b7fed6cf95c7143b05d4"
+            "d7012c72f7fab4240d594994744f099704ebf77ca75c76ac6d08274f327ff2f1"
         );
         assert!(crate::serve::verify_signature(
             b"k",

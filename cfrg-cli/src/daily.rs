@@ -1,16 +1,15 @@
-//! `cfrg daily`: the one daily run of the bridge (operating model R49), as the CronJob in the `forge-bridge` namespace runs it.
+//! `cfrg daily`: the one daily run of the bridge as a scheduler runs it (a Kubernetes CronJob, a systemd timer, cron).
 //!
 //! Five steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
-//! (Renovate is not one of them: it runs as its own CronJob `renovate-daily`, in its own image, pinned to the node of slot a.)
-//! failed, so the Job fails. A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
+//! failed, so the job fails. (Renovate is not one of them: run it as its own job.) A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
-//!   settings     `cfrg native --operation settings --apply` (R42 copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
+//!   settings     `cfrg native --operation settings --apply` (copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
-//!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`, B11), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
+//!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
-//! (the Secret forge-bridge-db) and handed to the child as `CFRG_RELAY_DATABASE`; it never appears in an argument or in the output.
+//! (a mounted Secret or a systemd credential directory) and handed to the child as `CFRG_RELAY_DATABASE`; it never appears in an argument or in the output.
 use cfrg::Result;
 use clap::Args;
 use serde_json::json;
@@ -36,7 +35,7 @@ pub struct Options {
     /// CA file the database certificate is verified against (NOT `SSL_CERT_FILE`: that stays the public roots, which the providers and the key renewal need).
     #[arg(long, env = "CFRG_DAILY_CA", default_value = "/ca/ca.crt")]
     ca: PathBuf,
-    /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
+    /// The GitLab key renewal script: a script you provide (run with bash).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
     /// The GitHub write gate's directory (its volume): `<dir>/kill-switch` is the kill switch, `<dir>/paused` the pause folder. Without the directory the `settings` and `wiki` steps refuse.
@@ -175,7 +174,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             Action::Command { program: exe.to_owned(), args, env }
         }
     };
-    // settings and wiki: the copies of the R42 settings and the copy wikis, only behind the gate's files (kill switch, pause folder) and, for the wiki, the deploy key.
+    // settings and wiki: the copy settings and the copy wikis, only behind the gate's files (kill switch, pause folder) and, for the wiki, the deploy key.
     let gate_missing = if options.gate_dir.join("paused").is_dir() {
         None
     } else {

@@ -300,7 +300,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     fn copy() -> Copy {
-        serde_json::from_value(json!({"host":"10.0.42.6","user":"richc","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600})).unwrap()
+        serde_json::from_value(json!({"host":"192.0.2.6","user":"mirror","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600})).unwrap()
     }
     fn source() -> Endpoint {
         Endpoint {
@@ -371,7 +371,7 @@ mod tests {
                         let address = body["remote_address"]
                             .as_str()
                             .unwrap()
-                            .replacen("richc@", "", 1);
+                            .replacen("mirror@", "", 1);
                         self.writes.push(format!("create {name}"));
                         self.mirror(name, &address, "10m0s");
                         ok(self.mirrors[name].last().unwrap().clone())
@@ -518,7 +518,7 @@ mod tests {
     fn a_mirror_older_than_its_wikis_twin_is_replaced_because_forgejo_probes_the_wiki_only_at_creation(
     ) {
         let mut forge = Forge::default().repo(1, "org/late", true, false);
-        forge.mirror("org/late", "ssh://10.0.42.6/org/late.git", "10m0s");
+        forge.mirror("org/late", "ssh://192.0.2.6/org/late.git", "10m0s");
         let mut host = Host::default();
         let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert_eq!(rows[0]["state"], "replaced");
@@ -536,17 +536,17 @@ mod tests {
         let mut forge = Forge::default()
             .repo(1, "org/new", false, false)
             .repo(2, "org/slow", false, false);
-        forge.mirror("org/new", "ssh://10.0.42.6/org/old.git", "10m0s");
-        forge.mirror("org/slow", "ssh://10.0.42.6/org/slow.git", "1h0m0s");
+        forge.mirror("org/new", "ssh://192.0.2.6/org/old.git", "10m0s");
+        forge.mirror("org/slow", "ssh://192.0.2.6/org/slow.git", "1h0m0s");
         let mut host = Host::default();
         let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
         assert!(rows.iter().all(|r| r["state"] == "replaced"));
         assert_eq!(
             forge.mirrors["org/new"][0]["remote_address"],
-            "ssh://10.0.42.6/org/new.git"
+            "ssh://192.0.2.6/org/new.git"
         );
 
-        forge.mirror("org/new", "ssh://10.0.42.6/org/new.git", "10m0s");
+        forge.mirror("org/new", "ssh://192.0.2.6/org/new.git", "10m0s");
         assert!(reconcile(&copy(), &source(), &mut forge, &mut host, true, None).is_err());
     }
 
@@ -555,7 +555,7 @@ mod tests {
         let mut forge = Forge::default()
             .repo(1, "org/a", false, false)
             .repo(2, "org/b", true, false);
-        forge.mirror("org/a", "ssh://10.0.42.6/org/a.git", "10m0s");
+        forge.mirror("org/a", "ssh://192.0.2.6/org/a.git", "10m0s");
         let (rows, incomplete) =
             reconcile(&copy(), &source(), &mut forge, &mut NoReceiver, false, None).unwrap();
         assert!(incomplete && forge.writes.is_empty());
@@ -571,7 +571,7 @@ mod tests {
         assert!(!is_copy_mirror(Some(&copy()), &mirror));
         assert!(is_copy_mirror(
             Some(&copy()),
-            &json!({"remote_address":"ssh://10.0.42.6/org/a.git"})
+            &json!({"remote_address":"ssh://192.0.2.6/org/a.git"})
         ));
         assert!(!is_copy_mirror(None, &mirror));
         assert!(ours(&copy(), &[mirror]).unwrap().is_none());

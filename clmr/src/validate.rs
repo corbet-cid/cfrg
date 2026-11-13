@@ -882,7 +882,7 @@ mod tests {
         // Contract example and owned personal mapping both validate.
         for good in [
             "https://github.com/acme",
-            "https://github.com/julian-corbet",
+            "https://github.com/maintainer",
             "http://forge.internal:3001/acme/sub",
             "https://host.example:8443/a/b/c",
         ] {

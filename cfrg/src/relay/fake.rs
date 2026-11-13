@@ -80,7 +80,7 @@ impl World {
             forge,
             relay: Actor {
                 id: relay_id.to_owned(),
-                login: "corbet-forge".into(),
+                login: "relay-bot".into(),
             },
             repos: BTreeMap::new(),
             faults: Faults::default(),

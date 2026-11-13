@@ -697,20 +697,20 @@ mod tests {
                 r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[],"copy":{copy}}}"#
             )
         };
-        let good = r#"{"host":"10.0.42.6","user":"richc","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#;
+        let good = r#"{"host":"192.0.2.6","user":"mirror","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#;
         let placement = Placement::from_document(document(good).as_bytes()).unwrap();
         placement.validate().unwrap();
         let copy = placement.copy.unwrap();
-        assert_eq!(copy.address("org/repo"), "ssh://10.0.42.6/org/repo.git");
+        assert_eq!(copy.address("org/repo"), "ssh://192.0.2.6/org/repo.git");
         assert_eq!(
             copy.push_address("org/repo"),
-            "ssh://richc@10.0.42.6/org/repo.git"
+            "ssh://mirror@192.0.2.6/org/repo.git"
         );
         for bad in [
-            good.replace("10.0.42.6", "srv/evil"),
-            good.replace("10.0.42.6", "srv:"),
-            good.replace("10.0.42.6", "srv:99999"),
-            good.replace("richc", "a@b"),
+            good.replace("192.0.2.6", "srv/evil"),
+            good.replace("192.0.2.6", "srv:"),
+            good.replace("192.0.2.6", "srv:99999"),
+            good.replace("mirror", "a@b"),
             good.replace("600", "599"),
             good.replace("\"K\"", "\"k\""),
             good.replace("}", ",\"extra\":1}"),
@@ -721,12 +721,12 @@ mod tests {
                 "{bad}"
             );
         }
-        let with_port = good.replace("10.0.42.6", "10.0.42.6:2222");
+        let with_port = good.replace("192.0.2.6", "192.0.2.6:2222");
         let placement = Placement::from_document(document(&with_port).as_bytes()).unwrap();
         placement.validate().unwrap();
         assert_eq!(
             placement.copy.unwrap().host_and_port(),
-            ("10.0.42.6", Some("2222"))
+            ("192.0.2.6", Some("2222"))
         );
     }
 
@@ -752,7 +752,7 @@ mod tests {
     fn a_mirror_is_owned_when_its_address_is_a_declared_destination_or_the_copy() {
         let mirror =
             |name: &str, address: &str| json!({"remote_name":name,"remote_address":address});
-        let copy: Copy = serde_json::from_str(r#"{"host":"10.0.42.6","user":"git","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#).unwrap();
+        let copy: Copy = serde_json::from_str(r#"{"host":"192.0.2.6","user":"git","admin_key_env":"K","known_hosts_env":"H","interval_seconds":600}"#).unwrap();
         let repo = declared_repo(GITLAB);
         // The declared destination, with or without the SSH userinfo Forgejo sanitises.
         assert!(owned_by(
@@ -778,13 +778,13 @@ mod tests {
         ));
         assert!(!owned_by(&repo, None, &json!({"remote_name":"d"})));
         // The git copy is ours only when the placement declares one.
-        let on_copy = mirror("e", "ssh://10.0.42.6/team/new.git");
+        let on_copy = mirror("e", "ssh://192.0.2.6/team/new.git");
         assert!(!owned_by(&repo, None, &on_copy));
         assert!(owned_by(&repo, Some(&copy), &on_copy));
         assert!(!owned_by(
             &repo,
             Some(&copy),
-            &mirror("f", "ssh://10.0.42.7/team/new.git")
+            &mirror("f", "ssh://192.0.2.7/team/new.git")
         ));
         // A declared remote_name is an explicit claim.
         let claimed = declared_repo(

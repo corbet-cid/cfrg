@@ -61,7 +61,7 @@ fn hex_matches(key: &[u8], body: &[u8], value: &str) -> bool {
 }
 
 /// Forgejo: hex HMAC-SHA256 of the body in `X-Forgejo-Signature` (also `X-Gitea-Signature`, and the
-/// `X-Hub-Signature-256` form that the Python bridge accepted). Delivery id: `X-Forgejo-Delivery`.
+/// `X-Hub-Signature-256` form). Delivery id: `X-Forgejo-Delivery`.
 pub fn forgejo(
     key: Option<&str>,
     headers: &HeaderMap,

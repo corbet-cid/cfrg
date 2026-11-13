@@ -1,4 +1,8 @@
-# Serve
+# Serve (the land lane, `cfrg serve`)
+
+This page describes `cfrg serve`, which drives landing and mirror verification. The receiver for GitHub, GitLab and Forgejo
+events (relay, release upload, wiki push) is the separate binary `cfrg-serve`: see
+[configuration](configuration.md#serve-configuration-cfrg-serve) and the [quick start](quickstart.md).
 
 `cfrg serve` is the long-running mode: neither agents nor timers have to poll.
 Signed webhook deliveries bring a repository's pass forward; a slow periodic

@@ -1,6 +1,5 @@
 //! `/hooks/downsync`: a green run of `ci.yml` on `main` fans out to the downstreams that follow the repository
-//! (port of the srv receiver's hook, scripts/downsync-dispatch.sh in infra). Accepts exactly the shape the srv hook
-//! matched: event `action_run_success`, `action` success, workflow `ci.yml`, ref `main`, a 40-hex commit.
+//! (the command that runs is yours: `hook_commands.downsync`). Accepts exactly this shape: event `action_run_success`, `action` success, workflow `ci.yml`, ref `main`, a 40-hex commit.
 use super::{event, valid_repo, Job};
 use http::HeaderMap;
 use serde_json::Value;
@@ -26,7 +25,7 @@ pub fn plan(headers: &HeaderMap, payload: &Value) -> Option<Job> {
     Some(Job {
         command: "downsync",
         key: format!("{repo}@{sha}"),
-        // REPOSITORY COMMIT WORKFLOW REF ACTION: the five arguments of the srv script's event entry.
+        // REPOSITORY COMMIT WORKFLOW REF ACTION: the five arguments of the configured command.
         args: [repo, sha, "ci.yml", "main", "success"]
             .map(str::to_owned)
             .to_vec(),

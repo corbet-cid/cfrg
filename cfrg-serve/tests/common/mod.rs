@@ -313,9 +313,9 @@ impl World {
         .await;
         let cfg: Config = serde_json::from_value(json!({
             "forge_api": format!("{}/api/v1", forge.url),
-            "forge_web": forge.url,
-            "github": {"api": gh.url, "uploads": gh.url, "web": format!("{}/web", gh.url), "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
-            "gitlab": {"api": format!("{}/api/v4", gl.url), "groups": ["corbet-fsl"]},
+            "forge_hosts": ["forge.example.org"], "forge_web": forge.url,
+            "github": {"api": gh.url, "uploads": gh.url, "web": format!("{}/web", gh.url), "orgs": ["example-fsl"], "min_write_interval_s": 0},
+            "gitlab": {"api": format!("{}/api/v4", gl.url), "groups": ["example-fsl"]},
         }))
         .unwrap();
         let creds = Credentials::from_pairs(&[
@@ -331,7 +331,7 @@ impl World {
             gl,
             store,
             ctx,
-            repo: "corbet-fsl/ccvl".into(),
+            repo: "example-fsl/ccvl".into(),
             tag,
         }
     }
@@ -357,14 +357,14 @@ fn forgejo(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
     let st = st.lock().unwrap();
     let p = r.path.as_str();
     if r.method == "POST"
-        && p == "/api/v1/repos/corbet-infra/infra/actions/workflows/relay.yml/dispatches"
+        && p == "/api/v1/repos/example-infra/infra/actions/workflows/relay.yml/dispatches"
     {
         return bytes_resp(st.dispatch_status, vec![]);
     }
-    if p == "/api/v1/repos/corbet-fsl/ccvl" {
+    if p == "/api/v1/repos/example-fsl/ccvl" {
         return json_resp(200, json!({"mirror": st.mirror, "private": false}));
     }
-    if p == format!("/api/v1/repos/corbet-fsl/ccvl/releases/tags/{}", st.tag) {
+    if p == format!("/api/v1/repos/example-fsl/ccvl/releases/tags/{}", st.tag) {
         let assets: Vec<Value> = st
             .files
             .iter()
@@ -376,10 +376,11 @@ fn forgejo(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
             json!({"tag_name": st.tag, "name": "ccvl 0.1.0", "body": "Notes\r\nline two", "draft": st.draft, "prerelease": false, "assets": assets}),
         );
     }
-    if p == format!("/api/v1/repos/corbet-fsl/ccvl/tags/{}", st.tag) {
+    if p == format!("/api/v1/repos/example-fsl/ccvl/tags/{}", st.tag) {
         return json_resp(200, json!({"commit": {"sha": COMMIT}}));
     }
-    if let Some(name) = p.strip_prefix(&format!("/corbet-fsl/ccvl/releases/download/{}/", st.tag)) {
+    if let Some(name) = p.strip_prefix(&format!("/example-fsl/ccvl/releases/download/{}/", st.tag))
+    {
         return match st.served.get(&unquote(name)) {
             Some(data) => bytes_resp(200, data.clone()),
             None => bytes_resp(404, vec![]),
@@ -400,21 +401,21 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
         };
     }
     match (m, parts.as_slice()) {
-        ("GET", ["web", "corbet-fsl"]) => bytes_resp(st.g_org_page, b"<html></html>".to_vec()),
-        ("GET", ["repos", "corbet-fsl", "ccvl"]) => json_resp(200, json!({"archived": false})),
-        ("GET", ["repos", "corbet-fsl", "ccvl", "git", "ref", "tags", tag]) => {
+        ("GET", ["web", "example-fsl"]) => bytes_resp(st.g_org_page, b"<html></html>".to_vec()),
+        ("GET", ["repos", "example-fsl", "ccvl"]) => json_resp(200, json!({"archived": false})),
+        ("GET", ["repos", "example-fsl", "ccvl", "git", "ref", "tags", tag]) => {
             match st.g_tags.get(&unquote(tag)) {
                 Some(sha) => json_resp(200, json!({"object": {"type": "commit", "sha": sha}})),
                 None => json_resp(404, json!({"message": "Not Found"})),
             }
         }
-        ("GET", ["repos", "corbet-fsl", "ccvl", "actions", "permissions"]) => {
+        ("GET", ["repos", "example-fsl", "ccvl", "actions", "permissions"]) => {
             json_resp(200, json!({"enabled": st.g_actions}))
         }
-        ("GET", ["repos", "corbet-fsl", "ccvl", "releases"]) => {
+        ("GET", ["repos", "example-fsl", "ccvl", "releases"]) => {
             json_resp(200, Value::Array(st.g_releases.clone()))
         }
-        ("POST", ["repos", "corbet-fsl", "ccvl", "releases"]) => {
+        ("POST", ["repos", "example-fsl", "ccvl", "releases"]) => {
             let body: Value = serde_json::from_slice(&r.body).unwrap();
             st.g_next += 1;
             let id = st.g_next;
@@ -423,7 +424,7 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
             st.g_assets.insert(id, BTreeMap::new());
             json_resp(201, rel)
         }
-        ("PATCH", ["repos", "corbet-fsl", "ccvl", "releases", id]) => {
+        ("PATCH", ["repos", "example-fsl", "ccvl", "releases", id]) => {
             let id: u64 = id.parse().unwrap();
             let patch: Value = serde_json::from_slice(&r.body).unwrap();
             let rel = st.g_releases.iter_mut().find(|x| x["id"] == id).unwrap();
@@ -432,7 +433,7 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
             }
             json_resp(200, rel.clone())
         }
-        ("GET", ["repos", "corbet-fsl", "ccvl", "releases", id, "assets"]) => {
+        ("GET", ["repos", "example-fsl", "ccvl", "releases", id, "assets"]) => {
             let id: u64 = id.parse().unwrap();
             let items: Vec<Value> = st
                 .g_assets
@@ -446,7 +447,7 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
                 .unwrap_or(1);
             json_resp(200, Value::Array(if number == 1 { items } else { vec![] }))
         }
-        ("POST", ["repos", "corbet-fsl", "ccvl", "releases", id, "assets"]) => {
+        ("POST", ["repos", "example-fsl", "ccvl", "releases", id, "assets"]) => {
             let id: u64 = id.parse().unwrap();
             let name = r.query["name"].clone();
             st.g_next += 1;
@@ -468,14 +469,14 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
             st.g_assets.get_mut(&id).unwrap().insert(name, asset);
             json_resp(201, out)
         }
-        ("DELETE", ["repos", "corbet-fsl", "ccvl", "releases", "assets", id]) => {
+        ("DELETE", ["repos", "example-fsl", "ccvl", "releases", "assets", id]) => {
             let id: u64 = id.parse().unwrap();
             for assets in st.g_assets.values_mut() {
                 assets.retain(|_, a| a.id != id);
             }
             bytes_resp(204, vec![])
         }
-        ("GET", ["repos", "corbet-fsl", "ccvl", "releases", "assets", id]) => Resp {
+        ("GET", ["repos", "example-fsl", "ccvl", "releases", "assets", id]) => Resp {
             status: 302,
             headers: vec![("Location".into(), format!("{store_url}/blob/{id}"))],
             body: vec![],
@@ -489,8 +490,8 @@ fn gitlab(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
     let m = r.method.as_str();
     let p = r.path.as_str();
     let tag = st.tag.clone();
-    if m == "GET" && p == "/api/v4/projects/corbet-fsl%2Fccvl"
-        || p == "/api/v4/projects/corbet-fsl/ccvl"
+    if m == "GET" && p == "/api/v4/projects/example-fsl%2Fccvl"
+        || p == "/api/v4/projects/example-fsl/ccvl"
     {
         return json_resp(
             200,
@@ -571,7 +572,7 @@ fn gitlab(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
     }
 }
 
-/// A placement with one relayed repository: Forgejo 8, GitHub 4242 (corbet-fsl/ccvl), GitLab 55.
+/// A placement with one relayed repository: Forgejo 8, GitHub 4242 (example-fsl/ccvl), GitLab 55.
 pub fn placement_text() -> String {
     let dest = |provider: &str, host: &str, id: &str, path: &str, ns: &str| {
         format!(
@@ -580,16 +581,16 @@ pub fn placement_text() -> String {
         )
     };
     format!(
-        r#"{{"native":{{"schema":1,"source":{{"origin":"https://forge.corbet.ch","token_env":"T"}},"repositories":[
-        {{"path":"corbet-fsl/ccvl","source_id":8,"private":false,"default_branch":"main","content":"profile","hold":null,"destinations":[{},{}]}}],
+        r#"{{"native":{{"schema":1,"source":{{"origin":"https://forge.example.org","token_env":"T"}},"repositories":[
+        {{"path":"example-fsl/ccvl","source_id":8,"private":false,"default_branch":"main","content":"profile","hold":null,"destinations":[{},{}]}}],
         "contributed":[]}}}}"#,
         dest(
             "github",
             "api.github.com",
             "4242",
-            "corbet-fsl/ccvl",
-            "corbet-fsl"
+            "example-fsl/ccvl",
+            "example-fsl"
         ),
-        dest("gitlab", "gitlab.com", "55", "corbet-fsl/ccvl", "2")
+        dest("gitlab", "gitlab.com", "55", "example-fsl/ccvl", "2")
     )
 }

@@ -300,7 +300,7 @@ dependencies = [
 [[package]]
 name = "cbkt"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cbkt?rev=53441c2669a03f96772827fb81a16d397cdfea0f#53441c2669a03f96772827fb81a16d397cdfea0f"
+source = "git+https://git.corbet.ch/corbet-libre/cbkt?rev=447ddb037f6d9ddc3e1be74573c7cbdffe07e54d#447ddb037f6d9ddc3e1be74573c7cbdffe07e54d"
 dependencies = [
  "cfrg",
  "serde_json",
@@ -334,7 +334,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 [[package]]
 name = "cfgj"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cfgj?rev=ea6e029af7a5593bb5a79499f0fe4e9ed4789b49#ea6e029af7a5593bb5a79499f0fe4e9ed4789b49"
+source = "git+https://git.corbet.ch/corbet-libre/cfgj?rev=044d3d9fb939f9d44086e05c75b08fca86c7732b#044d3d9fb939f9d44086e05c75b08fca86c7732b"
 dependencies = [
  "cfrg",
  "cqlt",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "cfrg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "cqlt",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "cfrg-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cbkt",
  "cfgj",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "cfrg-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cfgj",
  "cfrg",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "cfrg-serve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "cghb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=cbe36b82947c6ffc7e9951b8416d3f7d5083b4ca#cbe36b82947c6ffc7e9951b8416d3f7d5083b4ca"
+source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=b89dff96a25f86b1de2c240d2a7b0239c4e4fac6#b89dff96a25f86b1de2c240d2a7b0239c4e4fac6"
 dependencies = [
  "cfrg",
  "cqlt",
@@ -440,7 +440,7 @@ dependencies = [
 [[package]]
 name = "cglb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cglb?rev=dbfa6fa64714f9598d7da71fce6811f4ba05933c#dbfa6fa64714f9598d7da71fce6811f4ba05933c"
+source = "git+https://git.corbet.ch/corbet-libre/cglb?rev=8693ec9f251a5393ef593e1f14de558be74aae42#8693ec9f251a5393ef593e1f14de558be74aae42"
 dependencies = [
  "cfrg",
  "gitlab",
@@ -515,7 +515,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clmr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -1,7 +1,8 @@
 {
   "relay": {
     "forgejo": ["1"],
-    "gitlab": ["44416965"],
-    "github": []
-  }
+    "gitlab": ["2001"],
+    "github": ["3001"]
+  },
+  "screen": "hold_all"
 }

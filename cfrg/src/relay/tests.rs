@@ -382,7 +382,7 @@ fn a_delivery_from_the_relay_identity_is_dropped_before_any_request() {
     let mut h = H::new();
     let relay = Actor {
         id: "200".into(),
-        login: "corbet-forge".into(),
+        login: "relay-bot".into(),
     };
     let hint = h.hint(Forge::Github, 1, HintAction::Changed, Some(&relay));
     let report = h.eng().apply(&hint).unwrap();

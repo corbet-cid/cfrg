@@ -1,14 +1,26 @@
 # cfrg relay
 
-The issue relay of the bridge (Bridge design §3.1, §3.2, §5; operating model R37, R38, R41, R50, R51). Code:
-`cfrg/src/relay/`, library: `cfrg-relay/`, command: `cfrg-cli/src/relay.rs`. Forgejo Actions runs it; it has no queue, timer, catch-up or
-rebuild of its own (R30, R49).
+The relay keeps issues, comments and pull or merge requests in step across Forgejo, GitHub and GitLab. Code:
+`cfrg/src/relay/` (engine), `cfrg-relay/` (library with the live adapters), `cfrg-cli/src/relay.rs` (command). It has
+no queue, timer, catch-up or rebuild of its own: an event is a hint, and everything else is read live from the forges.
+`cfrg-serve` runs the same code in-process when a signed event arrives ([configuration](configuration.md)); `cfrg relay`
+runs it by hand or from a scheduler.
+
+| Flow | Behaviour | Tests |
+|---|---|---|
+| Issues and comments | an issue or comment created, edited or closed on any forge is carried to the sibling objects on the others; the Forgejo object is the hub and is written first; each write is journalled in an intent row before it happens | `cfrg/src/relay/tests.rs` |
+| Pull and merge requests from outside | a request on a copy yields a credited sibling request on the other copy forges (through a relay branch head) and one `contribution` notice on the Forgejo primary; moved heads move the notice marker; a request closed at its origin closes the siblings and the notice; comments are relayed between the requests | `cfrg/src/relay/tests_contrib.rs`; live proof on throwaway repositories: `cfrg-relay/examples/contribution_proof.rs` |
+| Abuse screen | `screen: hold_all` (default) keeps every new outside request on Forgejo for a human; `rate_limit` lets it through and leaves the per-author daily cap as the only brake | `cfrg/src/relay/tests_contrib.rs` |
+| Take-in | after a human review of the notice, [`cfrg take-in`](take-in.md) brings exactly the reviewed commit into the primary | `cfrg-cli/src/take_in.rs` tests |
+
+A deletion is carried to the other copies only within the hourly caps of `limits`; a contribution notice is never
+deleted, only closed.
 
 ## Commands
 
 | Command | What it does | Exit |
 |---|---|---|
-| `cfrg relay apply <event>` | Applies one event (a hint: forge, repository id, kind, number, action, actor). The event is the JSON text, a file, or `-` for standard input. Everything else is read live from the forges (RD1). | 0 for converged, pending, held and dropped; non-zero when nothing could be done now (busy lease, outage, kill switch), so the job is re-run |
+| `cfrg relay apply <event>` | Applies one event (a hint: forge, repository id, kind, number, action, actor). The event is the JSON text, a file, or `-` for standard input. Everything else is read live from the forges. | 0 for converged, pending, held and dropped; non-zero when nothing could be done now (busy lease, outage, kill switch), so the job is re-run |
 | `cfrg relay sweep [--older-than s]` | Re-drives each object whose intent stayed pending longer than the bound (default 1 h), once, at most `sweep_max_objects`. Nothing pending means no read and no write. | 0 |
 
 Both take `--config` (`CFRG_RELAY_CONFIG`, the relay configuration JSON) and `--placement` (`CFRG_PLACEMENT`, whose
@@ -19,9 +31,9 @@ credential, so it is never an argument.
 
 **The repository set** is derived from the placement on every run (`relay::derive`), never from a hand list; a `repos`
 list in the relay configuration is refused. A repository is relayed when it is a Forgejo primary with at least one
-GitHub or GitLab copy. Contributed projects (`native.contributed`, R10, R11) and Bitbucket (git mirror only) never take
+GitHub or GitLab copy. Contributed projects (`native.contributed`) and Bitbucket (git mirror only) never take
 part. A copy is a member only when the placement knows its immutable `repository_id`; the Forgejo primary is addressed
-by its `source_id`. The relay identities (`relay`: the user ids of `corbet-forge` per forge) stay in the configuration;
+by its `source_id`. The relay identities (`relay`: the user ids of `relay-bot` per forge) stay in the configuration;
 while a forge has members but no identity the run refuses: `sweep` logs `relay: refused: ...` and exits 0, `apply`
 exits non-zero.
 
@@ -53,16 +65,12 @@ the store first (a refused call still proves the database login) and builds the 
 
 The process owns one current-thread tokio runtime; the synchronous engine calls the async drivers through it.
 
-**Driver coverage.** The B3 drivers write (create an issue, comment, add labels, close). The adapters answer every other
-engine call (`read`, `update_comment`, deletions, marker search; a patch that edits text, reopens or removes labels)
-with `Unavailable`, so the intent stays pending and nothing is written twice. The read side is the next driver task.
-
 ## Order of an `apply`
 
-1. Policy: the repository must be listed, the actor must not be the relay identity (RD4a).
-2. `Contributed::refuse` for the primary and every copy of the set (R10, R11): no read and no write follows a refusal.
+1. Policy: the repository must be listed, the actor must not be the relay identity.
+2. `Contributed::refuse` for the primary and every copy of the set: no read and no write follows a refusal.
 3. The single-writer lease of the logical object (a UUID derived from the origin) is taken. A busy lease defers.
-4. Read every sibling, merge (RD3), write the difference hub first (RD2), each write behind an intent row.
+4. Read every sibling, merge, write the difference hub first, each write behind an intent row.
 
 ## Store (pgEdge database `forge_bridge`)
 
@@ -91,9 +99,9 @@ localhost, a loopback address or a unix socket, and `sslmode=disable` on any oth
 | Limit | Default |
 |---|---|
 | deletions cascaded per hour, fleet-wide / per repository | 10 / 3 (otherwise the deletion is held for the reviewer) |
-| new objects fanned out per author per day | 5 (R51; the rest stays on Forgejo) |
-| writing passes per object per hour | 30 (RF8 backstop: the object is frozen) |
-| mutations per namespace per hour / day | 60 / 400 (RD11) |
+| new objects fanned out per author per day | 5 (the rest stays on Forgejo) |
+| writing passes per object per hour | 30 (backstop: the object is frozen) |
+| mutations per namespace per hour / day | 60 / 400 |
 | gap between writes / between object creations, per namespace | 2 s / 12 s (`pacing.write_gap_secs`, `create_gap_secs`) |
 | lease | 600 s |
 
@@ -114,12 +122,12 @@ throwaway CA: `CFRG_RELAY_TEST_PG_BIN=<dir with initdb and pg_ctl> cargo test -p
 `update_comment`, `delete_comment`, `delete_object`, `find_by_marker`, `is_maintainer`. A definitive 404 or 410 is
 `ReadOutcome::Gone`; a 403, 5xx, timeout or rename is an error, never `Gone`.
 
-## Relay identity ids and copy ids (build task B3b)
+## Relay identity ids and copy ids
 
-**Identities** (`relay` in the configuration, immutable user ids, [example](relay-config.example.json)): Forgejo `1` (`julian-corbet`),
-GitLab `44416965` (service account `corbet-forge`), GitHub: the user id of the App's bot (`corbet-forge[bot]`), filled in once
-lane B7 has created the App. Until then the GitHub list is empty and a run with GitHub members is refused (nothing is read or
-written). A delivery whose actor is one of these ids is dropped (design RD4).
+**Identities** (`relay` in the configuration, immutable user ids, [example](relay-config.example.json)): one list of user ids per
+forge, for the account the relay acts as there; for GitHub it is the user id of the App's bot. A forge with members but no
+id refuses the run: nothing is read or written. A delivery whose actor is one of these ids is dropped, so the relay never
+reacts to its own writes.
 
 **Copy ids.** Repositories are addressed by immutable id, but the placement has no GitHub or GitLab copy ids. A run resolves
 the missing id of each copy once from its path (one read through the driver, at most 50 per run) and stores it in the relay
@@ -131,4 +139,4 @@ re-resolves. A copy that cannot be resolved now is left out of that run, never g
 not comments), patches (title, body, state, labels, assignees), comment edit and delete, object delete (GitHub through the
 GraphQL `deleteIssue`, which needs admin rights), the marker search over the newest issues (author must be a relay id) and
 the maintainer lookup. Only a definitive 404/410 is `Gone`; 401/402/403/429 are refusals, 5xx and transport failures
-outages, other 4xx rejections. The pull request head flow (B8) reads and opens merge requests through `cglb` as well.
+outages, other 4xx rejections. The pull request head flow reads and opens merge requests through `cglb` as well.

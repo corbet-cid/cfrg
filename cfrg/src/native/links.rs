@@ -62,7 +62,7 @@ pub struct Facts<'a> {
     pub provider: Provider,
     /// The copy is private (it has the primary's visibility, R42).
     pub private: bool,
-    /// The Forgejo origin, e.g. `https://forge.corbet.ch` (the placement's source origin).
+    /// The Forgejo origin, e.g. `https://forge.example.org` (the placement's source origin).
     pub forge_origin: &'a str,
     /// The primary's `owner/repo` on Forgejo.
     pub source_path: &'a str,
@@ -162,14 +162,14 @@ pub fn copy_description(primary_description: &str, facts: &Facts) -> String {
 mod tests {
     use super::*;
 
-    const FORGE: &str = "https://forge.corbet.ch";
+    const FORGE: &str = "https://forge.example.org";
 
     fn facts(provider: Provider, private: bool) -> Facts<'static> {
         Facts {
             provider,
             private,
             forge_origin: FORGE,
-            source_path: "corbet-cid/ccid",
+            source_path: "example-cid/ccid",
             issues: true,
             wiki: true,
             github: None,
@@ -179,7 +179,7 @@ mod tests {
 
     fn visible(issues: bool, wiki: bool) -> Option<PublicGithub<'static>> {
         Some(PublicGithub {
-            path: "corbet-cid/ccid",
+            path: "example-cid/ccid",
             issues,
             wiki,
         })
@@ -203,14 +203,14 @@ mod tests {
         f.github = visible(true, true);
         assert_eq!(
             copy_description("A tool", &f),
-            "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+            "A tool · Wiki: https://forge.example.org/example-cid/ccid/wiki"
         );
         // A public copy whose wiki repository is not initialised links like a private one.
         let mut f = facts(Provider::Github, false);
         f.copy_wiki = false;
         assert_eq!(
             copy_description("A tool", &f),
-            "A tool · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+            "A tool · Wiki: https://forge.example.org/example-cid/ccid/wiki"
         );
     }
 
@@ -227,7 +227,7 @@ mod tests {
         f.github = visible(true, false);
         assert_eq!(
             copy_description("A tool", &f),
-            "A tool · Issues: https://github.com/corbet-cid/ccid/issues · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+            "A tool · Issues: https://github.com/example-cid/ccid/issues · Wiki: https://forge.example.org/example-cid/ccid/wiki"
         );
     }
 
@@ -235,7 +235,7 @@ mod tests {
     fn public_bitbucket_links_the_wiki_to_github_only_once_github_holds_it() {
         let mut f = facts(Provider::Bitbucket, false);
         f.github = visible(true, true);
-        assert_eq!(links(&f)[1].url, "https://github.com/corbet-cid/ccid/wiki");
+        assert_eq!(links(&f)[1].url, "https://github.com/example-cid/ccid/wiki");
     }
 
     #[test]
@@ -243,13 +243,13 @@ mod tests {
         let f = facts(Provider::Bitbucket, false);
         assert_eq!(
             copy_description("", &f),
-            "Issues: https://forge.corbet.ch/corbet-cid/ccid/issues · Wiki: https://forge.corbet.ch/corbet-cid/ccid/wiki"
+            "Issues: https://forge.example.org/example-cid/ccid/issues · Wiki: https://forge.example.org/example-cid/ccid/wiki"
         );
         let mut f = facts(Provider::Bitbucket, false);
         f.github = visible(false, false);
         assert_eq!(
             links(&f)[0].url,
-            "https://forge.corbet.ch/corbet-cid/ccid/issues"
+            "https://forge.example.org/example-cid/ccid/issues"
         );
     }
 
@@ -274,10 +274,10 @@ mod tests {
     #[test]
     fn the_origin_may_end_with_a_slash() {
         let mut f = facts(Provider::Github, true);
-        f.forge_origin = "https://forge.corbet.ch/";
+        f.forge_origin = "https://forge.example.org/";
         assert_eq!(
             links(&f)[0].url,
-            "https://forge.corbet.ch/corbet-cid/ccid/wiki"
+            "https://forge.example.org/example-cid/ccid/wiki"
         );
     }
 

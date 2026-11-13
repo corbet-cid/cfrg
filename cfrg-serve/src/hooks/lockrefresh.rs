@@ -1,5 +1,5 @@
 //! `/hooks/lockrefresh`: a published release starts the first-party lock refresh of the repositories that depend on
-//! the released crate (port of the srv spool handler, scripts/release-lock-refresh.sh in infra). A second Forgejo
+//! the released crate (the command that runs is yours: `hook_commands.lockrefresh`). A second Forgejo
 //! system hook for the `release` event points here, so the release upload route is untouched.
 use super::{event, valid_repo, Job};
 use http::HeaderMap;

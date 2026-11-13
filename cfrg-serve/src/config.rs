@@ -1,6 +1,6 @@
 //! Configuration (`config.json`) and credentials (one file per key in a directory, like a mounted Secret).
 //!
-//! The file is the one the Python bridge read, with the receiver's own addition: the placement document that declares the contributed projects.
+//! The file also names the placement document that declares the contributed projects.
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -22,7 +22,7 @@ pub struct Config {
     pub aliases: BTreeMap<String, BTreeMap<String, String>>,
     /// The placement document that declares the contributed projects (R10, R11). Absent = none are declared.
     pub placement: Option<String>,
-    /// The public spellings of the primary forge (the first is the web host of the primary).
+    /// The public spellings of the primary forge (the first is the web host of the primary). Absent = the host of `forge_web`.
     #[serde(default = "default_forge_hosts")]
     pub forge_hosts: Vec<String>,
     /// The wiki leg (R40). Absent = a wiki hook is refused.
@@ -38,7 +38,7 @@ pub struct Config {
 }
 
 fn default_forge_hosts() -> Vec<String> {
-    vec!["forge.corbet.ch".into(), "git.corbet.ch".into()]
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,7 +145,17 @@ fn ten_thousand() -> usize {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        let mut config: Self = serde_json::from_slice(&fs::read(path)?)?;
+        if config.forge_hosts.is_empty() {
+            let host = config
+                .forge_web
+                .split("://")
+                .last()
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default();
+            config.forge_hosts.push(host.to_owned());
+        }
+        Ok(config)
     }
 
     pub fn copy_path(&self, provider: &str, repo: &str) -> String {

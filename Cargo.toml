@@ -4,7 +4,7 @@ members = ["cfrg", "cfrg-relay", "cfrg-cli", "cfrg-serve", "clmr"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
 
 [workspace.dependencies]
@@ -21,10 +21,10 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 cfrg = { path = "cfrg" }
 clmr = { path = "clmr" }
-cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "ea6e029af7a5593bb5a79499f0fe4e9ed4789b49" }
-cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "dbfa6fa64714f9598d7da71fce6811f4ba05933c" }
-cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "53441c2669a03f96772827fb81a16d397cdfea0f" }
-cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "cbe36b82947c6ffc7e9951b8416d3f7d5083b4ca" }
+cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "044d3d9fb939f9d44086e05c75b08fca86c7732b" }
+cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "8693ec9f251a5393ef593e1f14de558be74aae42" }
+cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "447ddb037f6d9ddc3e1be74573c7cbdffe07e54d" }
+cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "b89dff96a25f86b1de2c240d2a7b0239c4e4fac6" }
 cfrg-relay = { path = "cfrg-relay" }
 
 [workspace.lints.rust]

@@ -1,6 +1,6 @@
 # Contributed projects
 
-A **contributed project** is someone else's project that we contribute to (operating model R10, R11).
+A **contributed project** is someone else's project that we contribute to.
 Its own CI and conventions apply. We do not mirror or relay its releases and issues, our compute
 does not run its CI, and nothing of ours is put into its repository. We keep our own copy of it
 (a fork) where that helps our work.
@@ -37,8 +37,8 @@ Without the list nothing is classified and every document reads as before.
 
 | Effect | Where |
 |---|---|
-| **No mirror.** The placement is invalid when a contributed project's repository has a live `destination`, and when any live `destination` (its provider, host and path, pinned or following the primary) is itself a contributed project. A destination marked `absent` is a mirror being retired and is allowed: it is how an existing mirror of a project that has become contributed goes (mark it `absent` with its `remote_name`, reconcile, then drop the entry). A contributed project is the explicit exclusion that operating model R2 asks for. | `Placement::validate` |
-| **A guard for the callers that relay or upload.** `cfrg::contributed::Contributed` answers whether `owner/repo` on a forge is a contributed project (`classify`; a provider's API origin names its web host), and `refuse(operation, forge_host, path)` turns it into an error naming the operation. **Nothing in cfrg calls it yet**: the router (RD12) must call it for the primary and for every copy before any write, and the release upload of the bridge service (R45) before an upload. `cfrg bridge` (the old GitLab merge-request import, retired by RL7) and `cfrg sync` (which reads its own policy document, never this one) do not consult it. | `cfrg/src/contributed.rs` |
+| **No mirror.** The placement is invalid when a contributed project's repository has a live `destination`, and when any live `destination` (its provider, host and path, pinned or following the primary) is itself a contributed project. A destination marked `absent` is a mirror being retired and is allowed: it is how an existing mirror of a project that has become contributed goes (mark it `absent` with its `remote_name`, reconcile, then drop the entry). A contributed project is the explicit exclusion of a contributed project from mirroring. | `Placement::validate` |
+| **A guard for the callers that relay or upload.** `cfrg::contributed::Contributed` answers whether `owner/repo` on a forge is a contributed project (`classify`; a provider's API origin names its web host), and `refuse(operation, forge_host, path)` turns it into an error naming the operation. **Nothing in cfrg calls it yet**: the router must call it for the primary and for every copy before any write, and the release upload of the bridge service before an upload. `cfrg bridge` (the old GitLab merge-request import, retired by RL7) and `cfrg sync` (which reads its own policy document, never this one) do not consult it. | `cfrg/src/contributed.rs` |
 | **No CI of theirs on our runners.** `cfrg native` keeps the **Actions unit off** on every contributed repository on the source forge. A fork carries the upstream's workflows, and Forgejo reads `.github/workflows` when there is no `.forgejo`, so with Actions on, their CI would run on our runners. | `cfrg native` |
 
 `default` names the default primary, which a primary switch can point at another forge, so it is no
@@ -62,7 +62,7 @@ cannot see, so a declared repository that cannot be found is a wrong path or a c
 
 What it does not do: it acts when `cfrg native` runs (a reconcile or a status check), not when a fork is
 created, so a new fork has Actions on until the next run. It switches the unit of forks on **our** forge only;
-the Actions or pipelines of a fork on GitHub, GitLab or Bitbucket are that forge's own switch (R6, R7, R9: a
+the Actions or pipelines of a fork on GitHub, GitLab or Bitbucket are that forge's own switch (a
 copy runs no CI there; the GitHub forks declared today have Actions disabled).
 
 `--repository owner/repo` selects one contributed repository like any declared one. The copy policy

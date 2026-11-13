@@ -109,7 +109,7 @@ pub enum Lfs {
 pub struct RepoConfig {
     #[serde(default)]
     pub lane: Lane,
-    /// Bare repository whose newest state is pushed (the srv git copy).
+    /// Bare repository whose newest state is pushed (the local git copy).
     pub source: PathBuf,
     /// LFS payloads are never replicated unless the repository declares `"lfs": "payload"` (R4). Default: pointers only.
     #[serde(default)]

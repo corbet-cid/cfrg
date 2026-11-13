@@ -53,7 +53,7 @@ pub struct ServePolicy {
 #[serde(deny_unknown_fields)]
 pub struct Webhook {
     /// Where the forge delivers, for example
-    /// `http://cfrg-serve.ci.svc.cluster.local:8080/hook`.
+    /// `http://cfrg-serve.internal.example:8080/hook`.
     pub url: String,
     /// Organisations that get one hook for all their repositories; declared
     /// repositories of other owners get a repository hook.
@@ -1145,7 +1145,8 @@ mod tests {
         let base = json!({"listen":"0.0.0.0:8080","secret_env":"CFRG_WEBHOOK_SECRET"});
         assert!(ok(base.clone()).is_ok());
         let mut with = base.clone();
-        with["webhook"] = json!({"url":"http://cfrg-serve.ci.svc.cluster.local:8080/hook","orgs":["corbet-libs"]});
+        with["webhook"] =
+            json!({"url":"http://cfrg-serve.internal.example:8080/hook","orgs":["example-libs"]});
         with["mirrors"] = json!({"placement":"/p.json","state":"/s.json"});
         assert!(ok(with).is_ok());
         for bad in [

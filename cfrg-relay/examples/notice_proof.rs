@@ -9,9 +9,8 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let token = std::env::var("PROOF_FORGEJO_TOKEN").unwrap();
     let rt = cfrg_relay::live::runtime().unwrap();
-    let driver =
-        cfgj::relay::ForgejoRelay::new("https://forge.corbet.ch", &cfgj::relay::Token::new(token))
-            .unwrap();
+    let origin = std::env::var("PROOF_FORGEJO_ORIGIN").unwrap();
+    let driver = cfgj::relay::ForgejoRelay::new(&origin, &cfgj::relay::Token::new(token)).unwrap();
     let mut host = ForgejoNotices { driver, rt };
     let marker = ContributionMarker {
         origin: a[2].clone(),

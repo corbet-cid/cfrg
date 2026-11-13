@@ -1,6 +1,6 @@
 //! Who may send us events: our own repositories only.
 //!
-//! The GitHub App `corbet-forge` must be installable by other accounts (GitHub only lets a private App be installed on
+//! The GitHub App `relay-bot` must be installable by other accounts (GitHub only lets a private App be installed on
 //! its owner), so anyone could install it and send signed events. Right after the signature check an event is dropped
 //! (answer 202, one log line, no database work) unless it belongs to us:
 //!
@@ -82,17 +82,17 @@ mod tests {
             )
         };
         format!(
-            r#"{{"native":{{"schema":1,"source":{{"origin":"https://forge.corbet.ch","token_env":"T"}},"repositories":[
-            {{"path":"corbet-fsl/ccvl","source_id":8,"private":false,"default_branch":"main","content":"profile","hold":null,"destinations":[{},{}]}}],
+            r#"{{"native":{{"schema":1,"source":{{"origin":"https://forge.example.org","token_env":"T"}},"repositories":[
+            {{"path":"example-fsl/ccvl","source_id":8,"private":false,"default_branch":"main","content":"profile","hold":null,"destinations":[{},{}]}}],
             "contributed":[]}}}}"#,
             dest(
                 "github",
                 "api.github.com",
                 "4242",
-                "corbet-fsl/ccvl",
-                "corbet-fsl"
+                "example-fsl/ccvl",
+                "example-fsl"
             ),
-            dest("gitlab", "gitlab.com", "55", "corbet-fsl/ccvl", "2")
+            dest("gitlab", "gitlab.com", "55", "example-fsl/ccvl", "2")
         )
     }
 
@@ -102,11 +102,11 @@ mod tests {
         let file = dir.path().join("placement.json");
         fs::write(&file, placement_text()).unwrap();
         let allow = Allow::load(&file, &[]).unwrap();
-        let ours = json!({"repository": {"id": 4242, "owner": {"login": "Corbet-FSL"}}, "installation": {"account": {"login": "corbet-fsl"}}});
+        let ours = json!({"repository": {"id": 4242, "owner": {"login": "Example-FSL"}}, "installation": {"account": {"login": "example-fsl"}}});
         assert!(allow.permits(Forge::Github, "4242", &ours));
-        let foreign_installation = json!({"repository": {"id": 4242, "owner": {"login": "corbet-fsl"}}, "installation": {"account": {"login": "mallory"}}});
+        let foreign_installation = json!({"repository": {"id": 4242, "owner": {"login": "example-fsl"}}, "installation": {"account": {"login": "mallory"}}});
         assert!(!allow.permits(Forge::Github, "4242", &foreign_installation));
-        let foreign_repo = json!({"repository": {"id": 1, "full_name": "mallory/x"}, "installation": {"account": {"login": "corbet-fsl"}}});
+        let foreign_repo = json!({"repository": {"id": 1, "full_name": "mallory/x"}, "installation": {"account": {"login": "example-fsl"}}});
         assert!(!allow.permits(Forge::Github, "1", &foreign_repo));
         assert!(!allow.permits(Forge::Github, "1", &json!({})));
         assert!(

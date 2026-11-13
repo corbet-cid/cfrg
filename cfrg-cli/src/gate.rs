@@ -510,7 +510,7 @@ pub(crate) fn github(
     match api_request(api, token, method, path, body) {
         Ok(answer) => {
             if blocked(&format!("HTTP {}", answer.status)) {
-                // The first sign of throttling or abuse pauses the whole organisation until Julian resumes it.
+                // The first sign of throttling or abuse pauses the whole organisation until the operator resumes it.
                 std::fs::create_dir_all(config.paused_dir.join(org))?;
                 return Err(failure(format!(
                     "{org} paused after HTTP {}",
@@ -1056,7 +1056,7 @@ fn flush(
         };
         let url = format!("{origin}/{name}.git");
         if !entry.source.exists() {
-            // The srv git copy follows the primary's renames; a fill may list a repository before its copy arrives.
+            // The local git copy follows the primary's renames; a fill may list a repository before its copy arrives.
             report.push(json!({"repo": name, "verdict": "source missing on this host (git copy not there yet)"}));
             continue;
         }

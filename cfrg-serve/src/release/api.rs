@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
-pub const USER_AGENT: &str = "corbet-forge-bridge/1";
+pub const USER_AGENT: &str = "cfrg-serve/1";
 const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug)]

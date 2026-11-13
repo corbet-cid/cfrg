@@ -1,8 +1,7 @@
 //! The live relay: `cfrg_relay::apply` behind the [`Relay`] seam.
 //!
 //! `apply` is synchronous and blocks (database, HTTP through its own current-thread runtime), so it runs on a
-//! blocking thread. The database connection string is built from the files of the credentials directory (the Secret
-//! `forge-bridge-db`: `host`, `port`, `dbname`, `username`, `password`), verified against the cluster CA.
+//! blocking thread. The database connection string is built from the files of the credentials directory (a mounted Secret: `host`, `port`, `dbname`, `username`, `password`), verified against the cluster CA.
 use crate::{
     config::{RelayConfig, Result},
     relay::{Relay, RelayFuture},

@@ -286,14 +286,14 @@ mod tests {
     #[test]
     fn mirror_addresses_ignore_scheme_credentials_and_suffix() {
         for url in [
-            "https://*****:*****@forge.corbet.ch/corbet-media/switch-probe.git",
-            "ssh://git@forge.corbet.ch/corbet-media/switch-probe.git",
-            "https://user:secret@FORGE.corbet.ch/corbet-media/switch-probe",
-            "forge.corbet.ch/corbet-media/switch-probe/",
+            "https://*****:*****@forge.example.org/example-media/switch-probe.git",
+            "ssh://git@forge.example.org/example-media/switch-probe.git",
+            "https://user:secret@FORGE.example.org/example-media/switch-probe",
+            "forge.example.org/example-media/switch-probe/",
         ] {
             assert_eq!(
                 address_of(url).as_deref(),
-                Some("forge.corbet.ch/corbet-media/switch-probe"),
+                Some("forge.example.org/example-media/switch-probe"),
                 "{url}"
             );
         }

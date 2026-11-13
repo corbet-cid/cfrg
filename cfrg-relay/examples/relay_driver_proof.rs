@@ -2,7 +2,7 @@
 //!
 //! `relay_driver_proof <forgejo repo id> <forgejo path> <gitlab project id> <gitlab path>`
 //! Credentials: the files `forgejo-token` and `gitlab-token` of `$CREDENTIALS_DIRECTORY`. Relay identity ids
-//! come from `$PROOF_FORGEJO_RELAY_ID` and `$PROOF_GITLAB_RELAY_ID`. Writes only into the two named repositories.
+//! come from `$PROOF_FORGEJO_ORIGIN` (the Forgejo origin), `$PROOF_FORGEJO_RELAY_ID` and `$PROOF_GITLAB_RELAY_ID`. Writes only into the two named repositories.
 use cfrg::{
     model::Forge,
     relay::{
@@ -16,6 +16,13 @@ use std::{collections::BTreeMap, env};
 fn main() {
     let a: Vec<String> = env::args().collect();
     let (fj_id, fj_path, gl_id, gl_path) = (&a[1], &a[2], &a[3], &a[4]);
+    // The Forgejo origin of the throwaway repository, e.g. `https://forge.example.org`.
+    let forge_origin = env::var("PROOF_FORGEJO_ORIGIN").unwrap();
+    let forge_host = forge_origin
+        .split("://")
+        .last()
+        .unwrap_or_default()
+        .trim_end_matches('/');
     let member = |host: &str, id: &str, path: &str| RepoRef {
         host: host.into(),
         id: id.into(),
@@ -36,7 +43,7 @@ fn main() {
             name: fj_path.clone(),
             credit: Default::default(),
             members: BTreeMap::from([
-                (Forge::Forgejo, member("forge.corbet.ch", fj_id, fj_path)),
+                (Forge::Forgejo, member(forge_host, fj_id, fj_path)),
                 (Forge::Gitlab, member("gitlab.com", gl_id, gl_path)),
             ]),
         }],
@@ -44,7 +51,7 @@ fn main() {
     };
     let rt = cfrg_relay::live::runtime().unwrap();
     let dir = cfrg_relay::live::default_credentials_dir();
-    let mut forges = cfrg_relay::live::forges(&dir, &rt, &config, "https://forge.corbet.ch");
+    let mut forges = cfrg_relay::live::forges(&dir, &rt, &config, &forge_origin);
     for (forge, repo) in [(Forge::Forgejo, fj_id), (Forge::Gitlab, gl_id)] {
         let f = forges.get(forge).expect("adapter");
         let marker = format!("<!-- cforge:proof-{} -->", forge.as_str());

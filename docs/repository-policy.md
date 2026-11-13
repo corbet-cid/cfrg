@@ -2,7 +2,7 @@
 
 `cfrg validate --policy forges.json` validates a declaration without API
 writes. `cfrg plan --policy forges.json --repository widget` reports the
-primary and ordered read fallbacks. See [the complete example](../examples/repository-policy.json).
+primary and ordered read fallbacks. See [the complete example](../cfrg/examples/repository-policy.json).
 
 The primary CI names its forge; every repository must have a location there.
 Locations are explicit and use full instance/namespace identity, including nested
@@ -51,7 +51,7 @@ requires confirmed terminal cancellation and proof no execution began. Only an
 the repository's only executor: there is no fallback to turn to, so an unavailable,
 cancelled or unknown primary blocks.
 
-**No CI executor on a mirror forge can be modelled** (operating model R6, R7: no CI runs
+**No CI executor on a mirror forge can be modelled** (no CI runs
 on a mirror). Every executor is `"execution": "owned"` (our own compute); a
 provider-hosted (`free-hosted`) or `paid` executor does not parse; the own CI of a
 mirror forge (`github-actions`, `gitlab-ci`, `bitbucket-pipelines`) is refused as a

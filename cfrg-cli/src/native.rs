@@ -54,7 +54,7 @@ pub struct Options {
     /// `members` only: the report of a `settings` run; only the copies it found are planned for.
     #[arg(long)]
     copies_from: Option<PathBuf>,
-    /// `members` only: the login that is never touched (default julian-corbet).
+    /// `members` only: the login that is never touched (required).
     #[arg(long)]
     operator: Option<String>,
     /// `wiki` only: the SSH deploy key (private half; `<key>.pub` beside it) used to push the copy wikis.

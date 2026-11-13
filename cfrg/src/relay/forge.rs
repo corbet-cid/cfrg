@@ -49,7 +49,7 @@ impl fmt::Display for ForgeError {
 impl std::error::Error for ForgeError {}
 
 /// The answer to a read. `Gone` is only for a definitive 404/410: the object does not exist. A 403, a
-/// 5xx, a timeout or a rename is an `Err`, never `Gone` (R50 deletions, richc-bc 2026-11-13).
+/// 5xx, a timeout or a rename is an `Err`, never `Gone` (R50 deletions, the maintainer 2026-11-13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadOutcome {
     Found(Box<ObjectState>),

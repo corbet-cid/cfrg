@@ -1,6 +1,6 @@
 //! R50 deletions: "a deletion by the author or a maintainer on any forge deletes all copies".
 //!
-//! This is the one cascade the router gates hard (richc-bc 2026-11-13). A copy is deleted only when
+//! This is the one cascade the router gates hard (the maintainer 2026-11-13). A copy is deleted only when
 //! 1. the hint says `deleted`, AND a read returns a typed definitive *gone* (404/410; a 403, 5xx,
 //!    timeout or rename never counts) - for a comment: the object is readable and the comment is not in
 //!    its complete list;
@@ -498,7 +498,7 @@ impl Engine<'_> {
         })
     }
 
-    /// R52 / richc-bc: a contribution's notice is never deleted by a cascade, only closed.
+    /// R52 / the maintainer: a contribution's notice is never deleted by a cascade, only closed.
     fn close_notice(
         &mut self,
         mut obj: LogicalObject,

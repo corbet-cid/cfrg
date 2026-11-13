@@ -220,7 +220,7 @@ async fn draft_and_pull_mirror_and_foreign_orgs_do_nothing() {
     }
     assert!(w.sync(false).await.detail.unwrap().contains("pull mirror"));
     let mut cfg_json = json!({
-        "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
+        "forge_api": format!("{}/api/v1", w.forge.url), "forge_hosts": ["forge.example.org"], "forge_web": w.forge.url,
         "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": [], "min_write_interval_s": 0},
         "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": []},
     });
@@ -341,14 +341,14 @@ async fn a_contributed_repositorys_release_is_refused() {
     let placement = dir.path().join("placement.json");
     std::fs::write(
         &placement,
-        r#"{"native":{"schema":1,"source":{"origin":"https://forge.corbet.ch","token_env":"T"},"repositories":[],
-            "contributed":[{"name":"ccvl-upstream","upstream":"https://forge.corbet.ch/corbet-fsl/ccvl"}]}}"#,
+        r#"{"native":{"schema":1,"source":{"origin":"https://forge.example.org","token_env":"T"},"repositories":[],
+            "contributed":[{"name":"ccvl-upstream","upstream":"https://forge.example.org/example-fsl/ccvl"}]}}"#,
     )
     .unwrap();
     let cfg = json!({
-        "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
-        "github": {"api": w.gh.url, "uploads": w.gh.url, "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
-        "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["corbet-fsl"]},
+        "forge_api": format!("{}/api/v1", w.forge.url), "forge_hosts": ["forge.example.org"], "forge_web": w.forge.url,
+        "github": {"api": w.gh.url, "uploads": w.gh.url, "orgs": ["example-fsl"], "min_write_interval_s": 0},
+        "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["example-fsl"]},
         "placement": placement,
     });
     let ctx = cfrg_serve::release::Ctx::new(
@@ -359,7 +359,7 @@ async fn a_contributed_repositorys_release_is_refused() {
         ]),
     )
     .unwrap();
-    for host_spelling in ["corbet-fsl/ccvl"] {
+    for host_spelling in ["example-fsl/ccvl"] {
         let out = cfrg_serve::release::sync(&ctx, host_spelling, &w.tag, false).await;
         assert_eq!(out.exit, 0);
         let detail = out.detail.unwrap();
@@ -381,14 +381,14 @@ async fn a_contributed_copy_is_refused_and_the_other_copy_still_syncs() {
     let placement = dir.path().join("placement.json");
     std::fs::write(
         &placement,
-        r#"{"native":{"schema":1,"source":{"origin":"https://forge.corbet.ch","token_env":"T"},"repositories":[],
-            "contributed":[{"name":"theirs","upstream":"https://github.com/corbet-fsl/ccvl"}]}}"#,
+        r#"{"native":{"schema":1,"source":{"origin":"https://forge.example.org","token_env":"T"},"repositories":[],
+            "contributed":[{"name":"theirs","upstream":"https://github.com/example-fsl/ccvl"}]}}"#,
     )
     .unwrap();
     let cfg = json!({
-        "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
-        "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
-        "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["corbet-fsl"]},
+        "forge_api": format!("{}/api/v1", w.forge.url), "forge_hosts": ["forge.example.org"], "forge_web": w.forge.url,
+        "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["example-fsl"], "min_write_interval_s": 0},
+        "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["example-fsl"]},
         "placement": placement,
     });
     let ctx = cfrg_serve::release::Ctx::new(

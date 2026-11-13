@@ -19,7 +19,10 @@ carries because its primary does ([native mirrors](native-mirrors.md)).
 
 ## 2. Credentials
 
-* Secrets come from environment variables named in configuration. Files hold
+* Secrets come from environment variables named in configuration (`cfrg native`,
+  `cfrg gate`...) or, for the long-running receiver and relay, from files of a
+  credentials directory, never from the environment of the service
+  ([configuration](configuration.md#credentials-directory)). Configuration files hold
   the name, never the value (`cfrg/src/native.rs`, `env_name`).
 * The gate hands its token to git through `GIT_CONFIG_*` and to curl through
   `--variable`/`--expand-header`, never through arguments or files
@@ -30,7 +33,7 @@ carries because its primary does ([native mirrors](native-mirrors.md)).
 * State files hold rate windows and intents, never credentials
   ([native mirrors](native-mirrors.md)).
 * Webhook bodies are authenticated by HMAC-SHA256 over the raw body, compared in
-  constant time, before anything is parsed: `cfrg/src/serve.rs`
+  constant time, before anything is parsed: `cfrg/src/serve.rs` (the land lane) and `cfrg-serve/src/verify.rs` (the receiver)
   (`verify_signature`, `constant_time_eq`); tests `hmac_matches_the_rfc_4231_vectors`
   and `signatures_are_verified_exactly`.
 * Least write scope: GitHub writes go through one gate with a kill switch, a
@@ -39,18 +42,30 @@ carries because its primary does ([native mirrors](native-mirrors.md)).
 
 ## 3. Outside contributions and take-in after review
 
-Today (built): `cfrg bridge`, disabled unless `--enable-gitlab-import`, imports
+Two paths exist. The first is `cfrg bridge`, disabled unless `--enable-gitlab-import`, imports
 a GitLab merge request as a WIP pull request on the primary. It checks out and
 executes no code, hooks, filters or submodules; it checks that Actions are off
 on both repositories and that the webhook inventories are empty, and it needs
 `--confirm-ci-disabled` for the paths it cannot see. A WIP title is not a CI
 gate ([contribution bridge](pr-bridge.md); `cfrg/src/bridge/tests.rs`).
 
-Planned (B8, B13): outside commits are held out of the primary until a human
-maintainer has had them reviewed; `cfrg take-in` will fetch exactly the reviewed
-commit and fast-forward or merge it, never rebase or squash, so authorship is
-preserved. Only after take-in would the primary's CI run it. None of this
-exists in the code yet.
+The second is the relay ([relay](relay.md)). A pull or merge request from outside is
+relayed as credited sibling requests on the copies and one `contribution` notice on the
+primary, and nothing of it reaches the primary's branches or CI by itself
+(`cfrg/src/relay/tests_contrib.rs`). The abuse screen holds new outside requests on
+Forgejo by default (`screen: hold_all`) and a per-author daily cap bounds the rest.
+After a maintainer's review, [`cfrg take-in`](take-in.md) fetches exactly the reviewed
+commit, refuses if it moved since the review, and fast-forwards or merges it, never
+rebasing or squashing, so authorship is preserved. Only after take-in does the
+primary's CI run the commits (`cfrg-cli/src/take_in.rs` tests).
+
+Receiver hardening (`cfrg-serve/src/server.rs`, `verify.rs`): one HMAC key per forge, so a
+key that leaks from one provider signs nothing for another; the signature is checked over
+the raw body before parsing; a listener answers only the routes in its table; a request
+carries no authority, it names a repository and an object and the work re-reads everything
+from the forge; a delivery id is remembered so a replay does nothing twice; bodies over 1 MiB
+are refused; the relay has a kill switch file and per-forge pacing in the database
+([relay](relay.md)).
 
 ## 4. Projects that are not ours
 

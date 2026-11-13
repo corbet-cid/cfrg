@@ -52,10 +52,11 @@ pub fn run(options: &Options) -> Result<()> {
         })
         .collect();
     let paths: Vec<String> = primaries.iter().map(|p| p.path.clone()).collect();
-    let operator = options
-        .operator
-        .clone()
-        .unwrap_or_else(|| "julian-corbet".into());
+    let operator = options.operator.clone().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "members: --operator LOGIN is required (the login that is never touched)",
+        )
+    })?;
     let mut members = cfgj::native::list_members(&mut io, &placement.source, &paths)?;
     members.retain(|m| !m.login.eq_ignore_ascii_case(&operator));
 

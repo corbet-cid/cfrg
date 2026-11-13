@@ -90,9 +90,9 @@ impl Rig {
         let mut all = vec![("github_token", "ghp_fake"), ("gitlab_token", "glpat_fake")];
         all.extend(pairs);
         let cfg: Config = serde_json::from_value(json!({
-            "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
-            "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
-            "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["corbet-fsl"]},
+            "forge_api": format!("{}/api/v1", w.forge.url), "forge_hosts": ["forge.example.org"], "forge_web": w.forge.url,
+            "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["example-fsl"], "min_write_interval_s": 0},
+            "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["example-fsl"]},
             "placement": placement_file.path().join("placement.json"),
                     }))
         .unwrap();
@@ -179,7 +179,7 @@ impl Rig {
 }
 
 fn github_body() -> Vec<u8> {
-    json!({"action": "opened", "repository": {"id": 4242, "full_name": "corbet-fsl/ccvl", "owner": {"login": "corbet-fsl"}}, "installation": {"account": {"login": "corbet-fsl"}}, "issue": {"number": 7, "title": "SECRET TITLE"}, "sender": {"login": "mallory"}})
+    json!({"action": "opened", "repository": {"id": 4242, "full_name": "example-fsl/ccvl", "owner": {"login": "example-fsl"}}, "installation": {"account": {"login": "example-fsl"}}, "issue": {"number": 7, "title": "SECRET TITLE"}, "sender": {"login": "mallory"}})
         .to_string()
         .into_bytes()
 }
@@ -833,7 +833,7 @@ async fn the_service_speaks_tls_1_3_only_and_still_checks_the_signature() {
 async fn events_of_foreign_installations_and_repositories_are_dropped_with_a_202() {
     let rig = Rig::new().await;
     // GitHub: a signed event from an installation on a foreign account.
-    let foreign_installation = json!({"action": "opened", "repository": {"id": 4242, "owner": {"login": "corbet-fsl"}}, "installation": {"account": {"login": "mallory"}}, "issue": {"number": 7}})
+    let foreign_installation = json!({"action": "opened", "repository": {"id": 4242, "owner": {"login": "example-fsl"}}, "installation": {"account": {"login": "mallory"}}, "issue": {"number": 7}})
         .to_string()
         .into_bytes();
     assert_eq!(
@@ -847,7 +847,7 @@ async fn events_of_foreign_installations_and_repositories_are_dropped_with_a_202
         (202, "dropped".into())
     );
     // GitHub: our installation, a repository of a foreign owner.
-    let foreign_repo = json!({"action": "opened", "repository": {"id": 99, "full_name": "mallory/x", "owner": {"login": "mallory"}}, "installation": {"account": {"login": "corbet-fsl"}}, "issue": {"number": 7}})
+    let foreign_repo = json!({"action": "opened", "repository": {"id": 99, "full_name": "mallory/x", "owner": {"login": "mallory"}}, "installation": {"account": {"login": "example-fsl"}}, "issue": {"number": 7}})
         .to_string()
         .into_bytes();
     assert_eq!(

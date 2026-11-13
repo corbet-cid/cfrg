@@ -8,8 +8,9 @@ personal contact addresses.
 The primary repository is on Forgejo; GitHub, GitLab and Bitbucket hold copies.
 A pull or merge request on a copy is a valid way to contribute. Because copies
 never run CI ([security](docs/security.md)), a maintainer takes the change into
-the primary before anything runs on it. Until the planned review and take-in
-tooling exists (B13), that is done by hand.
+the primary before anything runs on it: the relay shows the request on the primary as a
+`contribution` notice, and after a maintainer's review `cfrg take-in` takes exactly the
+reviewed commit in ([take-in](docs/take-in.md)).
 
 ## Before you send a change
 
@@ -19,7 +20,7 @@ tooling exists (B13), that is done by hand.
   The workspace denies `dbg!`, `todo!` and `unimplemented!` and forbids unsafe
   code (`Cargo.toml`, `[workspace.lints]`).
 * Claims in documentation must name the code or test that backs them. A feature
-  that is not built is written as "planned" with its task ID, never as existing.
+  that is not built is not documented as existing.
 * Do not put host names, IP addresses or e-mail addresses of private systems in
   the repository. Use `example.invalid`-style placeholders.
 * Commits go to `main` without feature-branch ceremony; keep history linear.
