@@ -1,0 +1,539 @@
+//! R42 of the operating model: the settings every copy carries. The decision is pure. The
+//! Forgejo primary says what a copy must carry, the copy shows what it carries, and this
+//! says what to change, what to hold back and what the forge cannot hold at all. Adapters
+//! read and write; nothing here does I/O.
+//!
+//! Visibility has a direction. A copy that is more open than its primary is narrowed at
+//! once (the safe direction). A copy that would have to become public is never written by
+//! this pass: publishing cannot be undone (caches, indexes), so it is held and reported.
+use super::{Endpoint, Provider};
+use serde::Serialize;
+use serde_json::{json, Value};
+
+/// A copy to read or write: its forge, the credentialed API endpoint and its path.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub provider: Provider,
+    pub endpoint: Endpoint,
+    /// `owner/repo` on that forge.
+    pub path: String,
+}
+
+/// What an adapter did with one planned change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Applied {
+    pub field: Field,
+    /// `applied`, or `skipped` with the reason.
+    pub outcome: &'static str,
+    pub reason: Option<&'static str>,
+}
+
+impl Applied {
+    pub fn done(field: Field) -> Self {
+        Self {
+            field,
+            outcome: "applied",
+            reason: None,
+        }
+    }
+    pub fn skipped(field: Field, reason: &'static str) -> Self {
+        Self {
+            field,
+            outcome: "skipped",
+            reason: Some(reason),
+        }
+    }
+}
+
+/// What the Forgejo primary says a copy must match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Primary {
+    pub private: bool,
+    pub description: String,
+    /// Forgejo calls it the website.
+    pub homepage: String,
+    pub topics: Vec<String>,
+    pub default_branch: String,
+    pub archived: bool,
+}
+
+/// What a copy shows, normalised by its adapter. `None`: the forge does not report it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observed {
+    pub private: Option<bool>,
+    pub description: Option<String>,
+    pub homepage: Option<String>,
+    pub topics: Option<Vec<String>>,
+    pub default_branch: Option<String>,
+    pub archived: Option<bool>,
+    /// The forge's issue tracker is on (R38).
+    pub issues: Option<bool>,
+    /// The forge's wiki is on (R40).
+    pub wiki: Option<bool>,
+    /// The forge's own CI runs on the copy (R6).
+    pub ci: Option<bool>,
+    /// Automatic dependency or security update tooling is on (R35).
+    pub updates: Option<bool>,
+}
+
+/// One setting. The declaration order is the order of application: a copy is unarchived
+/// before anything else is written, and archived only after everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Field {
+    Unarchive,
+    Visibility,
+    Description,
+    Homepage,
+    Topics,
+    DefaultBranch,
+    Issues,
+    Wiki,
+    Ci,
+    Updates,
+    Archive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Change {
+    pub field: Field,
+    pub from: Value,
+    pub to: Value,
+}
+
+/// A difference this pass does not write, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Held {
+    pub field: Field,
+    pub reason: &'static str,
+    pub wanted: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Plan {
+    /// In application order.
+    pub changes: Vec<Change>,
+    pub held: Vec<Held>,
+    /// What the forge cannot hold at all (R3 "as closely as the forge allows").
+    pub unsupported: Vec<Field>,
+}
+
+impl Plan {
+    pub fn converged(&self) -> bool {
+        self.changes.is_empty() && self.held.is_empty()
+    }
+    pub fn to_json(&self) -> Value {
+        json!({"changes":self.changes, "held":self.held, "unsupported":self.unsupported})
+    }
+}
+
+/// How well the default branch of a copy is held for the mirroring alone (R43). Read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum Protection {
+    /// The receiver lock is in place exactly as cfrg writes it.
+    Locked,
+    /// Some protection exists on the default branch, but it is not the receiver lock.
+    Restricted { detail: String },
+    /// The default branch is open to anyone with write access.
+    Missing,
+    /// The forge's tier cannot lock this copy, or the question was not asked.
+    Unavailable { reason: String },
+}
+
+/// What a forge can store.
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities {
+    pub homepage: bool,
+    pub topics: bool,
+    pub archive: bool,
+    /// Automatic update tooling can be switched off through the API.
+    pub updates: bool,
+    pub description_limit: usize,
+    pub topic_limit: usize,
+}
+
+pub fn capabilities(provider: Provider) -> Capabilities {
+    match provider {
+        Provider::Github => Capabilities {
+            homepage: true,
+            topics: true,
+            archive: true,
+            updates: true,
+            description_limit: 350,
+            topic_limit: 20,
+        },
+        Provider::Gitlab => Capabilities {
+            homepage: false,
+            topics: true,
+            archive: true,
+            updates: false,
+            description_limit: 2000,
+            topic_limit: usize::MAX,
+        },
+        Provider::Bitbucket => Capabilities {
+            homepage: true,
+            topics: false,
+            archive: false,
+            updates: false,
+            description_limit: usize::MAX,
+            topic_limit: 0,
+        },
+    }
+}
+
+/// Whether the forge holds a wiki for this copy at no cost (R40). GitHub wikis of private
+/// repositories need a paid plan.
+pub fn wiki_free(provider: Provider, private: bool) -> bool {
+    !(provider == Provider::Github && private)
+}
+
+/// A topic as GitHub accepts it: lowercase letters, digits and hyphens, at most 50.
+fn github_topic(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.len() <= 50
+        && !topic.starts_with('-')
+        && topic
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn normalized(topics: &[String]) -> Vec<String> {
+    let mut all: Vec<String> = topics
+        .iter()
+        .map(|t| t.trim().to_ascii_lowercase())
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// Decide what a copy needs. `ci_declared`: the copy is declared to run the provider's own
+/// CI (a remote CI broker), so the CI switch is left as it is.
+pub fn plan(provider: Provider, primary: &Primary, seen: &Observed, ci_declared: bool) -> Plan {
+    let caps = capabilities(provider);
+    let mut plan = Plan::default();
+    let change = |plan: &mut Plan, field, from: Value, to: Value| {
+        plan.changes.push(Change { field, from, to });
+    };
+
+    // Visibility first: it decides what the forge lets the copy have (a GitHub wiki).
+    let mut effective_private = seen.private.unwrap_or(primary.private);
+    if let Some(live) = seen.private {
+        if live != primary.private {
+            if primary.private {
+                change(
+                    &mut plan,
+                    Field::Visibility,
+                    json!("public"),
+                    json!("private"),
+                );
+                effective_private = true;
+            } else {
+                plan.held.push(Held {
+                    field: Field::Visibility,
+                    reason: "publishing-needs-approval",
+                    wanted: json!("public"),
+                });
+            }
+        }
+    }
+
+    if let Some(live) = &seen.description {
+        let wanted = primary.description.trim();
+        if live.trim() != wanted {
+            if wanted.chars().count() > caps.description_limit {
+                plan.held.push(Held {
+                    field: Field::Description,
+                    reason: "longer-than-the-forge-allows",
+                    wanted: json!(wanted),
+                });
+            } else {
+                change(&mut plan, Field::Description, json!(live), json!(wanted));
+            }
+        }
+    }
+
+    if !caps.homepage {
+        if !primary.homepage.trim().is_empty() {
+            plan.unsupported.push(Field::Homepage);
+        }
+    } else if let Some(live) = &seen.homepage {
+        if live.trim() != primary.homepage.trim() {
+            change(
+                &mut plan,
+                Field::Homepage,
+                json!(live),
+                json!(primary.homepage.trim()),
+            );
+        }
+    }
+
+    if !caps.topics {
+        if !primary.topics.is_empty() {
+            plan.unsupported.push(Field::Topics);
+        }
+    } else if let Some(live) = &seen.topics {
+        let wanted = normalized(&primary.topics);
+        if normalized(live) != wanted {
+            let bad = provider == Provider::Github
+                && (wanted.len() > caps.topic_limit || wanted.iter().any(|t| !github_topic(t)));
+            if bad {
+                plan.held.push(Held {
+                    field: Field::Topics,
+                    reason: "topic-the-forge-does-not-accept",
+                    wanted: json!(wanted),
+                });
+            } else {
+                change(
+                    &mut plan,
+                    Field::Topics,
+                    json!(normalized(live)),
+                    json!(wanted),
+                );
+            }
+        }
+    }
+
+    if let Some(live) = &seen.default_branch {
+        if *live != primary.default_branch {
+            change(
+                &mut plan,
+                Field::DefaultBranch,
+                json!(live),
+                json!(primary.default_branch),
+            );
+        }
+    }
+
+    // Issues are on everywhere (R38).
+    if seen.issues == Some(false) {
+        change(&mut plan, Field::Issues, json!(false), json!(true));
+    }
+    // The wiki is on where it is free (R40); where it is not, the copy links to it instead.
+    if seen.wiki == Some(false) && wiki_free(provider, effective_private) {
+        change(&mut plan, Field::Wiki, json!(false), json!(true));
+    }
+    // No CI on a copy (R6), unless it is declared to run a broker's workflow.
+    if seen.ci == Some(true) && !ci_declared {
+        change(&mut plan, Field::Ci, json!("on"), json!("off"));
+    }
+    // No automatic update tooling on a copy (R35).
+    if seen.updates == Some(true) {
+        if caps.updates {
+            change(&mut plan, Field::Updates, json!("on"), json!("off"));
+        } else {
+            plan.unsupported.push(Field::Updates);
+        }
+    }
+
+    match (seen.archived, primary.archived) {
+        (Some(true), false) => change(&mut plan, Field::Unarchive, json!(true), json!(false)),
+        (Some(false), true) if caps.archive => {
+            change(&mut plan, Field::Archive, json!(false), json!(true))
+        }
+        (Some(false), true) => plan.unsupported.push(Field::Archive),
+        _ => {}
+    }
+    // A copy that stays archived is read-only: any other difference waits for the owner.
+    if seen.archived == Some(true) && primary.archived && !plan.changes.is_empty() {
+        for c in plan.changes.drain(..) {
+            plan.held.push(Held {
+                field: c.field,
+                reason: "archived-copy-is-read-only",
+                wanted: c.to,
+            });
+        }
+    }
+    plan.changes.sort_by_key(|c| c.field);
+    plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn primary() -> Primary {
+        Primary {
+            private: false,
+            description: "A tool".into(),
+            homepage: "https://example.org".into(),
+            topics: vec!["rust".into(), "cli".into()],
+            default_branch: "main".into(),
+            archived: false,
+        }
+    }
+
+    fn matching() -> Observed {
+        Observed {
+            private: Some(false),
+            description: Some("A tool".into()),
+            homepage: Some("https://example.org".into()),
+            topics: Some(vec!["cli".into(), "rust".into()]),
+            default_branch: Some("main".into()),
+            archived: Some(false),
+            issues: Some(true),
+            wiki: Some(true),
+            ci: Some(false),
+            updates: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_matching_copy_is_converged() {
+        for provider in [Provider::Github, Provider::Gitlab, Provider::Bitbucket] {
+            let plan = plan(provider, &primary(), &matching(), false);
+            assert!(plan.changes.is_empty(), "{provider:?}: {plan:?}");
+            assert!(plan.held.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_copy_more_open_than_its_primary_is_narrowed_at_once() {
+        let mut p = primary();
+        p.private = true;
+        let mut seen = matching();
+        seen.private = Some(false);
+        let plan = plan(Provider::Gitlab, &p, &seen, false);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].field, Field::Visibility);
+        assert_eq!(plan.changes[0].to, json!("private"));
+        assert!(plan.held.is_empty());
+    }
+
+    #[test]
+    fn a_copy_that_would_have_to_become_public_is_held_never_changed() {
+        let mut seen = matching();
+        seen.private = Some(true);
+        let plan = plan(Provider::Github, &primary(), &seen, false);
+        assert!(plan.changes.iter().all(|c| c.field != Field::Visibility));
+        assert_eq!(plan.held.len(), 1);
+        assert_eq!(plan.held[0].field, Field::Visibility);
+        assert_eq!(plan.held[0].reason, "publishing-needs-approval");
+    }
+
+    #[test]
+    fn unarchive_comes_first_and_archive_comes_last() {
+        let mut seen = matching();
+        seen.archived = Some(true);
+        seen.description = Some("old".into());
+        let plan = plan(Provider::Github, &primary(), &seen, false);
+        // Archived and primary live: unarchive, then everything else.
+        let fields: Vec<_> = plan.changes.iter().map(|c| c.field).collect();
+        assert_eq!(fields, [Field::Unarchive, Field::Description]);
+
+        let mut p = primary();
+        p.archived = true;
+        let mut seen = matching();
+        seen.description = Some("old".into());
+        let plan = plan_for(Provider::Gitlab, &p, &seen);
+        let fields: Vec<_> = plan.changes.iter().map(|c| c.field).collect();
+        assert_eq!(fields, [Field::Description, Field::Archive]);
+    }
+
+    fn plan_for(provider: Provider, p: &Primary, seen: &Observed) -> Plan {
+        plan(provider, p, seen, false)
+    }
+
+    #[test]
+    fn an_archived_copy_of_an_archived_primary_is_read_only() {
+        let mut p = primary();
+        p.archived = true;
+        let mut seen = matching();
+        seen.archived = Some(true);
+        seen.description = Some("old".into());
+        let plan = plan_for(Provider::Github, &p, &seen);
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.held[0].reason, "archived-copy-is-read-only");
+    }
+
+    #[test]
+    fn what_a_forge_cannot_hold_is_reported_not_forced() {
+        // GitLab has no homepage; Bitbucket has no topics and no archive.
+        let plan = plan_for(Provider::Gitlab, &primary(), &matching());
+        assert_eq!(plan.unsupported, [Field::Homepage]);
+        let mut p = primary();
+        p.archived = true;
+        let plan = plan_for(Provider::Bitbucket, &p, &matching());
+        assert!(plan.unsupported.contains(&Field::Topics));
+        assert!(plan.unsupported.contains(&Field::Archive));
+        assert!(plan.changes.iter().all(|c| c.field != Field::Archive));
+    }
+
+    #[test]
+    fn topics_compare_as_sets_and_github_refuses_what_it_cannot_store() {
+        let mut p = primary();
+        p.topics = vec!["Rust".into(), "cli".into(), "rust".into()];
+        let mut seen = matching();
+        seen.topics = Some(vec!["cli".into(), "rust".into()]);
+        assert!(plan_for(Provider::Github, &p, &seen).changes.is_empty());
+
+        p.topics = vec!["a.b".into()];
+        let plan = plan_for(Provider::Github, &p, &seen);
+        assert_eq!(plan.held[0].reason, "topic-the-forge-does-not-accept");
+        // GitLab takes any topic.
+        assert_eq!(plan_for(Provider::Gitlab, &p, &seen).changes.len(), 1);
+    }
+
+    #[test]
+    fn a_description_over_the_forge_limit_is_held() {
+        let mut p = primary();
+        p.description = "x".repeat(351);
+        let plan = plan_for(Provider::Github, &p, &matching());
+        assert_eq!(plan.held[0].reason, "longer-than-the-forge-allows");
+        assert!(plan_for(Provider::Gitlab, &p, &matching())
+            .changes
+            .iter()
+            .any(|c| c.field == Field::Description));
+    }
+
+    #[test]
+    fn issues_wiki_ci_and_updates_follow_the_model() {
+        let mut seen = matching();
+        seen.issues = Some(false);
+        seen.wiki = Some(false);
+        seen.ci = Some(true);
+        seen.updates = Some(true);
+        let fields = |plan: Plan| plan.changes.iter().map(|c| c.field).collect::<Vec<_>>();
+        assert_eq!(
+            fields(plan_for(Provider::Github, &primary(), &seen)),
+            [Field::Issues, Field::Wiki, Field::Ci, Field::Updates]
+        );
+        // A declared CI destination keeps its CI.
+        let kept = plan(Provider::Gitlab, &primary(), &seen, true);
+        assert!(kept.changes.iter().all(|c| c.field != Field::Ci));
+        // GitLab cannot switch update tooling off through the API.
+        assert!(plan(Provider::Gitlab, &primary(), &seen, true)
+            .unsupported
+            .contains(&Field::Updates));
+    }
+
+    #[test]
+    fn a_private_github_copy_gets_no_wiki_because_the_forge_charges_for_it() {
+        let mut p = primary();
+        p.private = true;
+        let mut seen = matching();
+        seen.private = Some(true);
+        seen.wiki = Some(false);
+        assert!(plan_for(Provider::Github, &p, &seen).changes.is_empty());
+        assert_eq!(
+            plan_for(Provider::Gitlab, &p, &seen).changes[0].field,
+            Field::Wiki
+        );
+        // A public copy that is narrowed to private loses its free wiki on GitHub too.
+        let mut seen = matching();
+        seen.wiki = Some(false);
+        let plan = plan_for(Provider::Github, &p, &seen);
+        assert!(plan.changes.iter().all(|c| c.field != Field::Wiki));
+    }
+
+    #[test]
+    fn the_default_branch_follows_the_primary() {
+        let mut seen = matching();
+        seen.default_branch = Some("master".into());
+        let plan = plan_for(Provider::Bitbucket, &primary(), &seen);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].field, Field::DefaultBranch);
+        assert_eq!(plan.changes[0].to, json!("main"));
+    }
+}

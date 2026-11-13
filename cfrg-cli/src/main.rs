@@ -258,6 +258,13 @@ fn access_inputs(
         files,
         cfrg::access::PlanOptions {
             frozen: forges,
+            // Forgejo is the primary of every project this command plans for (R44); the
+            // other three forges are copies and never receive a push-capable role (R43).
+            copies: vec![
+                cfrg::model::Forge::Github,
+                cfrg::model::Forge::Gitlab,
+                cfrg::model::Forge::Bitbucket,
+            ],
             operator: operator.clone(),
             run_at,
         },
