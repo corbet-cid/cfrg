@@ -25,6 +25,7 @@ pub mod ops;
 pub mod pacing;
 pub mod pass;
 pub mod pg;
+pub mod pgtls;
 pub mod store;
 
 #[cfg(test)]
@@ -35,6 +36,8 @@ mod tests;
 mod tests_ops;
 #[cfg(test)]
 mod tests_pg;
+#[cfg(test)]
+mod tests_tls;
 
 pub use engine::{Engine, Outcome, Report};
 pub use forge::{Forges, HoldAll, RouterForge, Screen, ScreenVerdict};

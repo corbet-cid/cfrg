@@ -4,18 +4,19 @@
 //! every write is `INSERT … ON CONFLICT DO UPDATE` of the whole row, so a retried job changes nothing. The lease is
 //! one conditional upsert. A transaction is `BEGIN`/`COMMIT` on the one connection.
 //!
-//! The connection is plain (no TLS) and `sslmode=require` fails closed, so use it inside the cluster; a TLS
-//! connector is the one open item before the runners connect over a public network.
+//! A non-local host is reached over verified TLS by default, see [`super::pgtls`]; plain TCP is for localhost.
 
 use super::model::{
     CommentRow, Hold, Intent, IntentStatus, LedgerEntry, LogicalObject, SiblingRow,
 };
 use super::store::{comment_order, sibling_order, Store};
 use crate::{model::Forge, Result};
-use postgres::{types::ToSql, Client, NoTls};
+use postgres::{config::SslMode, types::ToSql, Client, NoTls};
 use serde::{de::DeserializeOwned, Serialize};
 use std::cell::RefCell;
 use uuid::Uuid;
+
+const SCHEMA_LOCK: i64 = 0x6366_7267_7265_6c61;
 
 /// Created on connect; every statement is idempotent.
 pub const SCHEMA: &str = "
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS relay_intents (id uuid PRIMARY KEY, lid uuid NOT NULL
 CREATE INDEX IF NOT EXISTS relay_intents_lid ON relay_intents (lid);
 CREATE TABLE IF NOT EXISTS relay_ledger (id uuid PRIMARY KEY, ts bigint NOT NULL, doc jsonb NOT NULL);
 CREATE INDEX IF NOT EXISTS relay_ledger_ts ON relay_ledger (ts);
+CREATE TABLE IF NOT EXISTS relay_pace (forge text NOT NULL, namespace text NOT NULL, next_any bigint NOT NULL, next_create bigint NOT NULL, PRIMARY KEY (forge, namespace));
 CREATE TABLE IF NOT EXISTS relay_holds (forge text NOT NULL, namespace text NOT NULL, doc jsonb NOT NULL, PRIMARY KEY (forge, namespace));
 ";
 
@@ -54,8 +56,19 @@ fn json<T: Serialize>(row: &T) -> Result<serde_json::Value> {
 impl PgStore {
     /// Connects with a libpq-style URL or key/value string and makes sure the schema exists.
     pub fn connect(config: &str) -> Result<Self> {
-        let mut client = Client::connect(config, NoTls)?;
-        client.batch_execute(SCHEMA)?;
+        let parsed = super::pgtls::parse(config)?;
+        let mut cfg: postgres::Config = parsed.config.parse()?;
+        let mut client = match parsed.mode {
+            super::pgtls::Mode::Disable => cfg.ssl_mode(SslMode::Disable).connect(NoTls)?,
+            // Require, so a server that refuses TLS is an error and never a silent plain connection.
+            super::pgtls::Mode::Verify => cfg
+                .ssl_mode(SslMode::Require)
+                .connect(super::pgtls::connector(parsed.root_cert.as_deref())?)?,
+        };
+        // Concurrent first starts would race inside CREATE TABLE IF NOT EXISTS; one advisory lock serialises them.
+        client.batch_execute(&format!(
+            "SELECT pg_advisory_xact_lock({SCHEMA_LOCK}); {SCHEMA}"
+        ))?;
         Ok(Self {
             client: RefCell::new(client),
             depth: 0,
@@ -262,6 +275,40 @@ impl Store for PgStore {
 
     fn ledger_since(&self, ts: u64) -> Result<Vec<LedgerEntry>> {
         self.docs("SELECT doc FROM relay_ledger WHERE ts >= $1", &[&int(ts)])
+    }
+
+    fn pace_claim(
+        &mut self,
+        forge: Forge,
+        namespace: &str,
+        now: u64,
+        gap: u64,
+        create_gap: Option<u64>,
+    ) -> Result<u64> {
+        // One atomic statement on the namespace row: concurrent jobs queue behind each other's claims.
+        let rows = self.client.borrow_mut().query(
+            "INSERT INTO relay_pace (forge, namespace, next_any, next_create) \
+             VALUES ($1, $2, $3::bigint + $4::bigint, CASE WHEN $6 THEN $3::bigint + $5::bigint ELSE 0 END) \
+             ON CONFLICT (forge, namespace) DO UPDATE SET \
+               next_any = GREATEST($3::bigint, relay_pace.next_any, \
+                                   CASE WHEN $6 THEN relay_pace.next_create ELSE 0 END) + $4::bigint, \
+               next_create = CASE WHEN $6 THEN GREATEST($3::bigint, relay_pace.next_any, relay_pace.next_create) \
+                                       + $5::bigint ELSE relay_pace.next_create END \
+             RETURNING next_any",
+            &[
+                &forge.as_str(),
+                &namespace,
+                &int(now),
+                &int(gap),
+                &int(create_gap.unwrap_or(0)),
+                &create_gap.is_some(),
+            ],
+        )?;
+        let next: i64 = rows.first().ok_or("pace claim returned no row")?.get(0);
+        Ok(u64::try_from(next)
+            .unwrap_or(0)
+            .saturating_sub(gap)
+            .saturating_sub(now))
     }
 
     fn holds(&self) -> Result<Vec<Hold>> {

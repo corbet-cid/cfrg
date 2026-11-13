@@ -316,6 +316,41 @@ fn the_first_issue_takes_the_minimum_of_writes() {
 }
 
 #[test]
+fn writes_to_one_namespace_are_spaced_by_the_gap_and_creations_by_the_longer_one() {
+    let mut h = H::new();
+    h.github_issue();
+    h.github_issue();
+    let mut by_ns: std::collections::BTreeMap<(Forge, String), Vec<(u64, String)>> =
+        Default::default();
+    for e in h.store.ledger_since(0).unwrap() {
+        if e.kind == super::model::LedgerKind::Write {
+            by_ns
+                .entry((e.forge, e.namespace))
+                .or_default()
+                .push((e.ts, e.lid.unwrap()));
+        }
+    }
+    assert!(!by_ns.is_empty());
+    for ((forge, ns), mut writes) in by_ns {
+        writes.sort();
+        for pair in writes.windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= 2, "{forge:?} {ns}: {writes:?}");
+        }
+        // The first write of each object in a namespace is its creation (or the origin's first comment).
+        let mut firsts: Vec<u64> = Vec::new();
+        for (ts, lid) in &writes {
+            if !writes.iter().any(|(t, l)| l == lid && t < ts) {
+                firsts.push(*ts);
+            }
+        }
+        if forge != Forge::Github {
+            assert_eq!(firsts.len(), 2, "{forge:?} {ns}");
+            assert!(firsts[1] - firsts[0] >= 12, "{forge:?} {ns}: {firsts:?}");
+        }
+    }
+}
+
+#[test]
 fn an_issue_opened_on_forgejo_is_its_own_hub() {
     let mut h = H::new();
     let n =

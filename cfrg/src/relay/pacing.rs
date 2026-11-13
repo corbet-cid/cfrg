@@ -19,6 +19,8 @@ pub const DAY: u64 = 86_400;
 pub trait Clock {
     /// Seconds since the epoch.
     fn now(&self) -> u64;
+    /// Waits `secs` seconds, once. Tests move their clock instead of waiting.
+    fn sleep(&self, secs: u64);
 }
 
 pub struct SystemClock;
@@ -28,6 +30,10 @@ impl Clock for SystemClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs())
+    }
+
+    fn sleep(&self, secs: u64) {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
     }
 }
 
@@ -103,6 +109,30 @@ pub fn admit(
     Ok(Ok(()))
 }
 
+/// Takes the next write slot of the namespace and waits for it, once: the wait is computed by the store from
+/// the other jobs' claims, then slept in one piece. `creation` also keeps the longer gap between creations.
+pub fn pace_write(
+    store: &mut dyn Store,
+    cfg: &RouterConfig,
+    clock: &dyn Clock,
+    forge: Forge,
+    namespace: &str,
+    creation: bool,
+) -> Result<u64> {
+    let p = &cfg.pacing;
+    let wait = store.pace_claim(
+        forge,
+        namespace,
+        clock.now(),
+        p.write_gap_secs,
+        creation.then_some(p.create_gap_secs),
+    )?;
+    if wait > 0 {
+        clock.sleep(wait);
+    }
+    Ok(wait)
+}
+
 fn count_since(
     store: &dyn Store,
     now: u64,
@@ -161,6 +191,10 @@ pub(crate) mod testing {
     impl Clock for FakeClock {
         fn now(&self) -> u64 {
             self.0.get()
+        }
+
+        fn sleep(&self, secs: u64) {
+            self.advance_secs(secs);
         }
     }
 }
@@ -229,5 +263,63 @@ mod tests {
             admit(&store, &cfg, Forge::Gitlab, "x", false, now).unwrap(),
             Err(Denied::KillSwitch)
         );
+    }
+
+    #[test]
+    fn claims_are_spaced_per_namespace_and_creations_by_the_longer_gap() {
+        let mut store = MemStore::default();
+        let claim = |s: &mut MemStore, ns: &str, now: u64, create: bool| {
+            s.pace_claim(Forge::Github, ns, now, 2, create.then_some(12))
+                .unwrap()
+        };
+        assert_eq!(claim(&mut store, "a", 100, true), 0);
+        // A write right after waits for the 2 s gap; a creation waits for the 12 s one.
+        assert_eq!(claim(&mut store, "a", 100, false), 2);
+        assert_eq!(claim(&mut store, "a", 100, true), 12);
+        // Another namespace and another forge are independent.
+        assert_eq!(claim(&mut store, "b", 100, true), 0);
+        assert_eq!(
+            store.pace_claim(Forge::Gitlab, "a", 100, 2, None).unwrap(),
+            0
+        );
+        // After the slots have passed there is nothing to wait for.
+        assert_eq!(claim(&mut store, "a", 200, true), 0);
+    }
+
+    #[test]
+    fn two_concurrent_writers_on_one_namespace_are_at_least_a_gap_apart() {
+        use std::{
+            sync::{Arc, Mutex},
+            time::Instant,
+        };
+        let store = Arc::new(Mutex::new(MemStore::default()));
+        let start = Instant::now();
+        let times: Vec<_> = (0..3)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let clock = SystemClock;
+                    // The claim is the only locked step; the wait is slept once, outside the lock.
+                    let wait = store
+                        .lock()
+                        .unwrap()
+                        .pace_claim(Forge::Forgejo, "org", clock.now(), 1, None)
+                        .unwrap();
+                    clock.sleep(wait);
+                    start.elapsed()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut times = times;
+        times.sort();
+        for pair in times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= std::time::Duration::from_millis(900),
+                "{times:?}"
+            );
+        }
     }
 }

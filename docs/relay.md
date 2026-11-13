@@ -37,8 +37,12 @@ each row is key columns plus the full row as JSONB, written by `INSERT … ON CO
 | `relay_ledger` | `id` | counted writes, fan-outs and cascaded deletions (the caps) |
 | `relay_holds` | `(forge, namespace)` | a refused namespace; only the owner lifts it |
 
-The connection is plain TCP: `sslmode=require` fails closed. A TLS connector is open until the runners connect over a
-public network.
+| `relay_pace` | `(forge, namespace)` | the next allowed write and the next allowed creation (the gaps) |
+
+A host that is not local is reached over TLS (rustls through `tokio-postgres-rustls`) with the chain and the server
+name verified: `verify-full` is the default there, and `require` and `verify-ca` are treated the same (never weaker
+than libpq). `sslrootcert=<pem>` names the fleet CA; without it the system roots are used. Plain TCP is only for
+localhost, a loopback address or a unix socket, and `sslmode=disable` on any other host is an error.
 
 ## Limits
 
@@ -48,14 +52,19 @@ public network.
 | new objects fanned out per author per day | 5 (R51; the rest stays on Forgejo) |
 | writing passes per object per hour | 30 (RF8 backstop: the object is frozen) |
 | mutations per namespace per hour / day | 60 / 400 (RD11) |
+| gap between writes / between object creations, per namespace | 2 s / 12 s (`pacing.write_gap_secs`, `create_gap_secs`) |
 | lease | 600 s |
+
+The gaps hold across concurrent jobs: before a write the job claims its slot in `relay_pace` with one atomic upsert
+(the store returns the wait), sleeps once for that wait and then writes. There is no polling loop.
 
 ## Tests
 
 `cargo test -p cfrg --lib relay` runs the fake-forge suite and the in-memory store. The PostgreSQL tests are ignored
 unless a throwaway server is named:
 `CFRG_RELAY_TEST_PG='host=/tmp/sock user=postgres dbname=postgres' cargo test -p cfrg --lib relay::tests_pg -- --ignored`
-(and `-p cfrg-cli --test it relay_cli -- --ignored`).
+(and `-p cfrg-cli --test it relay_cli -- --ignored`). The TLS and database pacing tests start their own server with a
+throwaway CA: `CFRG_RELAY_TEST_PG_BIN=<dir with initdb and pg_ctl> cargo test -p cfrg --lib relay::tests_tls -- --ignored`.
 
 ## What a driver implements
 

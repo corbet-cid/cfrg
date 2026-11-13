@@ -36,6 +36,18 @@ pub trait Store {
 
     fn ledger_append(&mut self, entry: LedgerEntry) -> Result<()>;
     fn ledger_since(&self, ts: u64) -> Result<Vec<LedgerEntry>>;
+    /// Reserves the next write slot of a (forge, namespace) for the caller and returns how many seconds it must wait
+    /// before sending: every claim is at least `gap` after the previous claim, and a claim with `create_gap`
+    /// (an object creation) is also at least that after the previous creation. One atomic step, so concurrent
+    /// jobs on the namespace are spaced by the store, not by their own timers.
+    fn pace_claim(
+        &mut self,
+        forge: Forge,
+        namespace: &str,
+        now: u64,
+        gap: u64,
+        create_gap: Option<u64>,
+    ) -> Result<u64>;
     fn holds(&self) -> Result<Vec<Hold>>;
     /// `false` = the namespace is already on hold.
     fn hold_put(&mut self, hold: Hold) -> Result<bool>;
@@ -59,6 +71,8 @@ struct State {
     intents: BTreeMap<String, Intent>,
     ledger: Vec<LedgerEntry>,
     holds: Vec<Hold>,
+    /// (forge, namespace) to (next write, next creation).
+    pace: BTreeMap<String, (u64, u64)>,
 }
 
 /// [`Store`] in memory, for tests.
@@ -200,6 +214,27 @@ impl Store for MemStore {
             .filter(|e| e.ts >= ts)
             .cloned()
             .collect())
+    }
+
+    fn pace_claim(
+        &mut self,
+        forge: Forge,
+        namespace: &str,
+        now: u64,
+        gap: u64,
+        create_gap: Option<u64>,
+    ) -> Result<u64> {
+        let slot = self
+            .state
+            .pace
+            .entry(format!("{}/{namespace}", forge.as_str()))
+            .or_insert((0, 0));
+        let start = now.max(slot.0).max(create_gap.map_or(0, |_| slot.1));
+        slot.0 = start.saturating_add(gap);
+        if let Some(create_gap) = create_gap {
+            slot.1 = start.saturating_add(create_gap);
+        }
+        Ok(start - now)
     }
 
     fn holds(&self) -> Result<Vec<Hold>> {

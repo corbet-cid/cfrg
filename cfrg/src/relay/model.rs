@@ -137,6 +137,10 @@ pub struct Person {
 pub struct Pacing {
     pub namespace_per_hour: u64,
     pub namespace_per_day: u64,
+    /// Minimum seconds between any two writes to one forge namespace, across all relay jobs (kept in the store).
+    pub write_gap_secs: u64,
+    /// Minimum seconds between two object creations in one forge namespace.
+    pub create_gap_secs: u64,
 }
 
 impl Default for Pacing {
@@ -144,6 +148,8 @@ impl Default for Pacing {
         Self {
             namespace_per_hour: 60,
             namespace_per_day: 400,
+            write_gap_secs: 2,
+            create_gap_secs: 12,
         }
     }
 }

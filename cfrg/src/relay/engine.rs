@@ -302,6 +302,15 @@ impl Engine<'_> {
             self.note_intent(&intent.id, lid, text.clone())?;
             return Ok(Sent::Skipped(text));
         }
+        // The gap comes after the checks and before the ledger entry, so the entry carries the send time.
+        pacing::pace_write(
+            &mut *self.store,
+            self.cfg,
+            self.clock,
+            forge,
+            namespace,
+            intent.op == OpKind::CreateObject,
+        )?;
         let at = self.clock.now();
         let mut attempt = intent.clone();
         attempt.attempts += 1;

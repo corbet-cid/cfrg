@@ -20,12 +20,17 @@ tempfile.workspace = true
 process-wrap.workspace = true
 postgres.workspace = true
 uuid.workspace = true
+tokio-postgres-rustls = "0.14.0"
+rustls-native-certs = "0.8.5"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
 tokio = { version = "1", features = ["rt", "process", "io-util", "time"] }
 
 [dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 toml.workspace = true
 
 [lints]
