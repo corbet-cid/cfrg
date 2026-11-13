@@ -10,7 +10,7 @@ use cfrg::{
         heads::{Copy, GitCli, HeadHost, Heads, Origin, ReqRef, ReqState, Site},
     },
 };
-use cfrg_relay::heads_live::{enc, GitlabHeads, Rest};
+use cfrg_relay::heads_live::GitlabHeads;
 use std::{env, fs, rc::Rc};
 
 include!("forgejo_origin.rs.inc");
@@ -36,13 +36,14 @@ fn main() {
     heads.insert(Box::new(
         GitlabHeads::new(Rc::clone(&rt), driver, "gitlab.com", &gl).unwrap(),
     ));
-    heads.insert(Box::new(ForgejoOrigin(
-        Rest::new(
-            "https://forge.corbet.ch/api/v1",
-            &format!("Authorization: token {fjt}"),
+    heads.insert(Box::new(ForgejoOrigin {
+        rt: Rc::clone(&rt),
+        driver: cfgj::relay::ForgejoRelay::new(
+            "https://forge.corbet.ch",
+            &cfgj::relay::Token::new(fjt.clone()),
         )
         .unwrap(),
-    )));
+    }));
     let origin = Origin {
         forge: Forge::Forgejo,
         repo: fj.clone(),
@@ -58,7 +59,6 @@ fn main() {
         repo: copy.clone(),
         base: "main".into(),
     }];
-    let _ = enc("");
     let reports = if mode == "take" {
         heads.take_in(&origin, &copies, sha)
     } else {

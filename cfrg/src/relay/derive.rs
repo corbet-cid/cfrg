@@ -183,4 +183,29 @@ mod tests {
             "a copy without an immutable id is not addressed"
         );
     }
+
+    #[test]
+    fn a_copy_without_an_id_is_resolved_once_and_then_a_member() {
+        let doc = format!(
+            r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"F"}},"repositories":[{}],"contributed":[]}}"#,
+            repo("o/unknown-id", 5, &[dest("github", None)]),
+        );
+        let placement = Placement::from_document(doc.as_bytes()).unwrap();
+        let contributed = Contributed::from_placement(&placement, &[]).unwrap();
+        let none = |_: Forge, _: &str| None;
+        assert_eq!(
+            unresolved_copies(&placement, &contributed, &none),
+            [(Forge::Github, "o/unknown-id".to_owned())]
+        );
+        // The stored id (keyed by forge and path) makes the copy a member; a changed path would be a miss again.
+        let stored = |f: Forge, path: &str| {
+            (f == Forge::Github && path == "o/unknown-id").then(|| "4242".into())
+        };
+        assert!(unresolved_copies(&placement, &contributed, &stored).is_empty());
+        let sets = repos_from_placement_with(&placement, &contributed, &stored);
+        assert_eq!(sets[0].members[&Forge::Github].id, "4242");
+        let moved =
+            |f: Forge, path: &str| (f == Forge::Github && path == "o/old").then(|| "4242".into());
+        assert_eq!(unresolved_copies(&placement, &contributed, &moved).len(), 1);
+    }
 }

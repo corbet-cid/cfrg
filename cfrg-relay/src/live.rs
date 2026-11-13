@@ -5,19 +5,21 @@
 //! missing or unreadable gets no adapter: the engine treats it as an outage (RF1), and one log line on standard error
 //! names the forge and the credential file (never a value).
 //!
-//! The drivers (B3) offer the write capabilities only (create an issue, comment, add labels, close). Everything else
-//! the engine asks of a forge (reads, comment edits, deletions, marker search, maintainer lookup) answers
-//! `Unavailable("... not implemented by the driver")`: the intent stays pending and nothing is written twice.
+//! The drivers implement the whole `RouterForge` trait (build tasks B3 and B3b): reads, edits, deletions, the marker
+//! search and the maintainer lookup. A status stays a status: 401/403/429/402 are refusals (they hold a namespace),
+//! 5xx and transport failures are outages, other 4xx are rejections, and only a definitive 404/410 is `Gone`.
 use cfrg::{
     model::Forge,
     relay::{
-        forge::{Created, ForgeError, NewObject, ReadOutcome, RouterForge},
+        forge::{
+            from_status, has_marker_line, Created, ForgeError, NewObject, ReadOutcome, RouterForge,
+        },
         merge::Patch,
         model::{Actor, IssueState, ObjectRef, RouterConfig},
         Forges,
     },
 };
-use std::{collections::BTreeMap, fs, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, fs, path::PathBuf, rc::Rc};
 use tokio::runtime::Runtime;
 
 /// The fixed credential names (files of the credentials directory).
@@ -56,6 +58,219 @@ pub fn runtime() -> cfrg::Result<Rc<Runtime>> {
     ))
 }
 
+/// Repositories a definitive 404 was seen on, as (forge, repository id): the next run resolves their ids again.
+pub type Stale = Rc<RefCell<Vec<(Forge, String)>>>;
+
+fn classify(status: Option<u16>, invalid: bool, text: String) -> ForgeError {
+    match (status, invalid) {
+        (Some(code), _) => from_status(code, text),
+        (None, true) => ForgeError::Rejected(text),
+        (None, false) => ForgeError::Unavailable(text),
+    }
+}
+
+pub fn github_error(e: cghb::relay::Error) -> ForgeError {
+    classify(
+        e.status(),
+        matches!(e, cghb::relay::Error::Invalid(_)),
+        e.to_string(),
+    )
+}
+
+pub fn gitlab_error(e: cglb::relay::Error) -> ForgeError {
+    classify(
+        e.status(),
+        matches!(e, cglb::relay::Error::Invalid(_)),
+        e.to_string(),
+    )
+}
+
+pub fn forgejo_error(e: cfgj::relay::Error) -> ForgeError {
+    classify(
+        e.status(),
+        matches!(e, cfgj::relay::Error::Invalid(_)),
+        e.to_string(),
+    )
+}
+
+pub fn forgejo_repo(path: &str) -> Result<cfgj::relay::Repo, ForgeError> {
+    cfgj::relay::Repo::parse(path).map_err(forgejo_error)
+}
+
+/// The authenticated drivers of the forges whose credential is present.
+pub struct Drivers {
+    github: Option<cghb::relay::GithubRelay>,
+    gitlab: Option<cglb::relay::GitlabRelay>,
+    forgejo: Option<cfgj::relay::ForgejoRelay>,
+}
+
+impl Drivers {
+    pub fn open(dir: &Option<PathBuf>, rt: &Rc<Runtime>, forgejo_origin: &str) -> Self {
+        let forgejo = match credential(dir, FORGEJO_TOKEN) {
+            Some(token) => {
+                match cfgj::relay::ForgejoRelay::new(
+                    forgejo_origin,
+                    &cfgj::relay::Token::new(token),
+                ) {
+                    Ok(driver) => Some(driver),
+                    Err(why) => {
+                        eprintln!("relay: forgejo refused: {why}");
+                        None
+                    }
+                }
+            }
+            None => {
+                refused("forgejo", &[FORGEJO_TOKEN]);
+                None
+            }
+        };
+        let gitlab = match credential(dir, GITLAB_TOKEN) {
+            Some(token) => match rt.block_on(cglb::relay::GitlabRelay::new(
+                "gitlab.com",
+                &cglb::relay::Token::new(token),
+                false,
+            )) {
+                Ok(driver) => Some(driver),
+                Err(why) => {
+                    eprintln!("relay: gitlab refused: {why}");
+                    None
+                }
+            },
+            None => {
+                refused("gitlab", &[GITLAB_TOKEN]);
+                None
+            }
+        };
+        let app = (
+            credential(dir, GITHUB_APP_ID),
+            credential(dir, GITHUB_INSTALLATION_ID),
+            credential(dir, GITHUB_APP_KEY),
+        );
+        let github = match app {
+            (Some(app_id), Some(installation_id), Some(key)) => {
+                match (app_id.parse::<u64>(), installation_id.parse::<u64>()) {
+                    (Ok(app_id), Ok(installation_id)) => {
+                        let creds = cghb::relay::AppCredentials {
+                            app_id,
+                            installation_id,
+                            private_key_pem: cghb::relay::Redacted::new(key),
+                        };
+                        match rt.block_on(async {
+                            cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
+                        }) {
+                            Ok(driver) => Some(driver),
+                            Err(why) => {
+                                eprintln!("relay: github refused: {why}");
+                                None
+                            }
+                        }
+                    }
+                    _ => {
+                        eprintln!("relay: github refused: {GITHUB_APP_ID} and {GITHUB_INSTALLATION_ID} must be numbers");
+                        None
+                    }
+                }
+            }
+            _ => {
+                refused(
+                    "github",
+                    &[GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_APP_KEY],
+                );
+                None
+            }
+        };
+        Self {
+            github,
+            gitlab,
+            forgejo,
+        }
+    }
+
+    /// The immutable repository id of a copy, from its path. `Ok(None)` is a definitive 404/410 (no such copy);
+    /// a forge without a driver is an outage.
+    pub fn resolve(
+        &self,
+        rt: &Runtime,
+        forge: Forge,
+        path: &str,
+    ) -> Result<Option<String>, ForgeError> {
+        let no_driver = || ForgeError::Unavailable(format!("no {} credential", forge.as_str()));
+        match forge {
+            Forge::Github => {
+                let d = self.github.as_ref().ok_or_else(no_driver)?;
+                let repo = cghb::relay::Repo::parse(path).map_err(github_error)?;
+                Ok(rt
+                    .block_on(d.repo_id(&repo))
+                    .map_err(github_error)?
+                    .map(|i| i.to_string()))
+            }
+            Forge::Gitlab => {
+                let d = self.gitlab.as_ref().ok_or_else(no_driver)?;
+                let p = cglb::relay::Path::parse(path).map_err(gitlab_error)?;
+                Ok(rt
+                    .block_on(d.project_id(&p))
+                    .map_err(gitlab_error)?
+                    .map(|i| i.to_string()))
+            }
+            Forge::Forgejo => {
+                let d = self.forgejo.as_ref().ok_or_else(no_driver)?;
+                Ok(rt
+                    .block_on(d.repo_id(&forgejo_repo(path)?))
+                    .map_err(forgejo_error)?
+                    .map(|i| i.to_string()))
+            }
+            Forge::Bitbucket => Err(ForgeError::Rejected(
+                "Bitbucket is a git mirror only".into(),
+            )),
+        }
+    }
+
+    /// The router adapters of the drivers that exist.
+    pub fn into_forges(self, rt: &Rc<Runtime>, config: &RouterConfig, stale: &Stale) -> Forges {
+        // repository id -> path, per forge: the engine names repositories by immutable id, the drivers by path.
+        let mut paths: BTreeMap<Forge, BTreeMap<String, String>> = BTreeMap::new();
+        for set in &config.repos {
+            for (forge, member) in &set.members {
+                paths
+                    .entry(*forge)
+                    .or_default()
+                    .insert(member.id.clone(), member.path.clone());
+            }
+        }
+        let paths_of = |forge: Forge| paths.get(&forge).cloned().unwrap_or_default();
+        let relay_of = |forge: Forge| config.relay.get(&forge).cloned().unwrap_or_default();
+        let mut forges = Forges::new();
+        if let Some(driver) = self.forgejo {
+            forges.insert(Box::new(Forgejo {
+                rt: rt.clone(),
+                driver,
+                paths: paths_of(Forge::Forgejo),
+                relay: relay_of(Forge::Forgejo),
+                stale: stale.clone(),
+            }));
+        }
+        if let Some(driver) = self.gitlab {
+            forges.insert(Box::new(Gitlab {
+                rt: rt.clone(),
+                driver,
+                paths: paths_of(Forge::Gitlab),
+                relay: relay_of(Forge::Gitlab),
+                stale: stale.clone(),
+            }));
+        }
+        if let Some(driver) = self.github {
+            forges.insert(Box::new(Github {
+                rt: rt.clone(),
+                driver,
+                paths: paths_of(Forge::Github),
+                relay: relay_of(Forge::Github),
+                stale: stale.clone(),
+            }));
+        }
+        forges
+    }
+}
+
 /// Adapters for every forge whose credential is present.
 pub fn forges(
     dir: &Option<PathBuf>,
@@ -63,87 +278,7 @@ pub fn forges(
     config: &RouterConfig,
     forgejo_origin: &str,
 ) -> Forges {
-    let mut forges = Forges::new();
-    // repository id -> path, per forge: the engine names repositories by immutable id, the drivers by path.
-    let mut paths: BTreeMap<Forge, BTreeMap<String, String>> = BTreeMap::new();
-    for set in &config.repos {
-        for (forge, member) in &set.members {
-            paths
-                .entry(*forge)
-                .or_default()
-                .insert(member.id.clone(), member.path.clone());
-        }
-    }
-    let paths_of = |forge: Forge| paths.get(&forge).cloned().unwrap_or_default();
-
-    match credential(dir, FORGEJO_TOKEN) {
-        Some(token) => {
-            match cfgj::relay::ForgejoRelay::new(forgejo_origin, &cfgj::relay::Token::new(token)) {
-                Ok(driver) => forges.insert(Box::new(Forgejo {
-                    rt: rt.clone(),
-                    driver,
-                    paths: paths_of(Forge::Forgejo),
-                })),
-                Err(why) => eprintln!("relay: forgejo refused: {why}"),
-            }
-        }
-        None => refused("forgejo", &[FORGEJO_TOKEN]),
-    }
-    match credential(dir, GITLAB_TOKEN) {
-        Some(token) => match rt.block_on(cglb::relay::GitlabRelay::new(
-            "gitlab.com",
-            &cglb::relay::Token::new(token),
-            false,
-        )) {
-            Ok(driver) => forges.insert(Box::new(Gitlab {
-                rt: rt.clone(),
-                driver,
-                paths: paths_of(Forge::Gitlab),
-            })),
-            Err(why) => eprintln!("relay: gitlab refused: {why}"),
-        },
-        None => refused("gitlab", &[GITLAB_TOKEN]),
-    }
-    let app = (
-        credential(dir, GITHUB_APP_ID),
-        credential(dir, GITHUB_INSTALLATION_ID),
-        credential(dir, GITHUB_APP_KEY),
-    );
-    match app {
-        (Some(app_id), Some(installation_id), Some(key)) => {
-            match (app_id.parse::<u64>(), installation_id.parse::<u64>()) {
-                (Ok(app_id), Ok(installation_id)) => {
-                    let creds = cghb::relay::AppCredentials {
-                        app_id,
-                        installation_id,
-                        private_key_pem: cghb::relay::Redacted::new(key),
-                    };
-                    match rt.block_on(async { cghb::relay::GithubRelay::new(&creds, "https://api.github.com") }) {
-                        Ok(driver) => forges.insert(Box::new(Github { rt: rt.clone(), driver, paths: paths_of(Forge::Github) })),
-                        Err(why) => eprintln!("relay: github refused: {why}"),
-                    }
-                }
-                _ => eprintln!("relay: github refused: {GITHUB_APP_ID} and {GITHUB_INSTALLATION_ID} must be numbers"),
-            }
-        }
-        _ => refused(
-            "github",
-            &[GITHUB_APP_ID, GITHUB_INSTALLATION_ID, GITHUB_APP_KEY],
-        ),
-    }
-    forges
-}
-
-fn missing(op: &str) -> ForgeError {
-    ForgeError::Unavailable(format!("{op} is not implemented by the driver"))
-}
-
-fn invalid(e: impl std::fmt::Display, rejected: bool) -> ForgeError {
-    if rejected {
-        ForgeError::Rejected(e.to_string())
-    } else {
-        ForgeError::Unavailable(e.to_string())
-    }
+    Drivers::open(dir, rt, forgejo_origin).into_forges(rt, config, &Stale::default())
 }
 
 fn path_of(paths: &BTreeMap<String, String>, repo: &str) -> Result<String, ForgeError> {
@@ -164,59 +299,65 @@ fn snap_of(new: &NewObject) -> cfrg::relay::model::Snap {
     }
 }
 
-/// The write subset of a patch that every driver has: state `closed` and added labels. Anything else is not written.
-fn patch_supported(patch: &Patch) -> Result<(), ForgeError> {
-    let reopens = patch.state == Some(IssueState::Open);
-    if patch.title.is_some()
-        || patch.body.is_some()
-        || reopens
-        || !patch.labels_remove.is_empty()
-        || !patch.assignees_add.is_empty()
-        || !patch.assignees_remove.is_empty()
-    {
-        return Err(missing(
-            "update (title, body, reopen, label removal, assignees)",
-        ));
-    }
-    Ok(())
+/// The relay-authored object carrying `marker` among recent issues, if any (lost-response recovery).
+fn marker_match(
+    recent: Vec<cfrg::relay::model::ObjectState>,
+    relay: &[String],
+    marker: &str,
+) -> Option<Created> {
+    recent
+        .into_iter()
+        .find(|o| relay.contains(&o.author.id) && has_marker_line(&o.snap.body, marker))
+        .map(|o| Created {
+            number: o.number,
+            url: o.url,
+            snap: o.snap,
+        })
 }
 
-macro_rules! unsupported_reads {
-    () => {
-        fn read(&mut self, _: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
-            Err(missing("read"))
+fn found(
+    forge: Forge,
+    stale: &Stale,
+    repo: &str,
+    state: Option<cfrg::relay::model::ObjectState>,
+) -> ReadOutcome {
+    match state {
+        Some(o) => ReadOutcome::Found(Box::new(o)),
+        None => {
+            // Re-resolve the repository's id on the next run, only after a definitive 404/410.
+            stale.borrow_mut().push((forge, repo.to_owned()));
+            ReadOutcome::Gone
         }
-        fn update_comment(&mut self, _: &ObjectRef, _: u64, _: &str) -> Result<(), ForgeError> {
-            Err(missing("update_comment"))
-        }
-        fn delete_comment(&mut self, _: &ObjectRef, _: u64) -> Result<(), ForgeError> {
-            Err(missing("delete_comment"))
-        }
-        fn delete_object(&mut self, _: &ObjectRef) -> Result<(), ForgeError> {
-            Err(missing("delete_object"))
-        }
-        fn find_by_marker(&mut self, _: &str, _: &str) -> Result<Option<Created>, ForgeError> {
-            Err(missing("find_by_marker"))
-        }
-        fn is_maintainer(&mut self, _: &str, _: &Actor) -> Result<Option<bool>, ForgeError> {
-            Ok(None)
-        }
-    };
+    }
+}
+
+fn number_i64(n: u64) -> Result<i64, ForgeError> {
+    i64::try_from(n).map_err(|_| ForgeError::Rejected("number out of range".into()))
 }
 
 struct Github {
     rt: Rc<Runtime>,
     driver: cghb::relay::GithubRelay,
     paths: BTreeMap<String, String>,
+    relay: Vec<String>,
+    stale: Stale,
 }
 impl Github {
     fn repo(&self, id: &str) -> Result<cghb::relay::Repo, ForgeError> {
-        cghb::relay::Repo::parse(&path_of(&self.paths, id)?).map_err(|e| invalid(e, true))
+        cghb::relay::Repo::parse(&path_of(&self.paths, id)?).map_err(github_error)
     }
 }
 impl RouterForge for Github {
     fn forge(&self) -> Forge {
         Forge::Github
+    }
+    fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
+        let r = self.repo(&o.repo)?;
+        let state = self
+            .rt
+            .block_on(self.driver.issue_read(&r, o.number))
+            .map_err(github_error)?;
+        Ok(found(Forge::Github, &self.stale, &o.repo, state))
     }
     fn create_object(&mut self, repo: &str, new: &NewObject) -> Result<Created, ForgeError> {
         let r = self.repo(repo)?;
@@ -226,7 +367,7 @@ impl RouterForge for Github {
                 self.driver
                     .issue_create(&r, &new.title, &new.body, &new.labels),
             )
-            .map_err(|e| invalid(e, false))?;
+            .map_err(github_error)?;
         Ok(Created {
             number: c.number,
             url: c.html_url,
@@ -234,45 +375,88 @@ impl RouterForge for Github {
         })
     }
     fn update_object(&mut self, o: &ObjectRef, patch: &Patch) -> Result<(), ForgeError> {
-        patch_supported(patch)?;
+        if patch.is_empty() {
+            return Ok(());
+        }
         let r = self.repo(&o.repo)?;
-        if !patch.labels_add.is_empty() {
-            let labels: Vec<String> = patch.labels_add.iter().cloned().collect();
-            self.rt
-                .block_on(self.driver.labels_add(&r, o.number, &labels))
-                .map_err(|e| invalid(e, false))?;
-        }
-        if patch.state == Some(IssueState::Closed) {
-            self.rt
-                .block_on(self.driver.issue_close(&r, o.number))
-                .map_err(|e| invalid(e, false))?;
-        }
-        Ok(())
+        self.rt
+            .block_on(self.driver.issue_edit(&r, o.number, patch))
+            .map_err(github_error)
     }
     fn create_comment(&mut self, o: &ObjectRef, body: &str) -> Result<u64, ForgeError> {
         let r = self.repo(&o.repo)?;
         Ok(self
             .rt
             .block_on(self.driver.comment(&r, o.number, body))
-            .map_err(|e| invalid(e, false))?
+            .map_err(github_error)?
             .id)
     }
-    unsupported_reads!();
+    fn update_comment(&mut self, o: &ObjectRef, id: u64, body: &str) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.comment_edit(&r, id, body))
+            .map_err(github_error)
+    }
+    fn delete_comment(&mut self, o: &ObjectRef, id: u64) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.comment_delete(&r, id))
+            .map(|_| ())
+            .map_err(github_error)
+    }
+    fn delete_object(&mut self, o: &ObjectRef) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.issue_delete(&r, o.number))
+            .map(|_| ())
+            .map_err(github_error)
+    }
+    fn find_by_marker(&mut self, repo: &str, marker: &str) -> Result<Option<Created>, ForgeError> {
+        let r = self.repo(repo)?;
+        match self.rt.block_on(self.driver.issues_recent(&r)) {
+            Ok(recent) => Ok(marker_match(recent, &self.relay, marker)),
+            Err(e) => {
+                if e.status() == Some(404) {
+                    self.stale
+                        .borrow_mut()
+                        .push((Forge::Github, repo.to_owned()));
+                }
+                Err(github_error(e))
+            }
+        }
+    }
+    fn is_maintainer(&mut self, repo: &str, actor: &Actor) -> Result<Option<bool>, ForgeError> {
+        let r = self.repo(repo)?;
+        self.rt
+            .block_on(self.driver.is_maintainer(&r, &actor.login))
+            .map(Some)
+            .map_err(github_error)
+    }
 }
 
 struct Gitlab {
     rt: Rc<Runtime>,
     driver: cglb::relay::GitlabRelay,
     paths: BTreeMap<String, String>,
+    relay: Vec<String>,
+    stale: Stale,
 }
 impl Gitlab {
     fn project(&self, id: &str) -> Result<cglb::relay::Path, ForgeError> {
-        cglb::relay::Path::parse(&path_of(&self.paths, id)?).map_err(|e| invalid(e, true))
+        cglb::relay::Path::parse(&path_of(&self.paths, id)?).map_err(gitlab_error)
     }
 }
 impl RouterForge for Gitlab {
     fn forge(&self) -> Forge {
         Forge::Gitlab
+    }
+    fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
+        let p = self.project(&o.repo)?;
+        let state = self
+            .rt
+            .block_on(self.driver.issue_read(&p, o.number))
+            .map_err(gitlab_error)?;
+        Ok(found(Forge::Gitlab, &self.stale, &o.repo, state))
     }
     fn create_object(&mut self, repo: &str, new: &NewObject) -> Result<Created, ForgeError> {
         let p = self.project(repo)?;
@@ -282,54 +466,110 @@ impl RouterForge for Gitlab {
                 self.driver
                     .issue_create(&p, &new.title, &new.body, &new.labels),
             )
-            .map_err(|e| invalid(e, false))?;
+            .map_err(gitlab_error)?;
         Ok(Created {
             number: c.iid,
             url: c.web_url,
             snap: snap_of(new),
         })
     }
-    fn update_object(&mut self, _: &ObjectRef, patch: &Patch) -> Result<(), ForgeError> {
-        patch_supported(patch)?;
-        Err(missing(
-            "update (the GitLab driver has no label or close call for existing issues yet)",
-        ))
+    fn update_object(&mut self, o: &ObjectRef, patch: &Patch) -> Result<(), ForgeError> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let p = self.project(&o.repo)?;
+        self.rt
+            .block_on(self.driver.issue_edit(&p, o.number, patch))
+            .map_err(gitlab_error)
     }
     fn create_comment(&mut self, o: &ObjectRef, body: &str) -> Result<u64, ForgeError> {
         let p = self.project(&o.repo)?;
         Ok(self
             .rt
             .block_on(self.driver.issue_note(&p, o.number, body))
-            .map_err(|e| invalid(e, false))?
+            .map_err(gitlab_error)?
             .id)
     }
-    unsupported_reads!();
+    fn update_comment(&mut self, o: &ObjectRef, id: u64, body: &str) -> Result<(), ForgeError> {
+        let p = self.project(&o.repo)?;
+        self.rt
+            .block_on(self.driver.note_edit(&p, o.number, id, body))
+            .map_err(gitlab_error)
+    }
+    fn delete_comment(&mut self, o: &ObjectRef, id: u64) -> Result<(), ForgeError> {
+        let p = self.project(&o.repo)?;
+        self.rt
+            .block_on(self.driver.note_delete(&p, o.number, id))
+            .map(|_| ())
+            .map_err(gitlab_error)
+    }
+    fn delete_object(&mut self, o: &ObjectRef) -> Result<(), ForgeError> {
+        let p = self.project(&o.repo)?;
+        self.rt
+            .block_on(self.driver.issue_delete(&p, o.number))
+            .map(|_| ())
+            .map_err(gitlab_error)
+    }
+    fn find_by_marker(&mut self, repo: &str, marker: &str) -> Result<Option<Created>, ForgeError> {
+        let p = self.project(repo)?;
+        match self.rt.block_on(self.driver.issues_recent(&p)) {
+            Ok(recent) => Ok(marker_match(recent, &self.relay, marker)),
+            Err(e) => {
+                if e.status() == Some(404) {
+                    self.stale
+                        .borrow_mut()
+                        .push((Forge::Gitlab, repo.to_owned()));
+                }
+                Err(gitlab_error(e))
+            }
+        }
+    }
+    fn is_maintainer(&mut self, repo: &str, actor: &Actor) -> Result<Option<bool>, ForgeError> {
+        let Ok(user) = actor.id.parse::<u64>() else {
+            return Ok(None);
+        };
+        let p = self.project(repo)?;
+        self.rt
+            .block_on(self.driver.is_maintainer(&p, user))
+            .map(Some)
+            .map_err(gitlab_error)
+    }
 }
 
 struct Forgejo {
     rt: Rc<Runtime>,
     driver: cfgj::relay::ForgejoRelay,
     paths: BTreeMap<String, String>,
+    relay: Vec<String>,
+    stale: Stale,
 }
 impl Forgejo {
     fn repo(&self, id: &str) -> Result<cfgj::relay::Repo, ForgeError> {
-        cfgj::relay::Repo::parse(&path_of(&self.paths, id)?).map_err(|e| invalid(e, true))
+        forgejo_repo(&path_of(&self.paths, id)?)
     }
 }
 impl RouterForge for Forgejo {
     fn forge(&self) -> Forge {
         Forge::Forgejo
     }
+    fn read(&mut self, o: &ObjectRef) -> Result<ReadOutcome, ForgeError> {
+        let r = self.repo(&o.repo)?;
+        let state = self
+            .rt
+            .block_on(self.driver.issue_read(&r, number_i64(o.number)?))
+            .map_err(forgejo_error)?;
+        Ok(found(Forge::Forgejo, &self.stale, &o.repo, state))
+    }
     fn create_object(&mut self, repo: &str, new: &NewObject) -> Result<Created, ForgeError> {
         let r = self.repo(repo)?;
         let c = self
             .rt
             .block_on(self.driver.issue_create(&r, &new.title, &new.body))
-            .map_err(|e| invalid(e, false))?;
+            .map_err(forgejo_error)?;
         if !new.labels.is_empty() {
             self.rt
                 .block_on(self.driver.labels_add(&r, c.number, &new.labels))
-                .map_err(|e| invalid(e, false))?;
+                .map_err(forgejo_error)?;
         }
         Ok(Created {
             number: c.number as u64,
@@ -338,30 +578,63 @@ impl RouterForge for Forgejo {
         })
     }
     fn update_object(&mut self, o: &ObjectRef, patch: &Patch) -> Result<(), ForgeError> {
-        patch_supported(patch)?;
+        if patch.is_empty() {
+            return Ok(());
+        }
         let r = self.repo(&o.repo)?;
-        if !patch.labels_add.is_empty() {
-            let labels: Vec<String> = patch.labels_add.iter().cloned().collect();
-            self.rt
-                .block_on(self.driver.labels_add(&r, o.number as i64, &labels))
-                .map_err(|e| invalid(e, false))?;
-        }
-        if patch.state == Some(IssueState::Closed) {
-            self.rt
-                .block_on(self.driver.issue_close(&r, o.number as i64))
-                .map_err(|e| invalid(e, false))?;
-        }
-        Ok(())
+        self.rt
+            .block_on(self.driver.issue_edit(&r, number_i64(o.number)?, patch))
+            .map_err(forgejo_error)
     }
     fn create_comment(&mut self, o: &ObjectRef, body: &str) -> Result<u64, ForgeError> {
         let r = self.repo(&o.repo)?;
         let id = self
             .rt
-            .block_on(self.driver.comment(&r, o.number as i64, body))
-            .map_err(|e| invalid(e, false))?;
+            .block_on(self.driver.comment(&r, number_i64(o.number)?, body))
+            .map_err(forgejo_error)?;
         u64::try_from(id).map_err(|_| ForgeError::Rejected("negative comment id".into()))
     }
-    unsupported_reads!();
+    fn update_comment(&mut self, o: &ObjectRef, id: u64, body: &str) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.comment_edit(&r, number_i64(id)?, body))
+            .map_err(forgejo_error)
+    }
+    fn delete_comment(&mut self, o: &ObjectRef, id: u64) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.comment_delete(&r, number_i64(id)?))
+            .map(|_| ())
+            .map_err(forgejo_error)
+    }
+    fn delete_object(&mut self, o: &ObjectRef) -> Result<(), ForgeError> {
+        let r = self.repo(&o.repo)?;
+        self.rt
+            .block_on(self.driver.issue_delete(&r, number_i64(o.number)?))
+            .map(|_| ())
+            .map_err(forgejo_error)
+    }
+    fn find_by_marker(&mut self, repo: &str, marker: &str) -> Result<Option<Created>, ForgeError> {
+        let r = self.repo(repo)?;
+        match self.rt.block_on(self.driver.issues_recent(&r)) {
+            Ok(recent) => Ok(marker_match(recent, &self.relay, marker)),
+            Err(e) => {
+                if e.status() == Some(404) {
+                    self.stale
+                        .borrow_mut()
+                        .push((Forge::Forgejo, repo.to_owned()));
+                }
+                Err(forgejo_error(e))
+            }
+        }
+    }
+    fn is_maintainer(&mut self, repo: &str, actor: &Actor) -> Result<Option<bool>, ForgeError> {
+        let r = self.repo(repo)?;
+        self.rt
+            .block_on(self.driver.is_maintainer(&r, &actor.login))
+            .map(Some)
+            .map_err(forgejo_error)
+    }
 }
 
 #[cfg(test)]
@@ -386,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn a_present_forgejo_token_gives_an_adapter_that_cannot_read_yet() {
+    fn a_present_forgejo_token_gives_an_adapter_that_refuses_a_repository_outside_the_set() {
         let rt = runtime().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FORGEJO_TOKEN), "t\n").unwrap();
@@ -403,9 +676,10 @@ mod tests {
             kind: cfrg::relay::model::Kind::Issue,
             number: 1,
         };
+        // No request is made: the repository id is not in the relay set.
         assert!(matches!(
             adapter.read(&object),
-            Err(ForgeError::Unavailable(_))
+            Err(ForgeError::Rejected(_))
         ));
         assert!(f.get(Forge::Gitlab).is_none() && f.get(Forge::Github).is_none());
     }

@@ -1,4 +1,12 @@
-struct ForgejoOrigin(Rest);
+struct ForgejoOrigin {
+    rt: Rc<tokio::runtime::Runtime>,
+    driver: cfgj::relay::ForgejoRelay,
+}
+impl ForgejoOrigin {
+    fn repo(path: &str) -> Result<cfgj::relay::Repo, ForgeError> {
+        cfrg_relay::live::forgejo_repo(path)
+    }
+}
 impl HeadHost for ForgejoOrigin {
     fn forge(&self) -> Forge {
         Forge::Forgejo
@@ -24,13 +32,14 @@ impl HeadHost for ForgejoOrigin {
         Err(ForgeError::Rejected("origin only".into()))
     }
     fn request_state(&mut self, repo: &str, n: u64) -> Result<Option<ReqState>, ForgeError> {
-        let v = self
-            .0
-            .call_opt("GET", &format!("repos/{repo}/pulls/{n}"), &[])?;
-        Ok(v.map(|v| {
-            if v["merged"].as_bool() == Some(true) {
+        let pull = self
+            .rt
+            .block_on(self.driver.pull_read(&Self::repo(repo)?, n as i64))
+            .map_err(cfrg_relay::live::forgejo_error)?;
+        Ok(pull.map(|p| {
+            if p.merged {
                 ReqState::Merged
-            } else if v["state"].as_str() == Some("closed") {
+            } else if p.state == "closed" {
                 ReqState::Closed
             } else {
                 ReqState::Open
@@ -38,20 +47,15 @@ impl HeadHost for ForgejoOrigin {
         }))
     }
     fn close_request(&mut self, repo: &str, n: u64, note: &str) -> Result<(), ForgeError> {
-        self.0.call_opt(
-            "POST",
-            &format!("repos/{repo}/issues/{n}/comments"),
-            &[("body", note)],
-        )?;
-        self.0.call_opt(
-            "PATCH",
-            &format!("repos/{repo}/pulls/{n}"),
-            &[("state", "closed")],
-        )?;
-        Ok(())
+        let r = Self::repo(repo)?;
+        self.rt
+            .block_on(self.driver.comment(&r, n as i64, note))
+            .map_err(cfrg_relay::live::forgejo_error)?;
+        self.rt
+            .block_on(self.driver.pull_close(&r, n as i64))
+            .map_err(cfrg_relay::live::forgejo_error)
     }
     fn delete_branch(&mut self, _: &Site, _: &str) -> Result<(), ForgeError> {
         Ok(())
     }
 }
-

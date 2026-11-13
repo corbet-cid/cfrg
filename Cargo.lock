@@ -334,7 +334,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 [[package]]
 name = "cfgj"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cfgj?rev=c7fdd878add78e40308be51ec9d6c99c59251325#c7fdd878add78e40308be51ec9d6c99c59251325"
+source = "git+https://git.corbet.ch/corbet-libre/cfgj?rev=6fe1b0f48cd23ee2c3972529b75e0cd508244be4#6fe1b0f48cd23ee2c3972529b75e0cd508244be4"
 dependencies = [
  "cfrg",
  "cqlt",
@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "cghb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=437548c2ab8741b7a2135daf77a86c89d40259c7#437548c2ab8741b7a2135daf77a86c89d40259c7"
+source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=a63d74b67df7df06534d6d6afa1a103823e5453d#a63d74b67df7df06534d6d6afa1a103823e5453d"
 dependencies = [
  "cfrg",
  "cqlt",
@@ -440,7 +440,7 @@ dependencies = [
 [[package]]
 name = "cglb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cglb?rev=a858b2101540bc385bf15d73a4e6bd4aebb86207#a858b2101540bc385bf15d73a4e6bd4aebb86207"
+source = "git+https://git.corbet.ch/corbet-libre/cglb?rev=b964fc9619b5187788cb9e28cfec9ce29d3c8c42#b964fc9619b5187788cb9e28cfec9ce29d3c8c42"
 dependencies = [
  "cfrg",
  "gitlab",

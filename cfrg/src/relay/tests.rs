@@ -839,3 +839,62 @@ fn a_repository_rename_changes_nothing_because_repositories_are_addressed_by_id(
         "after the rename"
     );
 }
+
+#[test]
+fn a_gitlab_issue_becomes_a_forgejo_and_github_sibling_and_an_edit_and_a_close_propagate() {
+    let mut h = H::new();
+    let n =
+        h.gl.borrow_mut()
+            .open_issue(GL, &alice_gl(), "Hangs on exit", "It hangs.", &["bug"]);
+    let report = h.push(Forge::Gitlab, n, &alice_gl());
+    assert_eq!(report.outcome, Outcome::Converged, "{report:?}");
+    let hub = h.fj.borrow_mut().issue(FJ, 1);
+    let gh = h.gh.borrow_mut().issue(GH, 1);
+    assert_eq!(hub.snap.title, "Hangs on exit");
+    assert_eq!(gh.snap.title, "Hangs on exit");
+    assert!(gh.snap.labels.contains("bug"));
+    assert_eq!(
+        hub.author.id, "100",
+        "the sibling is written by the relay identity"
+    );
+    assert_eq!(gh.author.id, "200");
+
+    // An edit of the origin reaches both siblings.
+    h.gl.borrow_mut().edit(GL, n, |s| {
+        s.title = "Hangs on exit (Linux)".into();
+        s.body = "It hangs on Linux.".into();
+    });
+    h.clear_logs();
+    let report = h.push(Forge::Gitlab, n, &alice_gl());
+    assert_eq!(report.outcome, Outcome::Converged, "{report:?}");
+    for issue in [
+        h.fj.borrow_mut().issue(FJ, 1),
+        h.gh.borrow_mut().issue(GH, 1),
+    ] {
+        assert_eq!(issue.snap.title, "Hangs on exit (Linux)");
+        assert!(issue.snap.body.contains("It hangs on Linux."));
+    }
+
+    // A close reaches both siblings.
+    h.gl.borrow_mut()
+        .edit(GL, n, |s| s.state = Some(IssueState::Closed));
+    let report = h.push(Forge::Gitlab, n, &alice_gl());
+    assert_eq!(report.outcome, Outcome::Converged, "{report:?}");
+    for issue in [
+        h.fj.borrow_mut().issue(FJ, 1),
+        h.gh.borrow_mut().issue(GH, 1),
+    ] {
+        assert_eq!(issue.snap.state, Some(IssueState::Closed));
+    }
+    // A repeated delivery of the same close writes nothing.
+    h.clear_logs();
+    h.push(Forge::Gitlab, n, &alice_gl());
+    assert!(h.mutations().is_empty(), "{:?}", h.mutations());
+}
+
+fn alice_gl() -> Actor {
+    Actor {
+        id: "9001".into(),
+        login: "ada-gl".into(),
+    }
+}

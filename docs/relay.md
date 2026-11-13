@@ -113,3 +113,22 @@ throwaway CA: `CFRG_RELAY_TEST_PG_BIN=<dir with initdb and pg_ctl> cargo test -p
 `relay::RouterForge` (in `cfrg/src/relay/forge.rs`): `read`, `create_object`, `update_object`, `create_comment`,
 `update_comment`, `delete_comment`, `delete_object`, `find_by_marker`, `is_maintainer`. A definitive 404 or 410 is
 `ReadOutcome::Gone`; a 403, 5xx, timeout or rename is an error, never `Gone`.
+
+## Relay identity ids and copy ids (build task B3b)
+
+**Identities** (`relay` in the configuration, immutable user ids, [example](relay-config.example.json)): Forgejo `1` (`julian-corbet`),
+GitLab `44416965` (service account `corbet-forge`), GitHub: the user id of the App's bot (`corbet-forge[bot]`), filled in once
+lane B7 has created the App. Until then the GitHub list is empty and a run with GitHub members is refused (nothing is read or
+written). A delivery whose actor is one of these ids is dropped (design RD4).
+
+**Copy ids.** Repositories are addressed by immutable id, but the placement has no GitHub or GitLab copy ids. A run resolves
+the missing id of each copy once from its path (one read through the driver, at most 50 per run) and stores it in the relay
+database (`relay_copy_ids`, keyed by forge and path, created with the other relay tables on connect). A changed path is a
+miss and resolves again; a definitive 404 on a repository drops its row so the next run resolves it again. Nothing else
+re-resolves. A copy that cannot be resolved now is left out of that run, never guessed.
+
+**Driver coverage.** All three drivers implement the whole `RouterForge` trait: reads with comments (GitLab system notes are
+not comments), patches (title, body, state, labels, assignees), comment edit and delete, object delete (GitHub through the
+GraphQL `deleteIssue`, which needs admin rights), the marker search over the newest issues (author must be a relay id) and
+the maintainer lookup. Only a definitive 404/410 is `Gone`; 401/402/403/429 are refusals, 5xx and transport failures
+outages, other 4xx rejections. The pull request head flow (B8) reads and opens merge requests through `cglb` as well.

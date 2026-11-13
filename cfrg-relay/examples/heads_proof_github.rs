@@ -10,7 +10,7 @@ use cfrg::{
         heads::{Copy, GitCli, HeadHost, Heads, Origin, ReqRef, ReqState, Site},
     },
 };
-use cfrg_relay::heads_live::{GithubHeads, Rest};
+use cfrg_relay::heads_live::GithubHeads;
 use std::{env, rc::Rc};
 
 include!("forgejo_origin.rs.inc");
@@ -31,13 +31,14 @@ fn main() {
     let fjt = var("PROOF_FORGEJO_TOKEN");
     let mut heads = Heads::new(Box::new(GitCli));
     heads.insert(Box::new(GithubHeads::new(Rc::clone(&rt), driver).unwrap()));
-    heads.insert(Box::new(ForgejoOrigin(
-        Rest::new(
-            "https://forge.corbet.ch/api/v1",
-            &format!("Authorization: token {fjt}"),
+    heads.insert(Box::new(ForgejoOrigin {
+        rt: Rc::clone(&rt),
+        driver: cfgj::relay::ForgejoRelay::new(
+            "https://forge.corbet.ch",
+            &cfgj::relay::Token::new(fjt.clone()),
         )
         .unwrap(),
-    )));
+    }));
     let origin = Origin {
         forge: Forge::Forgejo,
         repo: fj.clone(),

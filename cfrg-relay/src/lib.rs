@@ -10,15 +10,26 @@ use cfrg::{
     contributed::Contributed,
     native::Placement,
     relay::{
-        derive::repos_from_placement, ops::SweepReport, pacing::SystemClock, pg::PgStore, Engine,
-        Hint, HoldAll, Report, RouterConfig,
+        copyid::CopyIds,
+        derive::{repos_from_placement, repos_from_placement_with, unresolved_copies},
+        ops::SweepReport,
+        pacing::SystemClock,
+        pg::PgStore,
+        Engine, Hint, HoldAll, Report, RouterConfig,
     },
     Result,
 };
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub mod heads_live;
 pub mod live;
+
+/// Copy ids resolved from a path in one run, at most; the rest follow in the next runs (reads are cheap, a burst is not).
+pub const MAX_RESOLVES_PER_RUN: usize = 50;
 
 /// Everything a run needs. Nothing here is a provider credential.
 #[derive(Clone, Debug)]
@@ -90,7 +101,14 @@ fn run<T>(
         .clone()
         .or_else(live::default_credentials_dir);
     let runtime = live::runtime()?;
-    let mut forges = live::forges(&dir, &runtime, &p.config, &p.placement.source.origin);
+    let drivers = live::Drivers::open(&dir, &runtime, &p.placement.source.origin);
+    let mut p = p;
+    resolve_copies(&mut store, &drivers, &runtime, &mut p)?;
+    if let Err(why) = p.config.validate() {
+        return Ok(refused(why.to_string()));
+    }
+    let stale = live::Stale::default();
+    let mut forges = drivers.into_forges(&runtime, &p.config, &stale);
     let clock = SystemClock;
     let holder = format!("cfrg-relay-{}", std::process::id());
     let mut engine = Engine {
@@ -103,7 +121,44 @@ fn run<T>(
         contributed: &p.contributed,
         holder: &holder,
     };
-    f(&mut engine)
+    let result = f(&mut engine);
+    // A definitive 404 on a repository: forget its resolved id, so the next run resolves it again.
+    for (forge, id) in stale.borrow().iter() {
+        store.drop_id(*forge, id)?;
+    }
+    result
+}
+
+/// Fills the ids of the copies the placement does not know: from the database, else once from the path through the
+/// driver, then stored. A copy that cannot be resolved now (outage, no credential) or does not exist is left out
+/// of this run's set; nothing is guessed.
+fn resolve_copies(
+    store: &mut PgStore,
+    drivers: &live::Drivers,
+    runtime: &tokio::runtime::Runtime,
+    p: &mut Prepared,
+) -> Result<()> {
+    let mut known = store.load()?;
+    let missing = unresolved_copies(&p.placement, &p.contributed, &|f, path| {
+        known.get(&(f, path.to_owned())).cloned()
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for (forge, path) in missing.into_iter().take(MAX_RESOLVES_PER_RUN) {
+        match drivers.resolve(runtime, forge, &path) {
+            Ok(Some(id)) => {
+                store.put(forge, &path, &id, now)?;
+                known.insert((forge, path), id);
+            }
+            Ok(None) => eprintln!("relay: {} copy {path} does not exist (404)", forge.as_str()),
+            Err(why) => eprintln!("relay: {} copy {path} not resolved: {why}", forge.as_str()),
+        }
+    }
+    p.config.repos = repos_from_placement_with(&p.placement, &p.contributed, &|f, path| {
+        known.get(&(f, path.to_owned())).cloned()
+    });
+    Ok(())
 }
 
 /// Applies one event (a hint: forge, repository id, object, action).
