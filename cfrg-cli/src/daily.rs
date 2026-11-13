@@ -1,8 +1,8 @@
 //! `cfrg daily`: the one daily run of the bridge (operating model R49), as the CronJob in the `forge-bridge` namespace runs it.
 //!
-//! Four steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
+//! Five steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
+//! (Renovate is not one of them: it runs as its own CronJob `renovate-daily`, in its own image, pinned to the node of slot a.)
 //! failed, so the Job fails. A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
-//!   renovate     runs in its own image (an initContainer of the Job: Renovate, cargo, git, nix are a large closure); it leaves its exit status in `--renovate-status`, and this step reports it (no file: a logged no-op)
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
 //!   settings     `cfrg native --operation settings --apply` (R42 copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
@@ -36,9 +36,6 @@ pub struct Options {
     /// CA file the database certificate is verified against (NOT `SSL_CERT_FILE`: that stays the public roots, which the providers and the key renewal need).
     #[arg(long, env = "CFRG_DAILY_CA", default_value = "/ca/ca.crt")]
     ca: PathBuf,
-    /// The file the Renovate initContainer leaves its exit status in (a decimal number).
-    #[arg(long, default_value = "/work/renovate.status")]
-    renovate_status: PathBuf,
     /// The GitLab key renewal script (run with bash; workloads brh-fra-k8s/forge-bridge/gitlab-key-renew.sh).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
@@ -58,8 +55,6 @@ pub struct Options {
 pub enum Action {
     /// Succeeds, saying why nothing was done.
     Noop(String),
-    /// A step that already ran elsewhere in the pod: succeeds when the file holds `0`.
-    Status(PathBuf),
     Command {
         program: PathBuf,
         args: Vec<String>,
@@ -84,15 +79,6 @@ pub fn run_steps(steps: &[Step]) -> Vec<&'static str> {
                     json!({"step": step.name, "outcome": "noop", "why": why})
                 );
                 true
-            }
-            Action::Status(path) => {
-                let code = fs::read_to_string(path).unwrap_or_default();
-                let ok = code.trim() == "0";
-                println!(
-                    "{}",
-                    json!({"step": step.name, "outcome": if ok { "ok" } else { "failed" }, "exit": code.trim()})
-                );
-                ok
             }
             Action::Command { program, args, env } => {
                 println!("{}", json!({"step": step.name, "outcome": "start"}));
@@ -173,13 +159,6 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             "CFRG_CREDENTIALS_DIRECTORY".into(),
             dir.display().to_string(),
         );
-    };
-    let renovate = if options.renovate_status.is_file() {
-        Action::Status(options.renovate_status.clone())
-    } else {
-        Action::Noop(
-            "renovate did not run in this pod (no status file from its initContainer)".into(),
-        )
     };
     let native = match env_file(dir, "native-env") {
         None => Action::Noop("the provider credentials of cfrg native (native-env) are not in the credentials directory yet".into()),
@@ -311,10 +290,6 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         };
     vec![
         Step {
-            name: "renovate",
-            action: renovate,
-        },
-        Step {
             name: "native",
             action: native,
         },
@@ -407,7 +382,6 @@ mod tests {
             placement: "/app/placement.json".into(),
             state: "/work/state".into(),
             ca: "/ca/ca.crt".into(),
-            renovate_status: dir.join("renovate.status"),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
             gate_dir: "/nonexistent-gate".into(),
             max_writes: 20,
@@ -421,14 +395,7 @@ mod tests {
         let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
-            [
-                "renovate",
-                "native",
-                "settings",
-                "wiki",
-                "sweep",
-                "gitlab-key"
-            ]
+            ["native", "settings", "wiki", "sweep", "gitlab-key"]
         );
         assert!(steps.iter().all(|s| matches!(s.action, Action::Noop(_))));
     }
@@ -442,7 +409,6 @@ mod tests {
             ("dbname", "forge_bridge"),
             ("username", "u"),
             ("password", "p'w\\x"),
-            ("renovate-forgejo", "tok"),
             ("native-env", "A=1\nB=2\n"),
             ("gitlab_token", "g"),
             ("forgejo_push", "f"),
@@ -452,13 +418,13 @@ mod tests {
             fs::write(dir.path().join(k), v).unwrap();
         }
         let steps = plan(&options(dir.path(), true), Path::new("/bin/cfrg"));
-        let Action::Command { args, env, .. } = &steps[5].action else {
+        let Action::Command { args, env, .. } = &steps[4].action else {
             panic!("gitlab-key must run")
         };
         assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
         assert_eq!(env["THRESHOLD_DAYS"], "0");
         assert!(!env.values().any(|v| v.contains("p'w")));
-        for step in [&steps[1], &steps[4]] {
+        for step in [&steps[0], &steps[3]] {
             let Action::Command { args, .. } = &step.action else {
                 panic!("{} must run", step.name)
             };
@@ -466,13 +432,13 @@ mod tests {
                 .iter()
                 .all(|a| !a.contains("p'w") && !a.contains("tok")));
         }
-        let Action::Command { args, env, .. } = &steps[4].action else {
+        let Action::Command { args, env, .. } = &steps[3].action else {
             unreachable!()
         };
         assert_eq!(args, &["relay", "sweep", "--older-than", "315360000"]);
         assert!(env["CFRG_RELAY_DATABASE"].contains("password='p\\'w\\\\x'"));
         assert!(env["CFRG_RELAY_DATABASE"].contains("sslmode=verify-full"));
-        let Action::Command { args, env, .. } = &steps[1].action else {
+        let Action::Command { args, env, .. } = &steps[0].action else {
             unreachable!()
         };
         assert!(
@@ -508,16 +474,9 @@ mod tests {
         let steps = plan(&o, Path::new("/bin/cfrg"));
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
-            [
-                "renovate",
-                "native",
-                "settings",
-                "wiki",
-                "sweep",
-                "gitlab-key"
-            ]
+            ["native", "settings", "wiki", "sweep", "gitlab-key"]
         );
-        let Action::Command { args, .. } = &steps[2].action else {
+        let Action::Command { args, .. } = &steps[1].action else {
             panic!("settings must run")
         };
         assert!(
@@ -529,7 +488,7 @@ mod tests {
             args.contains(&"--github-kill-switch".to_string())
                 && args.contains(&"--github-paused-dir".to_string())
         );
-        let Action::Command { args, .. } = &steps[3].action else {
+        let Action::Command { args, .. } = &steps[2].action else {
             panic!("wiki must run")
         };
         assert!(
@@ -543,7 +502,7 @@ mod tests {
         // dry: neither writes
         o.dry = true;
         let steps = plan(&o, Path::new("/bin/cfrg"));
-        for i in [2, 3] {
+        for i in [1, 2] {
             let Action::Command { args, .. } = &steps[i].action else {
                 panic!()
             };
@@ -559,14 +518,14 @@ mod tests {
         let mut o = options(dir.path(), false);
         o.gate_dir = gate.path().to_owned();
         let steps = plan(&o, Path::new("/bin/cfrg"));
-        assert!(matches!(steps[2].action, Action::Command { .. }));
-        let Action::Noop(why) = &steps[3].action else {
+        assert!(matches!(steps[1].action, Action::Command { .. }));
+        let Action::Noop(why) = &steps[2].action else {
             panic!("wiki without credentials must refuse")
         };
         assert!(why.starts_with("refused"));
         o.gate_dir = "/nonexistent-gate".into();
         let steps = plan(&o, Path::new("/bin/cfrg"));
-        for i in [2, 3] {
+        for i in [1, 2] {
             let Action::Noop(why) = &steps[i].action else {
                 panic!("no gate: refuse")
             };
@@ -575,28 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn renovate_is_the_status_its_init_container_left() {
-        let dir = tempfile::tempdir().unwrap();
-        let o = options(dir.path(), false);
-        let steps = plan(&o, Path::new("/bin/cfrg"));
-        assert!(matches!(&steps[0].action, Action::Noop(why) if why.contains("did not run")));
-        fs::write(dir.path().join("renovate.status"), "0\n").unwrap();
-        let steps = plan(&o, Path::new("/bin/cfrg"));
-        assert!(matches!(steps[0].action, Action::Status(_)));
-        assert!(run_steps(&steps[..1]).is_empty());
-        fs::write(dir.path().join("renovate.status"), "3\n").unwrap();
-        assert_eq!(
-            run_steps(&plan(&o, Path::new("/bin/cfrg"))[..1]),
-            vec!["renovate"]
-        );
-    }
-
-    #[test]
     fn a_real_run_reconciles_and_applies() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("native-env"), "A=1").unwrap();
         let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
-        let Action::Command { args, .. } = &steps[1].action else {
+        let Action::Command { args, .. } = &steps[0].action else {
             panic!()
         };
         assert!(args.contains(&"--apply".to_string()) && args.contains(&"reconcile".to_string()));
