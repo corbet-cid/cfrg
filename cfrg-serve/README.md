@@ -7,9 +7,9 @@ Events only: no timer, no polling, no queue of its own beyond a bounded in-memor
 |---|---|---|---|
 | internal (TLS 1.3, cluster CA) | `POST /hooks/release` | `hmac_forgejo` | Forgejo `release` hook -> release upload to the GitHub and GitLab copies (R45) |
 | internal | `POST /hooks/sync` | `hmac_forgejo` | a tag pusher's hint `{"repository","tag"}` -> the same upload |
-| internal | `POST /hooks/forgejo` | `hmac_forgejo` | issues, comments, pull requests of the primary -> `relay.yml` |
-| public (plain HTTP behind the tunnel) | `POST /hooks/github` | `hmac_github` | `X-Hub-Signature-256` -> `relay.yml` |
-| public | `POST /hooks/gitlab` | `hmac_gitlab` | Standard Webhooks (`webhook-signature`, key = the decoded `whsec_` token) -> `relay.yml` |
+| internal | `POST /hooks/forgejo` | `hmac_forgejo` | issues, comments, pull requests of the primary -> relay (in-process) |
+| public (plain HTTP behind the tunnel) | `POST /hooks/github` | `hmac_github` | `X-Hub-Signature-256` -> relay (in-process) |
+| public | `POST /hooks/gitlab` | `hmac_gitlab` | Standard Webhooks (`webhook-signature`, key = the decoded `whsec_` token) -> relay (in-process) |
 | both | `GET /healthz` | none | liveness |
 
 A listener answers nothing outside its rows. Every signature is checked on the raw body before it is parsed
@@ -17,14 +17,14 @@ A listener answers nothing outside its rows. Every signature is checked on the r
 a replay answers `200 duplicate`. The receiver answers `202` as soon as the job is queued; the dispatch itself is one
 attempt (no retry), and a failed one releases the id so the sender's redelivery is accepted.
 
-## The dispatch
+## The relay
 
-`POST {forge_api}/repos/{dispatch.repository}/actions/workflows/relay.yml/dispatches` with
-`{"ref": "main", "inputs": {forge, repository, kind, number, action}}`, all strings. `repository` is the forge's
-immutable repository id, `kind` is `issue` or `contribution`, `action` is `changed`, `deleted` or
-`comment_deleted:<comment id>`. `event::Dispatch::hint` turns the inputs into the relay's own `Hint`, so the workflow
-and the receiver cannot drift. Nothing else of the payload is forwarded. The credential is `dispatch_token`, a Forgejo
-token limited to the one repository (`write:repository`).
+After a verified event the service applies the relay itself, in-process, through the `relay::Relay` seam (the cfrg
+relay library on the `forge_bridge` database; the lease in the database is the only coordination, R56). There is no
+queue, no Forgejo workflow and no other machine in the path. The relay gets only the five fields as a `Hint`
+(`event::Dispatch::hint`): forge, repository id, `issue`/`contribution`, number, action (`changed`, `deleted`,
+`comment_deleted:<id>`). Until a relay is wired in (credentials not mounted) the relay routes answer 503 after their
+signature check.
 
 ## The release upload
 
@@ -40,5 +40,5 @@ cfrg-serve serve                          # config: FORGE_BRIDGE_CONFIG, credent
 cfrg-serve sync OWNER/REPO TAG [--plan]   # one release sync by hand; exit 0, 75 or 1
 ```
 
-Credentials are files named `forge_token`, `github_token`, `gitlab_token`, `dispatch_token`, `hmac_forgejo`,
+Credentials are files named `forge_token`, `github_token`, `gitlab_token`, `hmac_forgejo`,
 `hmac_github`, `hmac_gitlab`.

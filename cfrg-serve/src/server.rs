@@ -18,8 +18,8 @@
 //! spending our rate limits and starting jobs; it is not what makes the work safe.
 use crate::{
     config::{Config, Credentials},
-    dispatch::Dispatcher,
     event::{self, Dispatch},
+    relay::Relay,
     release::{self, Ctx},
     verify::{self, Reject, Replay},
 };
@@ -86,7 +86,7 @@ struct DispatchJob {
 pub struct Bridge {
     ctx: Arc<Ctx>,
     replay: Replay,
-    dispatcher: Option<Dispatcher>,
+    relay: Option<Arc<dyn Relay>>,
     release_tx: mpsc::Sender<(String, String)>,
     dispatch_tx: mpsc::Sender<DispatchJob>,
     wiki_tx: mpsc::Sender<String>,
@@ -105,20 +105,16 @@ pub struct Workers {
 }
 
 impl Bridge {
-    pub fn new(cfg: Config, creds: Credentials) -> crate::config::Result<(Arc<Self>, Workers)> {
+    /// `relay` runs the relay work in-process; `None` until its credentials are mounted (the relay routes then answer 503).
+    pub fn new(
+        cfg: Config,
+        creds: Credentials,
+        relay: Option<Arc<dyn Relay>>,
+    ) -> crate::config::Result<(Arc<Self>, Workers)> {
         let replay = Replay::new(
             Duration::from_secs(cfg.replay.ttl_seconds),
             cfg.replay.capacity,
         );
-        let dispatcher = match (&cfg.dispatch, creds.get("dispatch_token")) {
-            (Some(target), Some(token)) => Some(Dispatcher::new(
-                crate::http::forge_client(cfg.forge_ca.as_deref().map(Path::new))?,
-                &cfg.forge_api,
-                target,
-                token,
-            )),
-            _ => None,
-        };
         let (hooks, hook_rx) = crate::hooks::Queue::new();
         let ctx = Arc::new(Ctx::new(cfg, creds)?);
         let (release_tx, release_rx) = mpsc::channel(64);
@@ -127,7 +123,7 @@ impl Bridge {
         let bridge = Arc::new(Self {
             ctx,
             replay,
-            dispatcher,
+            relay,
             release_tx,
             dispatch_tx,
             wiki_tx,
@@ -160,7 +156,7 @@ impl Bridge {
             .copied()
     }
 
-    /// The two workers, each its own task: a long upload never delays a dispatch.
+    /// The two workers, each its own task: a long upload never delays a relay.
     pub fn run_workers(self: &Arc<Self>, workers: Workers) {
         let Workers {
             mut release_rx,
@@ -178,18 +174,7 @@ impl Bridge {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&(repo.clone(), tag.clone()));
-                let exit = match &bridge.ctx.cfg.release_command {
-                    Some(argv) if !argv.is_empty() => tokio::process::Command::new(&argv[0])
-                        .args(&argv[1..])
-                        .arg(&repo)
-                        .arg(&tag)
-                        .status()
-                        .await
-                        .ok()
-                        .and_then(|s| s.code())
-                        .unwrap_or(1),
-                    _ => release::sync(&bridge.ctx, &repo, &tag, false).await.exit,
-                };
+                let exit = release::sync(&bridge.ctx, &repo, &tag, false).await.exit;
                 bridge
                     .last
                     .lock()
@@ -233,13 +218,22 @@ impl Bridge {
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(job) = dispatch_rx.recv().await {
-                let Some(dispatcher) = &bridge.dispatcher else {
+                let Some(relay) = &bridge.relay else {
                     continue;
                 };
-                match dispatcher.run(&job.dispatch).await {
+                let (forge, kind, number) = (
+                    job.dispatch.forge.as_str(),
+                    job.dispatch.kind,
+                    job.dispatch.number,
+                );
+                let result = match job.dispatch.hint() {
+                    Ok(hint) => relay.apply(hint).await,
+                    Err(error) => Err(error),
+                };
+                match result {
                     Ok(()) => log(
-                        "dispatched",
-                        json!({"forge": job.dispatch.forge.as_str(), "kind": job.dispatch.kind, "number": job.dispatch.number}),
+                        "relayed",
+                        json!({"forge": forge, "kind": kind, "number": number}),
                     ),
                     Err(error) => {
                         // One attempt (R30): free the delivery id so the sender's redelivery is accepted.
@@ -247,8 +241,8 @@ impl Bridge {
                             bridge.replay.release(key);
                         }
                         log(
-                            "dispatch-failed",
-                            json!({"forge": job.dispatch.forge.as_str(), "error": error}),
+                            "relay-failed",
+                            json!({"forge": forge, "kind": kind, "number": number, "error": error}),
                         );
                     }
                 }
@@ -460,13 +454,13 @@ pub async fn handle(bridge: Arc<Bridge>, listener: Arc<str>, request: Request<In
                 );
                 return reply(202, "queued");
             }
-            if bridge.dispatcher.is_none() {
+            if bridge.relay.is_none() {
                 release_key(&replay_key);
                 log(
                     "refused",
-                    json!({"listener": &*listener, "path": path, "reason": "no dispatch target or token"}),
+                    json!({"listener": &*listener, "path": path, "reason": "no relay configured"}),
                 );
-                return reply(503, "dispatch is not configured");
+                return reply(503, "the relay is not configured");
             }
             let job = DispatchJob {
                 dispatch,

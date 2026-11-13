@@ -404,6 +404,7 @@ dependencies = [
  "bytes",
  "cfgj",
  "cfrg",
+ "cfrg-relay",
  "futures-util",
  "hex",
  "hmac 0.12.1",

@@ -1,6 +1,7 @@
 //! The receiver: signatures per forge (valid, wrong, missing, replayed), dispatch, routes per listener, TLS 1.3.
 mod common;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use cfrg::relay::{Hint, HintAction};
 use cfrg_serve::{
     config::{Config, Credentials},
     server::{self, Bridge},
@@ -28,8 +29,29 @@ fn gitlab_token() -> String {
     format!("whsec_{}", STANDARD.encode([9u8; 32]))
 }
 
+#[derive(Default)]
+struct Recorder {
+    seen: std::sync::Mutex<Vec<Hint>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl cfrg_serve::relay::Relay for Recorder {
+    fn apply(&self, hint: Hint) -> cfrg_serve::relay::RelayFuture<'_> {
+        self.seen.lock().unwrap().push(hint);
+        let fail = self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if fail {
+                Err("relay failed".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
 struct Rig {
     w: World,
+    rec: Arc<Recorder>,
     internal: String,
     public: String,
     bridge: Arc<Bridge>,
@@ -44,7 +66,7 @@ impl Rig {
                 ("hmac_forgejo", "s3cret"),
                 ("hmac_github", "ghkey"),
                 ("hmac_gitlab", "SET"),
-                ("dispatch_token", "dtok"),
+                ("relay", "on"),
             ],
             None,
         )
@@ -64,10 +86,15 @@ impl Rig {
             "forge_api": format!("{}/api/v1", w.forge.url), "forge_web": w.forge.url,
             "github": {"api": w.gh.url, "uploads": w.gh.url, "web": format!("{}/web", w.gh.url), "orgs": ["corbet-fsl"], "min_write_interval_s": 0},
             "gitlab": {"api": format!("{}/api/v4", w.gl.url), "groups": ["corbet-fsl"]},
-            "dispatch": {"repository": "corbet-infra/infra"},
-        }))
+                    }))
         .unwrap();
-        let (bridge, workers) = Bridge::new(cfg, Credentials::from_pairs(&all)).unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let relay: Option<Arc<dyn cfrg_serve::relay::Relay>> = if all.contains(&("relay", "on")) {
+            Some(recorder.clone())
+        } else {
+            None
+        };
+        let (bridge, workers) = Bridge::new(cfg, Credentials::from_pairs(&all), relay).unwrap();
         bridge.run_workers(workers);
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut urls = vec![];
@@ -92,6 +119,7 @@ impl Rig {
         }
         Rig {
             w,
+            rec: recorder,
             internal: urls[0].clone(),
             public: urls[1].clone(),
             bridge,
@@ -116,16 +144,11 @@ impl Rig {
         (status, response.text().await.unwrap().trim().to_owned())
     }
 
-    fn dispatches(&self) -> Vec<Req> {
-        self.w
-            .forge
-            .all()
-            .into_iter()
-            .filter(|r| r.path.ends_with("/dispatches"))
-            .collect()
+    fn dispatches(&self) -> Vec<Hint> {
+        self.rec.seen.lock().unwrap().clone()
     }
 
-    async fn dispatched(&self, count: usize) -> Vec<Req> {
+    async fn dispatched(&self, count: usize) -> Vec<Hint> {
         for _ in 0..100 {
             if self.dispatches().len() >= count {
                 break;
@@ -250,7 +273,7 @@ async fn github_signature_valid_wrong_missing_replayed() {
 }
 
 #[tokio::test]
-async fn the_dispatch_carries_only_the_five_fields_and_the_narrow_token() {
+async fn the_relay_gets_only_the_five_fields() {
     let rig = Rig::new().await;
     let body = github_body();
     rig.post(
@@ -261,31 +284,20 @@ async fn the_dispatch_carries_only_the_five_fields_and_the_narrow_token() {
     )
     .await;
     let sent = rig.dispatched(1).await;
-    let request = &sent[0];
+    let hint: Value = serde_json::to_value(&sent[0]).unwrap();
     assert_eq!(
-        request.path,
-        "/api/v1/repos/corbet-infra/infra/actions/workflows/relay.yml/dispatches"
+        hint,
+        json!({"forge": "github", "repo": "4242", "kind": "issue", "number": 7, "action": {"type": "changed"}, "actor": null})
     );
-    assert_eq!(
-        request.header("authorization").as_deref(),
-        Some("token dtok")
-    );
-    let payload: Value = serde_json::from_slice(&request.body).unwrap();
-    assert_eq!(
-        payload,
-        json!({"ref": "main", "inputs": {"forge": "github", "repository": "4242", "kind": "issue", "number": "7", "action": "changed"}})
-    );
-    let text = String::from_utf8_lossy(&request.body);
-    assert!(
-        !text.contains("SECRET TITLE") && !text.contains("mallory"),
-        "nothing but the five fields is forwarded"
-    );
+    assert!(!hint.to_string().contains("SECRET TITLE") && !hint.to_string().contains("mallory"));
 }
 
 #[tokio::test]
 async fn the_fast_2xx_does_not_wait_for_the_dispatch() {
     let rig = Rig::new().await;
-    rig.w.st.lock().unwrap().dispatch_status = 500;
+    rig.rec
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let body = github_body();
     let started = std::time::Instant::now();
     assert_eq!(
@@ -303,7 +315,9 @@ async fn the_fast_2xx_does_not_wait_for_the_dispatch() {
     // The dispatch failed: the delivery id was released, so GitHub's manual redelivery (same id, same body) is accepted.
     rig.dispatched(1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.w.st.lock().unwrap().dispatch_status = 204;
+    rig.rec
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         rig.post(
             &rig.public,
@@ -408,11 +422,8 @@ async fn gitlab_signature_valid_wrong_missing_replayed() {
         (202, "queued".into())
     );
     let sent = rig.dispatched(1).await;
-    let payload: Value = serde_json::from_slice(&sent[0].body).unwrap();
-    assert_eq!(
-        payload["inputs"],
-        json!({"forge": "gitlab", "repository": "55", "kind": "contribution", "number": "3", "action": "changed"})
-    );
+    assert_eq!((sent[0].repo.as_str(), sent[0].number), ("55", 3));
+    assert_eq!(sent[0].action, HintAction::Changed);
     assert_eq!(
         rig.post(&rig.public, "/hooks/gitlab", &ok, &body).await,
         (200, "duplicate".into())
@@ -466,9 +477,10 @@ async fn forgejo_signature_valid_wrong_missing_replayed_and_dispatch() {
         (202, "queued".into())
     );
     let sent = rig.dispatched(1).await;
-    let payload: Value = serde_json::from_slice(&sent[0].body).unwrap();
-    assert_eq!(payload["inputs"]["action"], "comment_deleted:31");
-    assert_eq!(payload["inputs"]["forge"], "forgejo");
+    assert_eq!(
+        sent[0].action,
+        HintAction::CommentDeleted { comment_id: 31 }
+    );
     assert_eq!(
         rig.post(
             &rig.internal,
@@ -482,7 +494,7 @@ async fn forgejo_signature_valid_wrong_missing_replayed_and_dispatch() {
 }
 
 #[tokio::test]
-async fn no_dispatch_token_means_503_and_nothing_is_lost_to_the_replay_guard() {
+async fn no_relay_means_503_and_nothing_is_lost_to_the_replay_guard() {
     let rig = Rig::with(&[("hmac_github", "ghkey")], None).await;
     let body = github_body();
     let headers = github_headers("ghkey", &body, "d1", "issues");

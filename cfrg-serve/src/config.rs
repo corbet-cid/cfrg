@@ -1,7 +1,6 @@
 //! Configuration (`config.json`) and credentials (one file per key in a directory, like a mounted Secret).
 //!
-//! The file is the one the Python bridge read, with the receiver's own additions: the dispatch target and the
-//! placement document that declares the contributed projects.
+//! The file is the one the Python bridge read, with the receiver's own addition: the placement document that declares the contributed projects.
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -26,16 +25,14 @@ pub struct Config {
     /// The public spellings of the primary forge (the first is the web host of the primary).
     #[serde(default = "default_forge_hosts")]
     pub forge_hosts: Vec<String>,
-    pub dispatch: Option<DispatchConfig>,
-    /// Run the release upload as this external command (argv; `OWNER/REPO TAG` are appended) instead of inside the
-    /// service, for example a locked unit elsewhere. Absent = inline. The service then holds no provider key.
-    pub release_command: Option<Vec<String>>,
     /// The wiki leg (R40). Absent = a wiki hook is refused.
     pub wiki: Option<WikiConfig>,
     /// Event hooks (src/hooks): command key (`copy`, `downsync`, `lockrefresh`) -> argv; the job's arguments are appended.
     /// A hook whose key is absent answers 503.
     #[serde(default)]
     pub hook_commands: BTreeMap<String, Vec<String>>,
+    /// The in-process relay (cfrg-relay): its configuration, the placement and the credentials directory.
+    pub relay: Option<RelayConfig>,
     #[serde(default)]
     pub replay: ReplayConfig,
 }
@@ -87,24 +84,23 @@ pub struct GitlabConfig {
     pub groups: Vec<String>,
 }
 
-/// Where the receiver starts the relay job: the infra repository's workflow, on the Forgejo of `forge_api`.
+/// The relay of `cfrg-relay`: files of the image/ConfigMap and the credentials directory (a Kubernetes Secret volume).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DispatchConfig {
-    /// `owner/repo` of the repository that holds `relay.yml`.
-    pub repository: String,
-    #[serde(default = "relay_yml")]
-    pub workflow: String,
-    #[serde(default = "main_ref", rename = "ref")]
-    pub git_ref: String,
+pub struct RelayConfig {
+    /// The relay configuration (identities, limits); no repository list.
+    pub config: String,
+    /// The placement document the repository set is derived from.
+    pub placement: String,
+    /// Holds the database files (`host`, `port`, `dbname`, `username`, `password`) and the provider credentials.
+    #[serde(default = "credentials")]
+    pub credentials_dir: String,
+    /// CA file the database connection is verified against (`sslmode=verify-full`).
+    pub database_ca: Option<String>,
 }
 
-fn relay_yml() -> String {
-    "relay.yml".into()
-}
-
-fn main_ref() -> String {
-    "main".into()
+fn credentials() -> String {
+    "/credentials".into()
 }
 
 /// Where the wiki leg keeps its state and finds its deploy key (the key's private half is a mounted Secret file,
@@ -163,23 +159,22 @@ impl Config {
 #[derive(Debug, Clone, Default)]
 pub struct Credentials(BTreeMap<String, String>);
 
-pub const CREDENTIAL_KEYS: [&str; 9] = [
-    "forge_token",
-    "github_token",
-    "gitlab_token",
-    "dispatch_token",
-    "hmac_forgejo",
-    "hmac_github",
-    "hmac_gitlab",
-    "hmac_bitbucket",
-    "hmac_review",
+/// (file name, key): the HMAC keys keep their names; the provider files are the names of `docs/relay.md`.
+pub const CREDENTIAL_KEYS: [(&str, &str); 7] = [
+    ("hmac_forgejo", "hmac_forgejo"),
+    ("hmac_github", "hmac_github"),
+    ("hmac_gitlab", "hmac_gitlab"),
+    ("forgejo-token", "forge_token"),
+    ("gitlab-token", "gitlab_token"),
+    ("github-token", "github_token"),
+    ("github-app-key", "github_app_key"),
 ];
 
 impl Credentials {
     pub fn load(directory: &Path) -> Self {
         let mut map = BTreeMap::new();
-        for key in CREDENTIAL_KEYS {
-            if let Ok(text) = fs::read_to_string(directory.join(key)) {
+        for (file, key) in CREDENTIAL_KEYS {
+            if let Ok(text) = fs::read_to_string(directory.join(file)) {
                 let value = text.trim().to_owned();
                 if !value.is_empty() {
                     map.insert(key.to_owned(), value);
@@ -187,6 +182,14 @@ impl Credentials {
             }
         }
         Self(map)
+    }
+
+    /// Add what `directory` holds (keys already present stay).
+    pub fn merge(mut self, directory: &Path) -> Self {
+        for (key, value) in Self::load(directory).0 {
+            self.0.entry(key).or_insert(value);
+        }
+        self
     }
 
     pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {

@@ -72,6 +72,10 @@ async fn run(args: &[String]) -> cfrg_serve::config::Result<u8> {
 async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u8> {
     let config = Config::load(&PathBuf::from(config_path))?;
     let creds = Credentials::load(&PathBuf::from(secrets));
+    let creds = match &config.relay {
+        Some(r) => creds.merge(&PathBuf::from(&r.credentials_dir)),
+        None => creds,
+    };
     let listeners = config.listeners.clone();
     let keys: Vec<String> = creds
         .names()
@@ -79,12 +83,18 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
         .filter(|k| k.starts_with("hmac_"))
         .map(|k| (*k).to_owned())
         .collect();
-    let (github, gitlab, dispatch) = (
+    let (github, gitlab) = (
         creds.get("github_token").is_some(),
         creds.get("gitlab_token").is_some(),
-        creds.get("dispatch_token").is_some(),
     );
-    let (bridge, workers) = Bridge::new(config, creds)?;
+    let relay: Option<std::sync::Arc<dyn cfrg_serve::relay::Relay>> = match &config.relay {
+        Some(r) => {
+            cfrg_serve::live::LiveRelay::from_config(r)?.map(|l| std::sync::Arc::new(l) as _)
+        }
+        None => None,
+    };
+    let relay_on = relay.is_some();
+    let (bridge, workers) = Bridge::new(config, creds, relay)?;
     bridge.run_workers(workers);
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut ports = serde_json::Map::new();
@@ -107,7 +117,7 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
     }
     server::log(
         "listening",
-        serde_json::json!({"listeners": ports, "keys": keys, "github": github, "gitlab": gitlab, "dispatch": dispatch}),
+        serde_json::json!({"listeners": ports, "keys": keys, "github": github, "gitlab": gitlab, "relay": relay_on}),
     );
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
