@@ -138,8 +138,8 @@ somebody else's project is skipped (R11).
 | topics | yes (lowercase, digits, hyphens; at most 20, else held) | yes | none (`unsupported`) |
 | default branch | only once the branch is on the copy | same | same |
 | archived | yes, and only once the copy is at the primary's head | yes, same | none (`unsupported`) |
-| issues on (R38) | `has_issues` | `issues_access_level` | `has_issues` |
-| wiki on where free (R40) | public repositories only (private needs a paid plan) | yes | yes |
+| issues on (R38) | `has_issues` | `issues_access_level` | none: Bitbucket Cloud removed issues on 2026-08-20 |
+| wiki on where free (R40) | public repositories only (private needs a paid plan) | yes | none: removed on 2026-08-20 |
 | CI off (R6) | Actions switch | `builds_access_level` | pipelines |
 | update tooling off (R35) | Dependabot security updates | none | none |
 

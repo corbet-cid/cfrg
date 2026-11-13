@@ -63,8 +63,9 @@ pub fn observe(io: &mut dyn Transport, target: &Target) -> Result<Option<Observe
         topics: None,
         default_branch: repo["mainbranch"]["name"].as_str().map(String::from),
         archived: None,
-        issues: repo["has_issues"].as_bool(),
-        wiki: repo["has_wiki"].as_bool(),
+        // Bitbucket Cloud removed its issue tracker and wiki on 2026-08-20: nothing to compare.
+        issues: None,
+        wiki: None,
         ci,
         updates: None,
     }))
@@ -133,13 +134,11 @@ pub fn apply(
                 fields.insert("website".into(), change.to.clone());
                 together.push(Field::Homepage);
             }
-            Field::Issues => {
-                fields.insert("has_issues".into(), json!(true));
-                together.push(Field::Issues);
-            }
-            Field::Wiki => {
-                fields.insert("has_wiki".into(), json!(true));
-                together.push(Field::Wiki);
+            Field::Issues | Field::Wiki => {
+                done.push(Applied::skipped(
+                    change.field,
+                    "Bitbucket Cloud has no issues or wiki",
+                ));
             }
             Field::DefaultBranch => {
                 if head(io, target, &primary.default_branch)?.is_some() {
@@ -237,7 +236,7 @@ mod tests {
         let seen = observe(&mut io, &target()).unwrap().unwrap();
         assert_eq!(seen.homepage.as_deref(), Some(""));
         assert_eq!(seen.default_branch.as_deref(), Some("main"));
-        assert_eq!(seen.wiki, Some(false));
+        assert_eq!(seen.wiki, None);
         assert_eq!(seen.ci, Some(false));
         assert_eq!(seen.topics, None);
         let mut gone = Script {

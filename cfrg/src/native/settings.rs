@@ -147,6 +147,10 @@ pub struct Capabilities {
     pub homepage: bool,
     pub topics: bool,
     pub archive: bool,
+    /// The forge has an issue tracker and a wiki at all. Bitbucket Cloud removed both on
+    /// 2026-08-20; a copy there carries links in its description instead.
+    pub issues: bool,
+    pub wiki: bool,
     /// Automatic update tooling can be switched off through the API.
     pub updates: bool,
     pub description_limit: usize,
@@ -159,6 +163,8 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             homepage: true,
             topics: true,
             archive: true,
+            issues: true,
+            wiki: true,
             updates: true,
             description_limit: 350,
             topic_limit: 20,
@@ -167,6 +173,8 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             homepage: false,
             topics: true,
             archive: true,
+            issues: true,
+            wiki: true,
             updates: false,
             description_limit: 2000,
             topic_limit: usize::MAX,
@@ -175,6 +183,8 @@ pub fn capabilities(provider: Provider) -> Capabilities {
             homepage: true,
             topics: false,
             archive: false,
+            issues: false,
+            wiki: false,
             updates: false,
             description_limit: usize::MAX,
             topic_limit: 0,
@@ -307,11 +317,11 @@ pub fn plan(provider: Provider, primary: &Primary, seen: &Observed, ci_declared:
     }
 
     // Issues are on everywhere (R38).
-    if seen.issues == Some(false) {
+    if caps.issues && seen.issues == Some(false) {
         change(&mut plan, Field::Issues, json!(false), json!(true));
     }
     // The wiki is on where it is free (R40); where it is not, the copy links to it instead.
-    if seen.wiki == Some(false) && wiki_free(provider, effective_private) {
+    if caps.wiki && seen.wiki == Some(false) && wiki_free(provider, effective_private) {
         change(&mut plan, Field::Wiki, json!(false), json!(true));
     }
     // No CI on a copy (R6), unless it is declared to run a broker's workflow.
@@ -506,6 +516,18 @@ mod tests {
         assert!(plan(Provider::Gitlab, &primary(), &seen, true)
             .unsupported
             .contains(&Field::Updates));
+    }
+
+    #[test]
+    fn bitbucket_has_neither_issues_nor_wiki_so_none_is_planned() {
+        let mut seen = matching();
+        seen.issues = Some(false);
+        seen.wiki = Some(false);
+        let plan = plan_for(Provider::Bitbucket, &primary(), &seen);
+        assert!(plan
+            .changes
+            .iter()
+            .all(|c| c.field != Field::Issues && c.field != Field::Wiki));
     }
 
     #[test]
