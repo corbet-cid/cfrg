@@ -1,4 +1,7 @@
 mod copy;
+mod members;
+mod protection;
+mod settings;
 
 use cfrg::{
     native::{
@@ -34,6 +37,24 @@ pub struct Options {
     operation: Operation,
     #[arg(long)]
     apply: bool,
+    /// `settings` only: write to at most this many copies in one run (default 20).
+    #[arg(long)]
+    max_writes: Option<usize>,
+    /// `settings` only: the write gate's kill switch; while it exists no GitHub copy is written.
+    #[arg(long)]
+    github_kill_switch: Option<PathBuf>,
+    /// `settings` only: the write gate's pause directory; `<dir>/<org>` pauses that organisation.
+    #[arg(long)]
+    github_paused_dir: Option<PathBuf>,
+    /// `members` only: the identity table (TOML, person id to a handle per forge).
+    #[arg(long)]
+    identities: Option<PathBuf>,
+    /// `members` only: the report of a `settings` run; only the copies it found are planned for.
+    #[arg(long)]
+    copies_from: Option<PathBuf>,
+    /// `members` only: the login that is never touched (default julian-corbet).
+    #[arg(long)]
+    operator: Option<String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Operation {
@@ -48,9 +69,25 @@ enum Operation {
     /// declared one, every destination (found by its recorded id) against the
     /// name it must carry. Holds and exceptions do not exempt a repository.
     Names,
+    /// R42: bring the settings of every copy (visibility, description, homepage, topics,
+    /// default branch, archived state, issues, wiki, CI) in line with its Forgejo primary.
+    /// Read-only without `--apply`; a copy that would have to become public is only reported.
+    Settings,
+    /// R43: the membership the copies need (read or triage, never write), planned from the
+    /// primary's members. Read-only until the identity table is decided.
+    Members,
+    /// R43: is the default branch of every copy held for the mirroring alone? Read-only; needs
+    /// `--copies-from` (the report of a `settings` run).
+    Protection,
 }
 
 pub fn run(options: Options) -> Result<()> {
+    match options.operation {
+        Operation::Settings => return settings::run(&options),
+        Operation::Members => return members::run(&options),
+        Operation::Protection => return protection::run(&options),
+        _ => {}
+    }
     let (report, incomplete, result) = execute(&options)?;
     println!(
         "{}",
@@ -77,6 +114,12 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         existing_only: false,
         operation: Operation::Status,
         apply: false,
+        max_writes: None,
+        github_kill_switch: None,
+        github_paused_dir: None,
+        identities: None,
+        copies_from: None,
+        operator: None,
     };
     let (report, incomplete, result) = execute(&options)?;
     result?;
@@ -94,6 +137,12 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         existing_only: true,
         operation: Operation::Rename,
         apply: true,
+        max_writes: None,
+        github_kill_switch: None,
+        github_paused_dir: None,
+        identities: None,
+        copies_from: None,
+        operator: None,
     };
     let (report, incomplete, result) = execute(&options)?;
     result?;

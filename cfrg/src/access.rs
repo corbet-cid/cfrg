@@ -255,6 +255,9 @@ pub struct Baseline {
 /// when a snapshot carries no usable timestamp.
 pub struct PlanOptions {
     pub frozen: Vec<Forge>,
+    /// Forges that are copies of a primary elsewhere (R43): no push-capable role (write or
+    /// admin) is ever planned onto them; such a grant is reported as `no-write-on-copies`.
+    pub copies: Vec<Forge>,
     pub operator: Option<String>,
     pub run_at: u64,
 }
@@ -960,6 +963,26 @@ pub fn plan(
             if after == winner {
                 continue;
             }
+            // R43: nobody gets write or merge on a copy. A copy takes the one-way plan of
+            // `copy_access` (read or triage) instead of an exact mirror of the primary.
+            if options.copies.contains(forge) && winner.is_some_and(|level| level >= Level::Write) {
+                report.skipped_protected.push(Skipped {
+                    person: target.person.clone(),
+                    org: display_org.clone(),
+                    team: target.team.clone(),
+                    repo: target.repo.clone(),
+                    reason: "no-write-on-copies".into(),
+                    call: grants.get(*forge).write_call(
+                        target.team.as_deref(),
+                        target.repo.as_deref(),
+                        winner,
+                        &display_org,
+                        &handle,
+                        after.is_none(),
+                    ),
+                });
+                continue;
+            }
             // Personal-namespace owners are never removed or downgraded: an
             // admin grant under the person's own namespace keeps admin.
             let demotes_owner = target.org == format!("{PERSON_PREFIX}{}", target.person)
@@ -1403,6 +1426,7 @@ mod tests {
     fn options() -> PlanOptions {
         PlanOptions {
             frozen: vec![Forge::Github],
+            copies: Vec::new(),
             operator: None,
             run_at: 1_760_000_000,
         }
@@ -1546,6 +1570,46 @@ mod tests {
             .iter()
             .all(|action| !action.call.path.contains("person:")));
         assert!(report.skipped_frozen.is_empty());
+    }
+
+    #[test]
+    fn r43_a_copy_never_receives_write_but_still_receives_read() {
+        let previous = Baseline {
+            schema: 1,
+            forges: BTreeMap::new(),
+        };
+        let run = |role: &str| {
+            let files = vec![
+                observed(Forge::Github, 100, vec![]),
+                observed(
+                    Forge::Forgejo,
+                    100,
+                    vec![team_grant("alice-fj", role, Some(90))],
+                ),
+                observed(Forge::Gitlab, 100, vec![]),
+            ];
+            let mut with_copies = options();
+            with_copies.copies = vec![Forge::Github, Forge::Gitlab, Forge::Bitbucket];
+            plan(
+                &maps_toml(),
+                Some(&previous),
+                &files,
+                &with_copies,
+                &roles(),
+                &grants(),
+            )
+            .unwrap()
+        };
+        let write = run("write");
+        assert!(write.actions.is_empty(), "{:?}", write.actions);
+        assert_eq!(write.skipped_protected.len(), 1);
+        assert_eq!(write.skipped_protected[0].reason, "no-write-on-copies");
+        assert_eq!(write.skipped_protected[0].call.forge, "gitlab");
+        let admin = run("admin");
+        assert!(admin.actions.is_empty());
+        let read = run("read");
+        assert_eq!(read.actions.len(), 1);
+        assert_eq!(read.actions[0].call.forge, "gitlab");
     }
 
     #[test]

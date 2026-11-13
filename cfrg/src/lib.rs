@@ -31,6 +31,7 @@ pub mod bridge;
 pub mod collect;
 pub mod contents;
 pub mod contributed;
+pub mod copy_access;
 pub mod gate;
 pub mod land;
 pub mod model;

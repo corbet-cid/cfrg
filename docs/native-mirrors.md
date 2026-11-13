@@ -125,6 +125,66 @@ Bitbucket restricts branch pushes to the declared account, denies merges and
 refuses existing force/delete restrictions that would prevent native mirroring.
 Administrative changes and destination tags are outside these branch checks.
 
+## Settings of a copy (R42): `--operation settings`
+
+`cfrg native --placement placement.json --state native-state.json --operation settings`
+brings every copy in line with its Forgejo primary (operating model R42). It reads only
+unless `--apply` is given. Copies are found from the primaries, not from the placement:
+every non-contributed repository the source lists should have a copy on GitHub, GitLab
+and Bitbucket (R2), at the primary's path unless the placement pins another. A copy that
+does not exist is reported `absent` and never created here. A contributed project (a
+pull-mirrored repository, or a location the placement's `contributed` list names, on the
+source or on the copy's forge) is skipped and reported `contributed-project` (R10, R11). A
+hold on a repository holds its copies on every forge, declared or not.
+
+| Setting | GitHub | GitLab | Bitbucket |
+|---|---|---|---|
+| visibility | `private` | `visibility` | `is_private` |
+| description | yes | yes | yes |
+| homepage | `homepage` | none (reported `unsupported`) | `website` |
+| topics | yes (lowercase, digits, hyphens; at most 20, else held) | yes | none (`unsupported`) |
+| default branch | only once the branch is on the copy | same | same |
+| archived | yes, and only once the copy is at the primary's head | yes, same | none (`unsupported`) |
+| issues on (R38) | `has_issues` | `issues_access_level` | none: Bitbucket Cloud removed issues on 2026-08-20 |
+| wiki (R40) | **off** (edit rights cannot be restricted through the API; the description links to the Forgejo wiki) | on (the Forgejo wiki is pushed there) | none: removed on 2026-08-20 |
+| CI off (R6) | Actions switch | `builds_access_level` | pipelines |
+| update tooling off (R35) | Dependabot security updates | none | none |
+| private vulnerability reporting | on, public copies only | none | none |
+
+Visibility has a direction. A copy more open than its primary is narrowed at once, the safe
+direction. A copy that would have to become public is **held and reported**
+(`publishing-needs-approval`): this pass never publishes, because publishing cannot be undone.
+CI is switched off on every copy that reports it on (R6, R7); nothing can declare it on. The picture and the
+front-page presentation travel with the git content or need a multipart upload, and are not
+written by this pass; licence is read from the repository's own file and follows the content.
+
+Writes are paced like every other native mutation (default twelve seconds apart), related
+fields travel in one request, an archived copy is unarchived first and archived last, and one
+run writes to at most `--max-writes` copies (default 20). GitHub writes also honour the write
+gate's files: `--github-kill-switch DIR` (no GitHub copy is written while it exists) and
+`--github-paused-dir DIR` (`DIR/<org>` pauses that organisation); an `--apply` that reaches
+GitHub refuses to start without both. The first 401, 402, 403,
+429 or server error stops that forge for the rest of the run (no retry, the window is
+recorded in the state). The report carries `totals` and `by_organisation` counts per
+provider: copies, absent, converged, to change, held, unsupported, and the changes by field.
+
+Dependabot's version updates cannot be switched off through an API: they start from
+`.github/dependabot.yml` in the content, and a mirror carries the content unchanged. The
+pass can switch security updates off, not version updates; a primary that carries the file
+has to lose it (R35 runs the updater on Forgejo).
+
+## Members of a copy (R43): `--operation members`
+
+Read-only. Reads the primary's non-owner team members and repository collaborators,
+applies the one-way role rule of `cfrg::copy_access` and prints the grants it would make and
+the members it cannot place. GitHub: triage. GitLab: Reporter (reads the code, manages
+issues). Bitbucket has no triage role, so a private copy gets read and a public one nothing.
+No role this module can produce may push or merge. `--identities FILE` is the identity table
+(person id, one handle per forge); a member without an entry, or without an account on a
+forge, is reported and never guessed. `--copies-from REPORT` limits the plan to the copies a
+`settings` run found. `--apply` is refused until the identity table is decided and reviewed.
+The default-branch lock of every copy is the receiver lock above.
+
 ## The copy: every repository and wiki on one plain git host
 
 `"copy"` in the placement is a POLICY over the forge's own repository listing, not a list of repositories:
@@ -168,7 +228,7 @@ repository ID; `mirror_user` is the login of the account whose token is both the
 API credential (`token_env`) and the mirror credential (`password_env`). Reconcile:
 
 * Ensures the repository (a missing one is created in the organisation, private
-  as the primary is, with issues, projects and wiki off; creation is paced by the
+  as the primary is, with issues on, projects and wiki off (R38, R40, R42); creation is paced by the
   creation window) and always switches GitHub Actions off on it, and the
   Dependabot alerts and security updates (reads first, writes only on drift).
 * Locks it as above. GitHub Free has rulesets for public repositories only: a

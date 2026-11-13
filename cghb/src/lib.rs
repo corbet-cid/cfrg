@@ -18,6 +18,7 @@
 
 pub mod native;
 pub mod relay;
+pub mod settings;
 
 /// Declared landing and release capability of this adapter. Never guessed:
 /// `unsupported` means the procedure is not implemented here.

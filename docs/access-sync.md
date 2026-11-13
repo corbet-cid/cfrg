@@ -96,6 +96,12 @@ cfrg access apply --identities ids.toml --baseline state.json \
 
 ## Protections
 
+- **Copies never receive write (R43).** `cfrg access` plans for a Forgejo primary, so
+  GitHub, GitLab and Bitbucket are copies: a write or admin role is never planned onto them
+  (reported as `no-write-on-copies` under `skipped_protected`). What a copy's members get is
+  planned one way, from the primary, by `cfrg native --operation members` (read or triage,
+  `cfrg::copy_access`); this exact-mirror draft only carries read to a copy.
+
 - GitHub is frozen by default: read but never written (repeat `--frozen`
   for more forges). Planned GitHub writes are reported as `skipped_frozen`.
 - Organization owners and namespace admins are never removed or downgraded

@@ -69,6 +69,202 @@ pub fn list_repositories(io: &mut dyn Transport, endpoint: &Endpoint) -> Result<
     Err("Forgejo repository pagination bound exceeded".into())
 }
 
+/// A repository of the source with the settings a copy must carry (R42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Primary {
+    pub id: u64,
+    /// `owner/repo`, lowercase: the name a copy carries.
+    pub path: String,
+    /// A pull mirror of somebody else's project (a contributed project, R11): not ours to
+    /// replicate, so it has no copies to keep in line.
+    pub contributed: bool,
+    /// The primary's issue tracker is on.
+    pub issues: bool,
+    /// The wiki unit is on (pages may still be absent: see [`wiki_exists`]).
+    pub has_wiki: bool,
+    pub settings: cfrg::native::settings::Primary,
+}
+
+/// Every repository the token sees with the settings R42 compares. One read per fifty.
+pub fn list_primaries(io: &mut dyn Transport, endpoint: &Endpoint) -> Result<Vec<Primary>> {
+    let mut all = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for page in 1..=100 {
+        let value = expect(
+            io.send(Request {
+                endpoint: endpoint.clone(),
+                auth: Auth::Token,
+                method: "GET",
+                path: format!("/api/v1/repos/search?limit=50&page={page}&sort=id&order=asc"),
+                body: None,
+                scope: format!("{}/api", endpoint.origin),
+                creation: false,
+            })?,
+            &[200],
+        )?;
+        let data = value["data"]
+            .as_array()
+            .ok_or("Malformed Forgejo repository search")?;
+        if data.is_empty() {
+            return Ok(all);
+        }
+        for item in data {
+            let id = item["id"].as_u64().ok_or("Missing repository id")?;
+            if !seen.insert(id) {
+                return Err("Repeated repository page".into());
+            }
+            let path = item["full_name"]
+                .as_str()
+                .ok_or("Missing repository name")?
+                .to_ascii_lowercase();
+            cfrg::native::path(&path, false)?;
+            let text = |key: &str| item[key].as_str().unwrap_or_default().to_string();
+            all.push(Primary {
+                id,
+                path,
+                contributed: item["mirror"] == true,
+                issues: item["has_issues"] == true,
+                has_wiki: item["has_wiki"] == true,
+                settings: cfrg::native::settings::Primary {
+                    private: item["private"] == true,
+                    description: text("description"),
+                    homepage: text("website"),
+                    topics: item["topics"]
+                        .as_array()
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|t| t.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    default_branch: text("default_branch"),
+                    archived: item["archived"] == true,
+                },
+            });
+        }
+    }
+    Err("Forgejo repository pagination bound exceeded".into())
+}
+
+/// The commit a branch of the primary points at, or `None` when it has no such branch.
+pub fn branch_head(
+    io: &mut dyn Transport,
+    endpoint: &Endpoint,
+    path: &str,
+    branch: &str,
+) -> Result<Option<String>> {
+    cfrg::native::path(path, false)?;
+    let response = io.send(Request {
+        endpoint: endpoint.clone(),
+        auth: Auth::Token,
+        method: "GET",
+        path: format!(
+            "/api/v1/repos/{path}/branches/{}",
+            cfrg::native::encode(branch)
+        ),
+        body: None,
+        scope: format!("{}/api", endpoint.origin),
+        creation: false,
+    })?;
+    if response.status == 404 {
+        return Ok(None);
+    }
+    Ok(expect(response, &[200])?["commit"]["id"]
+        .as_str()
+        .map(String::from))
+}
+
+/// The members of the primary's projects: every non-owner team of every organisation (its
+/// repositories are all the organisation's or the ones it lists) and every repository
+/// collaborator. Organisation owners are not members here: they own the copies' side too.
+pub fn list_members(
+    io: &mut dyn Transport,
+    endpoint: &Endpoint,
+    paths: &[String],
+) -> Result<Vec<cfrg::copy_access::Member>> {
+    let get = |io: &mut dyn Transport, path: String| -> Result<Option<Value>> {
+        let response = io.send(Request {
+            endpoint: endpoint.clone(),
+            auth: Auth::Token,
+            method: "GET",
+            path,
+            body: None,
+            scope: format!("{}/api", endpoint.origin),
+            creation: false,
+        })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        Ok(Some(expect(response, &[200])?))
+    };
+    let mut by_login: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let orgs: std::collections::BTreeSet<&str> =
+        paths.iter().filter_map(|p| p.split('/').next()).collect();
+    for org in orgs {
+        // A personal namespace is no organisation: 404, no teams.
+        let Some(teams) = get(io, format!("/api/v1/orgs/{org}/teams"))? else {
+            continue;
+        };
+        for team in teams.as_array().into_iter().flatten() {
+            if team["permission"] == "owner" {
+                continue;
+            }
+            let id = team["id"].as_u64().ok_or("Missing team id")?;
+            let covered: Vec<String> = if team["includes_all_repositories"] == true {
+                paths
+                    .iter()
+                    .filter(|p| p.split('/').next() == Some(org))
+                    .cloned()
+                    .collect()
+            } else {
+                get(io, format!("/api/v1/teams/{id}/repos"))?
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r["full_name"].as_str().map(str::to_ascii_lowercase))
+                    .collect()
+            };
+            let members = get(io, format!("/api/v1/teams/{id}/members"))?;
+            for member in members
+                .as_ref()
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(login) = member["login"].as_str() {
+                    by_login
+                        .entry(login.to_string())
+                        .or_default()
+                        .extend(covered.iter().cloned());
+                }
+            }
+        }
+    }
+    for path in paths {
+        cfrg::native::path(path, false)?;
+        let collaborators = get(io, format!("/api/v1/repos/{path}/collaborators"))?;
+        for who in collaborators
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(login) = who["login"].as_str() {
+                by_login
+                    .entry(login.to_string())
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+    }
+    Ok(by_login
+        .into_iter()
+        .map(|(login, repos)| cfrg::copy_access::Member { login, repos })
+        .collect())
+}
+
 /// Whether the repository has a wiki to copy: the pages list answers 404 while the
 /// wiki git repository does not exist, however the wiki unit is set.
 pub fn wiki_exists(io: &mut dyn Transport, endpoint: &Endpoint, path: &str) -> Result<bool> {

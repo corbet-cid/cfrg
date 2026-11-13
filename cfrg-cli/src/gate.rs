@@ -662,7 +662,9 @@ fn create_repository(
         "name": repo,
         "private": private,
         "description": description,
-        "has_issues": false,
+        // R38/R40/R42: issues are on; the wiki stays off on GitHub (its edit rights cannot be
+        // restricted through the API, so the description links to the Forgejo wiki); projects off.
+        "has_issues": true,
         "has_projects": false,
         "has_wiki": false,
         "auto_init": false,
