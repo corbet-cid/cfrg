@@ -390,6 +390,7 @@ dependencies = [
  "cbkt",
  "cfgj",
  "cfrg",
+ "cfrg-relay",
  "cghb",
  "cglb",
  "clap",
@@ -398,8 +399,20 @@ dependencies = [
  "ctrlc",
  "serde_json",
  "tempfile",
- "tokio",
  "toml",
+]
+
+[[package]]
+name = "cfrg-relay"
+version = "0.1.0"
+dependencies = [
+ "cfgj",
+ "cfrg",
+ "cghb",
+ "cglb",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

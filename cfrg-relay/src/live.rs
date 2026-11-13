@@ -20,12 +20,17 @@ use cfrg::{
 use std::{collections::BTreeMap, fs, path::PathBuf, rc::Rc};
 use tokio::runtime::Runtime;
 
-/// The fixed credential names (files in `$CREDENTIALS_DIRECTORY`).
+/// The fixed credential names (files of the credentials directory).
 pub const FORGEJO_TOKEN: &str = "forgejo-token";
 pub const GITLAB_TOKEN: &str = "gitlab-token";
 pub const GITHUB_APP_ID: &str = "github-app-id";
 pub const GITHUB_INSTALLATION_ID: &str = "github-installation-id";
 pub const GITHUB_APP_KEY: &str = "github-app-key";
+
+/// The directory used when none is configured: `$CREDENTIALS_DIRECTORY` (a systemd unit), else none.
+pub fn default_credentials_dir() -> Option<PathBuf> {
+    std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
+}
 
 /// Reads one credential; `None` for a missing, unreadable or empty one. Never a value in a message.
 fn credential(dir: &Option<PathBuf>, name: &str) -> Option<String> {
@@ -37,7 +42,7 @@ fn credential(dir: &Option<PathBuf>, name: &str) -> Option<String> {
 
 fn refused(forge: &str, names: &[&str]) {
     eprintln!(
-        "relay: {forge} refused: credential {} is not provided to this unit; no request is made to {forge}",
+        "relay: {forge} refused: credential {} is not in the credentials directory; no request is made to {forge}",
         names.join(", ")
     );
 }
@@ -52,16 +57,7 @@ pub fn runtime() -> cfrg::Result<Rc<Runtime>> {
 }
 
 /// Adapters for every forge whose credential is present.
-pub fn forges(rt: &Rc<Runtime>, config: &RouterConfig, forgejo_origin: &str) -> Forges {
-    forges_in(
-        &std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
-        rt,
-        config,
-        forgejo_origin,
-    )
-}
-
-fn forges_in(
+pub fn forges(
     dir: &Option<PathBuf>,
     rt: &Rc<Runtime>,
     config: &RouterConfig,
@@ -376,11 +372,11 @@ mod tests {
     fn a_forge_without_its_credential_has_no_adapter() {
         let rt = runtime().unwrap();
         let cfg = RouterConfig::default();
-        assert!(forges_in(&None, &rt, &cfg, "https://forge.example").is_empty());
+        assert!(forges(&None, &rt, &cfg, "https://forge.example").is_empty());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FORGEJO_TOKEN), "  \n").unwrap(); // empty = missing
         std::fs::write(dir.path().join(GITHUB_APP_ID), "12").unwrap(); // the other two github files are absent
-        assert!(forges_in(
+        assert!(forges(
             &Some(dir.path().to_path_buf()),
             &rt,
             &cfg,
@@ -394,7 +390,7 @@ mod tests {
         let rt = runtime().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FORGEJO_TOKEN), "t\n").unwrap();
-        let mut f = forges_in(
+        let mut f = forges(
             &Some(dir.path().to_path_buf()),
             &rt,
             &RouterConfig::default(),

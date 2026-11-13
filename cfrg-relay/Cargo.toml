@@ -1,0 +1,21 @@
+[package]
+name = "cfrg-relay"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The issue relay of cfrg as a library: apply one event, sweep, with the live forge drivers"
+repository = "https://git.corbet.ch/corbet-cid/cfrg.git"
+
+[dependencies]
+cfrg.workspace = true
+cfgj.workspace = true
+cglb.workspace = true
+cghb.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

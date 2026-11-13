@@ -17,11 +17,11 @@ cfgj.workspace = true
 cglb.workspace = true
 cbkt.workspace = true
 cghb.workspace = true
+cfrg-relay.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 toml.workspace = true
 
 [dev-dependencies]

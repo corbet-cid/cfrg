@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cfrg", "cfrg-cli", "cfrg-serve", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
+members = ["cfrg", "cfrg-relay", "cfrg-cli", "cfrg-serve", "cfgj", "cglb", "cbkt", "cghb", "clmr"]
 
 [workspace.package]
 edition = "2021"
@@ -25,6 +25,7 @@ cfgj = { path = "cfgj" }
 cglb = { path = "cglb" }
 cbkt = { path = "cbkt" }
 cghb = { path = "cghb" }
+cfrg-relay = { path = "cfrg-relay" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

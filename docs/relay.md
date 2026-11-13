@@ -1,7 +1,7 @@
 # cfrg relay
 
 The issue relay of the bridge (Bridge design §3.1, §3.2, §5; operating model R37, R38, R41, R50, R51). Code:
-`cfrg/src/relay/`, command: `cfrg-cli/src/relay.rs`. Forgejo Actions runs it; it has no queue, timer, catch-up or
+`cfrg/src/relay/`, library: `cfrg-relay/`, command: `cfrg-cli/src/relay.rs`. Forgejo Actions runs it; it has no queue, timer, catch-up or
 rebuild of its own (R30, R49).
 
 ## Commands
@@ -25,16 +25,31 @@ by its `source_id`. The relay identities (`relay`: the user ids of `corbet-forge
 while a forge has members but no identity the run refuses: `sweep` logs `relay: refused: ...` and exits 0, `apply`
 exits non-zero.
 
-**Credentials** are read only from systemd credentials, the files `$CREDENTIALS_DIRECTORY/<name>` (no environment
-variable, no path argument, no fallback to a personal token). A missing, unreadable or empty file means that forge has
-no adapter: one line `relay: <forge> refused: credential <names> is not provided to this unit` goes to standard error,
-no request is made to it, and the engine treats it as an outage (the sweep exits 0, an apply exits non-zero).
+**Credentials** are read only from files of one credentials directory: `--credentials-dir` (library: `Settings::credentials_dir`),
+default `$CREDENTIALS_DIRECTORY`. In production that is a Kubernetes Secret volume of the bridge pods (or a systemd unit's
+credential directory). No environment variable, no fallback to a personal token. A missing, unreadable or empty file means
+that forge has no adapter: one line `relay: <forge> refused: credential <names> is not in the credentials directory` goes to
+standard error, no request is made to it, and the engine treats it as an outage (the sweep exits 0, an apply exits non-zero).
 
 | Forge | Credential file(s) |
 |---|---|
 | Forgejo (the placement source) | `forgejo-token` |
 | GitLab (`gitlab.com`) | `gitlab-token` |
 | GitHub | `github-app-id`, `github-installation-id` (decimal numbers), `github-app-key` (the PEM private key of the App) |
+
+**Library API** (crate `cfrg-relay`; `cfrg relay` and `cfrg serve` run the same code):
+
+```rust
+pub struct Settings { config: PathBuf, placement: PathBuf, database: String /* libpq string */, credentials_dir: Option<PathBuf> }
+pub fn apply(&Settings, &Hint) -> cfrg::Result<Applied>;      // Applied::Refused(why) | Applied::Done(Report)
+pub fn sweep(&Settings, Option<u64>) -> cfrg::Result<Swept>;  // Swept::Refused(why)   | Swept::Done(SweepReport)
+```
+
+`Refused` means the configuration is not ready (no relay identity ids yet): nothing was read or written. In `Done`,
+`report.outcome == Outcome::Deferred(_)` means nothing could be done now (busy lease, outage, kill switch): retry later.
+Both functions BLOCK (database, HTTP through a private current-thread runtime): from async code call them with
+`tokio::task::spawn_blocking`, never on a runtime thread. Every call reads the configuration and placement again, connects
+the store first (a refused call still proves the database login) and builds the forge adapters from the credentials directory.
 
 The process owns one current-thread tokio runtime; the synchronous engine calls the async drivers through it.
 
