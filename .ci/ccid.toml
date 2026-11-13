@@ -8,6 +8,11 @@ render_schema = 2
 [checks.test]
 kind = "cargo"
 
+# Evaluation only (no build): fails when the flake cannot evaluate, e.g. outputHashes missing for a git dependency.
+[checks.flake-eval]
+kind = "commands"
+commands = [["nix", "eval", ".#packages.x86_64-linux.cfrg.drvPath"], ["nix", "eval", ".#packages.x86_64-linux.cfrg-serve.drvPath"]]
+
 [checks.build]
 kind = "cargo"
 actions = ["build"]
@@ -16,7 +21,7 @@ release = true
 [jobs.verify]
 scheduler = "forgejo"
 runs_on = "linux"
-checks = ["test"]
+checks = ["test", "flake-eval"]
 workflow = "ci"
 command = ["bash", ".ci/run-job.sh"]
 

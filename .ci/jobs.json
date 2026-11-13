@@ -2,7 +2,7 @@
   "schema": 1,
   "generator": "ccid render v1",
   "tool_revision": "",
-  "manifest_sha256": "b9e6e7341eee69cc50b3c92e65d69566769537b2ddccd6ed465d6abc9e77e9cf",
+  "manifest_sha256": "d70970427ba86d32e3e8275f61a3aca4de3f98b49b3fc190f3279fab6ea8b54e",
   "jobs": {
     "build": {
       "job": "build",
@@ -25,7 +25,8 @@
       "job": "verify",
       "scheduler": "forgejo",
       "checks": [
-        "test"
+        "test",
+        "flake-eval"
       ],
       "workflow": "ci",
       "command": [
