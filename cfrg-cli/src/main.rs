@@ -33,6 +33,7 @@ mod release;
 mod resolve;
 mod serve;
 mod switch;
+mod take_in;
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +59,8 @@ enum Action {
     Switch(switch::Options),
     /// The one daily run of the bridge: Renovate, native drift reconcile, relay sweep, GitLab key renewal; each step alone.
     Daily(daily::Options),
+    /// Take one reviewed contribution into the primary: fast-forward or merge commit, never rebase or squash.
+    TakeIn(take_in::Options),
     /// The issue relay: apply one event from a forge, or sweep what stayed pending.
     Relay(relay::Options),
     /// Long-running mode: signed webhooks and a periodic reconcile drive landing and mirror verification.
@@ -423,6 +426,7 @@ fn run(action: Action) -> Result<()> {
         Action::Relay(options) => relay::run(options)?,
         Action::Serve(options) => serve::run(options)?,
         Action::Switch(options) => switch::run(options)?,
+        Action::TakeIn(options) => take_in::run(options)?,
         Action::Validate { policy } => {
             let policy = read(policy)?;
             println!(
