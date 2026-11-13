@@ -78,6 +78,10 @@ pub struct Primary {
     /// A pull mirror of somebody else's project (a contributed project, R11): not ours to
     /// replicate, so it has no copies to keep in line.
     pub contributed: bool,
+    /// The primary's issue tracker is on.
+    pub issues: bool,
+    /// The wiki unit is on (pages may still be absent: see [`wiki_exists`]).
+    pub has_wiki: bool,
     pub settings: cfrg::native::settings::Primary,
 }
 
@@ -119,6 +123,8 @@ pub fn list_primaries(io: &mut dyn Transport, endpoint: &Endpoint) -> Result<Vec
                 id,
                 path,
                 contributed: item["mirror"] == true,
+                issues: item["has_issues"] == true,
+                has_wiki: item["has_wiki"] == true,
                 settings: cfrg::native::settings::Primary {
                     private: item["private"] == true,
                     description: text("description"),

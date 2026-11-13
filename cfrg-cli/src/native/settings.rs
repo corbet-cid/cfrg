@@ -10,6 +10,7 @@ use super::Options;
 use cfrg::{
     native::{
         http::{Http, Transport},
+        links::{self, PublicGithub},
         settings::{self, Field, Observed, Plan, Target},
         Endpoint, Placement, Provider,
     },
@@ -115,6 +116,11 @@ pub fn run(options: &Options) -> Result<()> {
             .repositories
             .iter()
             .find(|r| r.source_id == primary.id);
+        // What a Bitbucket copy's description may link to: the GitHub copy of this primary
+        // when anyone can see it (GitHub is read before Bitbucket), and whether the primary
+        // has wiki pages at all (read once, only when a link needs it).
+        let mut github_public: Option<(String, bool)> = None;
+        let mut wiki_pages: Option<bool> = None;
         for (provider, name, origin, token_env) in PROVIDERS {
             if options.provider.as_deref().is_some_and(|only| only != name) {
                 continue;
@@ -166,7 +172,40 @@ pub fn run(options: &Options) -> Result<()> {
                     );
                 };
                 count.copies += 1;
-                let mut plan = settings::plan(provider, &primary.settings, &seen, ci_declared);
+                if provider == Provider::Github
+                    && seen.private == Some(false)
+                    && !options
+                        .github_paused_dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.join(&org).exists())
+                {
+                    github_public = Some((path.clone(), seen.issues == Some(true)));
+                }
+                // ONE writer of descriptions: the wanted text, links included, comes from
+                // `links::copy_description`; the planner only compares it.
+                if provider != Provider::Gitlab && primary.has_wiki && wiki_pages.is_none() {
+                    wiki_pages = Some(cfgj::native::wiki_exists(
+                        &mut io,
+                        &placement.source,
+                        &primary.path,
+                    )?);
+                }
+                let facts = links::Facts {
+                    provider,
+                    private: primary.settings.private,
+                    forge_origin: &placement.source.origin,
+                    source_path: &primary.path,
+                    issues: primary.issues,
+                    wiki: wiki_pages.unwrap_or(false),
+                    github: github_public.as_ref().map(|(path, issues)| PublicGithub {
+                        path,
+                        issues: *issues,
+                        wiki: false,
+                    }),
+                };
+                let mut wanted = primary.settings.clone();
+                wanted.description = links::copy_description(&primary.settings.description, &facts);
+                let mut plan = settings::plan(provider, &wanted, &seen, ci_declared);
                 // A copy is archived only once it carries everything the primary has.
                 if plan.changes.iter().any(|c| c.field == Field::Archive) {
                     let want = cfgj::native::branch_head(
