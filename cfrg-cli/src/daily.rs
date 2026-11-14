@@ -278,7 +278,15 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         );
         env.insert("FORGE_BRIDGE_SECRETS".into(), dir.display().to_string());
         Action::Command {
-            program: exe.with_file_name("cfrg-serve"),
+            // next to cfrg when it is there; else by name on PATH (the image links cfrg from its own store path, where cfrg-serve is not a sibling)
+            program: {
+                let sibling = exe.with_file_name("cfrg-serve");
+                if sibling.is_file() {
+                    sibling
+                } else {
+                    PathBuf::from("cfrg-serve")
+                }
+            },
             args: vec!["release-resume".into()],
             env,
         }
@@ -670,7 +678,11 @@ mod tests {
         let Action::Command { program, args, env } = &steps[4].action else {
             panic!("not a command");
         };
-        assert_eq!(program, Path::new("/bin/cfrg-serve"));
+        assert_eq!(
+            program,
+            Path::new("cfrg-serve"),
+            "no sibling in /bin here: found by name on PATH"
+        );
         assert_eq!(args, &["release-resume"]);
         assert_eq!(env["FORGE_BRIDGE_CONFIG"], serve.display().to_string());
         assert_eq!(
