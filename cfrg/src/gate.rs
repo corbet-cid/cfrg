@@ -485,11 +485,11 @@ pub const BOT_PREFIX: &str = "refs/heads/renovate/";
 pub struct Plan {
     /// Refs the push creates or fast-forwards.
     pub updates: Vec<String>,
-    /// Copy-only branches the push deletes (operating model R3: the copy matches the primary).
+    /// Copy-only branches and tags the push deletes (operating model R3: the copy matches the primary).
     pub prune: Vec<String>,
     /// Refs a push without force cannot bring to the destination.
     pub conflicts: Vec<(String, Hold)>,
-    /// Refs on the destination that are left alone on purpose: copy-only tags, the relay namespace and the destination's default
+    /// Refs on the destination that are left alone on purpose: the relay namespace and the destination's default
     /// branch (GitHub refuses to delete it, which would fail the whole atomic push).
     pub kept: Vec<String>,
 }
@@ -502,7 +502,7 @@ pub enum Hold {
     NonFastForward,
     /// A tag stands at another object on the destination; a push without force never moves a tag.
     MovedTag,
-    /// More copy-only branches than `max_prune`: a person decides.
+    /// More copy-only branches and tags than `max_prune`: a person decides.
     PruneLimit,
     /// The destination refused this exact push (a `[rejected]` status line); it is not repeated until a ref it names changes.
     PushRejected,
@@ -513,7 +513,7 @@ impl Hold {
         match self {
             Self::NonFastForward => "a branch is not a fast-forward",
             Self::MovedTag => "a tag stands at another object",
-            Self::PruneLimit => "more copy-only branches than max_prune",
+            Self::PruneLimit => "more copy-only branches and tags than max_prune",
             Self::PushRejected => "the destination rejected the push",
         }
     }
@@ -546,9 +546,10 @@ pub fn plan(
         .keys()
         .filter(|n| !source.contains_key(*n) || n.starts_with(BOT_PREFIX))
     {
-        // Only a plain branch is ever deleted: never a tag, never the relay's namespace, never `refs/pull/*` or any other
-        // namespace, never the destination's default branch.
-        if name.starts_with("refs/heads/")
+        // Only a plain branch or a tag is ever deleted (operating model R42: the copy matches the primary, so a tag the
+        // primary retired goes too): never the relay's namespace, never `refs/pull/*` or any other namespace, never the
+        // destination's default branch.
+        if (name.starts_with("refs/heads/") || name.starts_with("refs/tags/"))
             && !name.starts_with(RELAY_PREFIX)
             && Some(name.as_str()) != default_branch
         {
@@ -1027,24 +1028,21 @@ mod tests {
             (theirs, ours) == ("b1", "b2")
         });
         assert_eq!(plan.updates, ["refs/heads/main", "refs/heads/new"]);
-        assert_eq!(plan.prune, ["refs/heads/stale"]);
+        assert_eq!(plan.prune, ["refs/heads/stale", "refs/tags/old"]);
         assert!(plan.conflicts.is_empty());
-        assert_eq!(
-            plan.kept,
-            ["refs/tags/old"],
-            "a copy-only tag is never deleted"
-        );
+        assert!(plan.kept.is_empty(), "a copy-only tag is deleted with the primary's retirement of it");
         assert!(plan.hold(10).is_none());
         assert!(!plan.is_empty());
     }
 
     #[test]
-    fn nothing_to_do_is_in_sync_even_with_copy_only_tags() {
+    fn a_copy_only_tag_is_pruned_like_a_copy_only_branch() {
         let source = refs_of(&[("refs/heads/main", "b1")]);
         let destination = refs_of(&[("refs/heads/main", "b1"), ("refs/tags/gh-only", "t")]);
         let plan = plan(&source, &destination, None, |_, _| true);
-        assert!(plan.is_empty(), "{plan:?}");
-        assert_eq!(plan.kept, ["refs/tags/gh-only"]);
+        assert!(!plan.is_empty(), "{plan:?}");
+        assert_eq!(plan.prune, ["refs/tags/gh-only"]);
+        assert!(plan.kept.is_empty());
     }
 
     #[test]
@@ -1140,7 +1138,7 @@ mod tests {
         moved.insert("refs/heads/main".into(), "b0".into());
         assert_ne!(base, print(&source, &moved));
         let mut tagged = destination.clone();
-        tagged.insert("refs/tags/gh-only".into(), "t".into());
+        tagged.insert("refs/pull/1/head".into(), "t".into());
         assert_eq!(base, print(&source, &tagged));
     }
 
