@@ -39,3 +39,5 @@ BEFORE it answers 202; when the intent cannot be written it answers 503 and the 
 when the sync ends with exit 0. Open intents are finished on service start and by the daily run
 (`cfrg-serve release-resume`, the `releases` step of `cfrg daily`; exit 1 while one stays open). The upload itself is
 idempotent ("identical, read back"), so a re-run is safe. There is no queue and no timer beyond that.
+
+The push of this repository to its git copy is a serve event too (`/hooks/copy`, workloads `forge-bridge/hooks`): see [deployment](deployment.md).
