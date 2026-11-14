@@ -152,14 +152,22 @@ async fn release_resume(config_path: &str, secrets: &str) -> cfrg_serve::config:
         println!("release-resume: the relay database login is not mounted: nothing to resume");
         return Ok(0);
     };
-    let journal = live.journal();
-    let open = journal.open_intents()?;
+    // the journal connects with a blocking client: on a blocking thread, never on the runtime (it panicked "Cannot start a runtime from within a runtime")
+    let journal = std::sync::Arc::new(live.journal());
+    let reader = std::sync::Arc::clone(&journal);
+    let open = tokio::task::spawn_blocking(move || reader.open_intents())
+        .await
+        .map_err(|e| e.to_string())??;
     let ctx = release::Ctx::new(config, creds)?;
     let mut left = 0;
     for (repo, tag) in &open {
         let outcome = release::sync(&ctx, repo, tag, false).await;
         if outcome.exit == 0 {
-            journal.clear(repo, tag)?;
+            let (writer, repo_name, tag_name) =
+                (std::sync::Arc::clone(&journal), repo.clone(), tag.clone());
+            tokio::task::spawn_blocking(move || writer.clear(&repo_name, &tag_name))
+                .await
+                .map_err(|e| e.to_string())??;
             println!("release-resume: {repo} {tag}: synced");
         } else {
             left += 1;
