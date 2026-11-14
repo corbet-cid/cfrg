@@ -3,6 +3,16 @@
 //! No queue of its own: the journal only remembers which (repository, tag) still owes a run; the upload itself is idempotent.
 use std::sync::Arc;
 
+/// Runs a call of a BLOCKING client (the journal's postgres connection starts a runtime of its own) on a blocking thread. Called directly from an async
+/// function it panics "Cannot start a runtime from within a runtime"; every journal call of an async function goes through here.
+pub async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(call)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 pub trait Journal: Send + Sync {
     fn open(&self, repo: &str, tag: &str) -> Result<(), String>;
     fn clear(&self, repo: &str, tag: &str) -> Result<(), String>;
@@ -44,5 +54,29 @@ impl Journal for PgJournal {
     }
     fn open_intents(&self) -> Result<Vec<(String, String)>, String> {
         self.with(|s| s.release_intents_open())
+    }
+}
+
+#[cfg(test)]
+mod blocking_tests {
+    use super::blocking;
+
+    /// What the postgres client does inside a call: build a runtime and block on it.
+    fn nested_runtime() -> Result<u8, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(runtime.block_on(async { 7 }))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocking_client_runs_on_a_blocking_thread() {
+        assert_eq!(blocking(nested_runtime).await, Ok(7));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "Cannot start a runtime from within a runtime")]
+    async fn the_same_call_made_directly_panics() {
+        let _ = nested_runtime();
     }
 }
