@@ -294,15 +294,19 @@ pub fn run(options: &Options) -> Result<()> {
                     return Ok(row(&primary.path, name, &path, "converged", &plan, None));
                 }
                 count.to_change += 1;
-                if !write {
-                    return Ok(row(&primary.path, name, &path, "planned", &plan, None));
-                }
                 let gate_owned = provider == Provider::Github
-                    && dest.is_some_and(|(repo, d)| {
-                        let mut live = repo.clone();
-                        live.path = primary.path.clone();
-                        github_copy_owned(&live, d, &gate_repos)
-                    });
+                    && github_copy_owned(&primary.path, dest.map(|(_, d)| d), &gate_repos);
+                if !write {
+                    let mut planned = row(&primary.path, name, &path, "planned", &plan, None);
+                    if provider == Provider::Github {
+                        planned["owned"] = json!(gate_owned);
+                        planned["paused"] = json!(options
+                            .github_paused_dir
+                            .as_ref()
+                            .is_some_and(|dir| dir.join(&org).exists()));
+                    }
+                    return Ok(planned);
+                }
                 if mirrors_cache.is_none() && provider != Provider::Github {
                     mirrors_cache = Some(match declared {
                         Some(repo) => {

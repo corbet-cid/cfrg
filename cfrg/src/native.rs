@@ -537,14 +537,22 @@ pub fn owned_by(repo: &Repository, copy: Option<&Copy>, mirror: &serde_json::Val
 }
 
 /// Ownership of a GitHub copy. GitHub copies are fed by the GitHub gate, never by a Forgejo push
-/// mirror (one mechanism per forge), so the mirror test of [`owned_by`] cannot see them. A GitHub
-/// copy is ours when the placement declares it (`declared` is one of `repo`'s destinations) AND
-/// the gate manages it: its `owner/repo` is a key of the gate catalogue (`gate_repos`).
-pub fn github_copy_owned(repo: &Repository, declared: &Destination, gate_repos: &[String]) -> bool {
-    declared.provider == Provider::Github
-        && gate_repos
-            .iter()
-            .any(|g| g.eq_ignore_ascii_case(&repo.destination_path(declared)))
+/// mirror (one mechanism per forge), so the mirror test of [`owned_by`] cannot see them. The copy of
+/// a (non-contributed, placed) primary sits at its declared GitHub destination, else at the
+/// primary's own path; it is ours when the gate manages that `owner/repo` (a key of the gate
+/// catalogue, `gate_repos`).
+pub fn github_copy_owned(
+    primary_path: &str,
+    declared: Option<&Destination>,
+    gate_repos: &[String],
+) -> bool {
+    let path = match declared {
+        Some(d) if d.provider == Provider::Github && d.pinned() => d.path.clone(),
+        Some(d) if d.provider == Provider::Github => primary_path.to_string(),
+        Some(_) => return false,
+        None => primary_path.to_string(),
+    };
+    gate_repos.iter().any(|g| g.eq_ignore_ascii_case(&path))
 }
 
 #[cfg(test)]
@@ -760,23 +768,28 @@ mod tests {
     const GITLAB: &str = r#"{"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"T"},"path":"team/new","namespace":"2","repository_id":"7","mirror_user":"9","password_env":"T","use_ssh":true,"interval_seconds":3600}"#;
 
     #[test]
-    fn a_github_copy_is_owned_when_declared_and_managed_by_the_gate() {
+    fn a_github_copy_is_owned_when_the_gate_manages_its_path() {
         let github = GITLAB.replace("\"gitlab\"", "\"github\"");
         let repo = declared_repo(&github);
         let declared = &repo.destinations[0];
         let gate = vec!["Team/New".to_string(), "other/x".to_string()];
-        assert!(github_copy_owned(&repo, declared, &gate));
-        // Declared but not in the gate: not ours.
+        assert!(github_copy_owned("team/new", Some(declared), &gate));
         assert!(!github_copy_owned(
-            &repo,
-            declared,
+            "team/new",
+            Some(declared),
             &["other/x".to_string()]
         ));
-        assert!(!github_copy_owned(&repo, declared, &[]));
-        // A destination that is not one of the repository's, or not GitHub: not ours.
+        assert!(!github_copy_owned("team/new", Some(declared), &[]));
+        // No declared GitHub destination: the copy sits at the primary's path.
+        assert!(github_copy_owned("team/new", None, &gate));
+        assert!(!github_copy_owned("team/else", None, &gate));
+        // A declared destination on another forge says nothing about GitHub.
         let gitlab = declared_repo(GITLAB);
-        assert!(!github_copy_owned(&gitlab, &gitlab.destinations[0], &gate));
-        assert!(!github_copy_owned(&repo, &gitlab.destinations[0], &gate));
+        assert!(!github_copy_owned(
+            "team/new",
+            Some(&gitlab.destinations[0]),
+            &gate
+        ));
     }
 
     #[test]
