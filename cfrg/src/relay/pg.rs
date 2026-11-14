@@ -35,6 +35,7 @@ CREATE INDEX IF NOT EXISTS relay_ledger_ts ON relay_ledger (ts);
 CREATE TABLE IF NOT EXISTS relay_pace (forge text NOT NULL, namespace text NOT NULL, next_any bigint NOT NULL, next_create bigint NOT NULL, PRIMARY KEY (forge, namespace));
 CREATE TABLE IF NOT EXISTS relay_holds (forge text NOT NULL, namespace text NOT NULL, doc jsonb NOT NULL, PRIMARY KEY (forge, namespace));
 CREATE TABLE IF NOT EXISTS relay_copy_ids (forge text NOT NULL, path text NOT NULL, repo_id text NOT NULL, resolved_at bigint NOT NULL, PRIMARY KEY (forge, path));
+CREATE TABLE IF NOT EXISTS release_intents (repo text NOT NULL, tag text NOT NULL, since bigint NOT NULL, PRIMARY KEY (repo, tag));
 ";
 
 pub struct PgStore {
@@ -74,6 +75,33 @@ impl PgStore {
             client: RefCell::new(client),
             depth: 0,
         })
+    }
+
+    /// Release upload journal: an intent is written before the upload and cleared once the copies are synced, so a restart
+    /// that cuts an upload off leaves it open for the next start to finish (the upload is idempotent).
+    pub fn release_intent_open(&self, repo: &str, tag: &str, since: u64) -> Result<()> {
+        self.run(
+            "INSERT INTO release_intents (repo, tag, since) VALUES ($1, $2, $3) ON CONFLICT (repo, tag) DO NOTHING",
+            &[&repo, &tag, &int(since)],
+        )?;
+        Ok(())
+    }
+
+    pub fn release_intent_clear(&self, repo: &str, tag: &str) -> Result<()> {
+        self.run(
+            "DELETE FROM release_intents WHERE repo = $1 AND tag = $2",
+            &[&repo, &tag],
+        )?;
+        Ok(())
+    }
+
+    /// Every release intent still open, oldest first.
+    pub fn release_intents_open(&self) -> Result<Vec<(String, String)>> {
+        let rows = self.client.borrow_mut().query(
+            "SELECT repo, tag FROM release_intents ORDER BY since, repo, tag",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     fn run(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {

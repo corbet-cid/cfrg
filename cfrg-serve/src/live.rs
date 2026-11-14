@@ -59,6 +59,13 @@ impl LiveRelay {
     }
 }
 
+impl LiveRelay {
+    /// The release intent journal in the same database as the relay.
+    pub fn journal(&self) -> crate::journal::PgJournal {
+        crate::journal::PgJournal::new(Arc::clone(&self.settings))
+    }
+}
+
 impl Relay for LiveRelay {
     fn apply(&self, hint: Hint) -> RelayFuture<'_> {
         let settings = Arc::clone(&self.settings);

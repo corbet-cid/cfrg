@@ -2,6 +2,7 @@
 mod common;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cfrg::relay::{Hint, HintAction};
+use cfrg_serve::journal::Journal as _;
 use cfrg_serve::{
     config::{Config, Credentials},
     server::{self, Bridge},
@@ -919,4 +920,117 @@ async fn events_of_foreign_installations_and_repositories_are_dropped_with_a_202
         202
     );
     assert_eq!(rig.dispatched(1).await.len(), 1);
+}
+
+#[derive(Default)]
+struct MemJournal(std::sync::Mutex<std::collections::BTreeSet<(String, String)>>);
+
+impl cfrg_serve::journal::Journal for MemJournal {
+    fn open(&self, repo: &str, tag: &str) -> Result<(), String> {
+        self.0.lock().unwrap().insert((repo.into(), tag.into()));
+        Ok(())
+    }
+    fn clear(&self, repo: &str, tag: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .remove(&(repo.to_owned(), tag.to_owned()));
+        Ok(())
+    }
+    fn open_intents(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(self.0.lock().unwrap().iter().cloned().collect())
+    }
+}
+
+#[tokio::test]
+async fn a_release_intent_left_open_is_completed_on_the_next_start() {
+    let rig = Rig::new().await;
+    // the previous pod was cut off mid-upload: its intent is still in the journal, no release event will come again
+    let journal = Arc::new(MemJournal::default());
+    journal.open(&rig.w.repo, &rig.w.tag).unwrap();
+    assert!(rig.w.gh_stored().is_empty());
+    rig.bridge.attach_journal(journal.clone());
+    assert_eq!(rig.wait_done().await, 0);
+    let files = rig.w.st.lock().unwrap().files.clone();
+    assert_eq!(rig.w.gh_stored(), files, "the copy was completed");
+    for _ in 0..50 {
+        if journal.open_intents().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        journal.open_intents().unwrap().is_empty(),
+        "synced clears the intent"
+    );
+}
+
+#[tokio::test]
+async fn a_release_event_writes_its_intent_and_synced_clears_it() {
+    let rig = Rig::new().await;
+    let journal = Arc::new(MemJournal::default());
+    rig.bridge.attach_journal(journal.clone());
+    let body = release_event(&rig.w);
+    let sig = [("x-forgejo-signature", forgejo_sig("s3cret", &body))];
+    assert_eq!(
+        rig.post(&rig.internal, "/hooks/release", &sig, &body).await,
+        (202, "queued".into())
+    );
+    assert_eq!(rig.wait_done().await, 0);
+    for _ in 0..50 {
+        if journal.open_intents().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(journal.open_intents().unwrap().is_empty());
+}
+
+struct FailJournal;
+
+impl cfrg_serve::journal::Journal for FailJournal {
+    fn open(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("database unreachable".into())
+    }
+    fn clear(&self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn open_intents(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(vec![])
+    }
+}
+
+#[tokio::test]
+async fn the_intent_is_written_before_the_202_and_a_journal_failure_answers_503() {
+    // a journal that cannot be written: 503 (the forge redelivers), nothing is queued, and the delivery id is released
+    let rig = Rig::new().await;
+    rig.bridge.attach_journal(Arc::new(FailJournal));
+    let body = release_event(&rig.w);
+    let sig = [("x-forgejo-signature", forgejo_sig("s3cret", &body))];
+    let first = rig.post(&rig.internal, "/hooks/release", &sig, &body).await;
+    assert_eq!(first.0, 503, "{first:?}");
+    assert!(rig.w.gh_stored().is_empty(), "nothing was queued");
+    // a journal that works: the intent is in the journal when the reply comes (the worker cannot have cleared it yet,
+    // because this journal keeps it)
+    struct Keep(MemJournal);
+    impl cfrg_serve::journal::Journal for Keep {
+        fn open(&self, r: &str, t: &str) -> Result<(), String> {
+            self.0.open(r, t)
+        }
+        fn clear(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn open_intents(&self) -> Result<Vec<(String, String)>, String> {
+            self.0.open_intents()
+        }
+    }
+    let rig = Rig::new().await;
+    let keep = Arc::new(Keep(MemJournal::default()));
+    rig.bridge.attach_journal(keep.clone());
+    let reply = rig.post(&rig.internal, "/hooks/release", &sig, &body).await;
+    assert_eq!(reply.0, 202);
+    assert_eq!(
+        keep.open_intents().unwrap(),
+        vec![(rig.w.repo.clone(), rig.w.tag.clone())]
+    );
 }

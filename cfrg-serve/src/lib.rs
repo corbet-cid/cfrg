@@ -12,6 +12,7 @@ pub mod config;
 pub mod event;
 pub mod hooks;
 pub mod http;
+pub mod journal;
 pub mod live;
 pub mod relay;
 pub mod release;

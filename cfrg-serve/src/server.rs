@@ -93,6 +93,7 @@ pub struct Bridge {
     wiki_tx: mpsc::Sender<String>,
     wiki_pending: Mutex<HashSet<String>>,
     pending: Mutex<HashSet<(String, String)>>,
+    journal: std::sync::OnceLock<Arc<dyn crate::journal::Journal>>,
     last: Mutex<HashMap<(String, String), i32>>,
     pub(crate) hooks: crate::hooks::Queue,
 }
@@ -136,6 +137,7 @@ impl Bridge {
             wiki_tx,
             wiki_pending: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
+            journal: std::sync::OnceLock::new(),
             last: Mutex::new(HashMap::new()),
             hooks,
         });
@@ -182,6 +184,14 @@ impl Bridge {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&(repo.clone(), tag.clone()));
                 let exit = release::sync(&bridge.ctx, &repo, &tag, false).await.exit;
+                if exit == 0 {
+                    if let Err(why) = bridge.journal_do(&repo, &tag, false).await {
+                        log(
+                            "journal-failed",
+                            json!({"repository": repo, "tag": tag, "error": why}),
+                        );
+                    }
+                }
                 bridge
                     .last
                     .lock()
@@ -261,6 +271,65 @@ impl Bridge {
                 }
             }
         });
+    }
+
+    /// Writes (`open`) or clears the release intent of this repository and tag. Without a journal this is a no-op.
+    async fn journal_do(&self, repo: &str, tag: &str, open: bool) -> Result<(), String> {
+        let Some(journal) = self.journal.get().cloned() else {
+            return Ok(());
+        };
+        let (r, t) = (repo.to_owned(), tag.to_owned());
+        tokio::task::spawn_blocking(move || {
+            if open {
+                journal.open(&r, &t)
+            } else {
+                journal.clear(&r, &t)
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|x| x)
+    }
+
+    /// Attaches the journal and queues every open intent once: a restart that cut an upload off leaves its intent open,
+    /// and no second release event arrives to retry it. (The daily run, `cfrg daily`, finishes what is still open; there is
+    /// no schedule of its own in serve.)
+    pub fn attach_journal(self: &Arc<Self>, journal: Arc<dyn crate::journal::Journal>) {
+        if self.journal.set(journal).is_err() {
+            return;
+        }
+        let bridge = Arc::clone(self);
+        tokio::spawn(async move {
+            bridge.resume_open().await;
+        });
+    }
+
+    /// Queues the open intents (the normal worker runs them, one pass each).
+    pub async fn resume_open(self: &Arc<Self>) -> usize {
+        let Some(journal) = self.journal.get().cloned() else {
+            return 0;
+        };
+        let open = match tokio::task::spawn_blocking(move || journal.open_intents()).await {
+            Ok(Ok(open)) => open,
+            Ok(Err(why)) => {
+                log("journal-failed", json!({"error": why}));
+                Vec::new()
+            }
+            Err(error) => {
+                log("journal-failed", json!({"error": error.to_string()}));
+                Vec::new()
+            }
+        };
+        let mut queued = 0;
+        for (repo, tag) in open {
+            if self.enqueue_release(&repo, &tag) == "queued" {
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            log("resumed", json!({"kind": "release", "intents": queued}));
+        }
+        queued
     }
 
     fn enqueue_release(&self, repo: &str, tag: &str) -> &'static str {
@@ -407,6 +476,16 @@ pub async fn handle(bridge: Arc<Bridge>, listener: Arc<str>, request: Request<In
                     json!({"listener": &*listener, "path": path, "reason": "shape"}),
                 );
                 return reply(400, "bad repository or tag");
+            }
+            // The intent is written BEFORE the 202: a restart after the reply cannot lose the release, and a journal that
+            // cannot be written answers 503 so that the forge redelivers.
+            if let Err(why) = bridge.journal_do(&repo, &tag, true).await {
+                log(
+                    "journal-failed",
+                    json!({"repository": repo, "tag": tag, "error": why}),
+                );
+                release_key(&replay_key);
+                return reply(503, "release journal unavailable");
             }
             let state = bridge.enqueue_release(&repo, &tag);
             log(

@@ -1,11 +1,12 @@
 //! `cfrg daily`: the one daily run of the bridge as a scheduler runs it (a Kubernetes CronJob, a systemd timer, cron).
 //!
-//! Five steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
+//! Six steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
 //! failed, so the job fails. (Renovate is not one of them: run it as its own job.) A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
 //!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
 //!   settings     `cfrg native --operation settings --apply` (copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
+//!   releases     `cfrg-serve release-resume`: finishes the release uploads a restart cut off (the journal `release_intents`), when the serve config is there
 //!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
@@ -41,6 +42,9 @@ pub struct Options {
     /// The GitHub write gate's directory (its volume): `<dir>/kill-switch` is the kill switch, `<dir>/paused` the pause folder. Without the directory the `settings` and `wiki` steps refuse.
     #[arg(long, default_value = "/gate")]
     gate_dir: PathBuf,
+    /// The serve configuration (for the `releases` step: forge addresses, organisations, the relay database login).
+    #[arg(long, default_value = "/app/serve-config.json")]
+    serve_config: PathBuf,
     /// Writes of one `settings` run and pushes of one `wiki` run (bounded per run).
     #[arg(long, default_value_t = 20)]
     max_writes: usize,
@@ -250,6 +254,24 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             Action::Command { program: exe.to_owned(), args, env }
         }
     };
+    let releases = if options.serve_config.is_file() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "FORGE_BRIDGE_CONFIG".into(),
+            options.serve_config.display().to_string(),
+        );
+        env.insert("FORGE_BRIDGE_SECRETS".into(), dir.display().to_string());
+        Action::Command {
+            program: exe.with_file_name("cfrg-serve"),
+            args: vec!["release-resume".into()],
+            env,
+        }
+    } else {
+        Action::Noop(format!(
+            "the serve configuration {} is not mounted",
+            options.serve_config.display()
+        ))
+    };
     let gitlab_key =
         if credential(dir, "gitlab_token").is_none() || credential(dir, "forgejo_push").is_none() {
             Action::Noop(
@@ -303,6 +325,10 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         Step {
             name: "sweep",
             action: sweep,
+        },
+        Step {
+            name: "releases",
+            action: releases,
         },
         Step {
             name: "gitlab-key",
@@ -383,6 +409,7 @@ mod tests {
             ca: "/ca/ca.crt".into(),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
             gate_dir: "/nonexistent-gate".into(),
+            serve_config: "/nonexistent-serve-config.json".into(),
             max_writes: 20,
             dry,
         }
@@ -394,7 +421,14 @@ mod tests {
         let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
-            ["native", "settings", "wiki", "sweep", "gitlab-key"]
+            [
+                "native",
+                "settings",
+                "wiki",
+                "sweep",
+                "releases",
+                "gitlab-key"
+            ]
         );
         assert!(steps.iter().all(|s| matches!(s.action, Action::Noop(_))));
     }
@@ -417,7 +451,7 @@ mod tests {
             fs::write(dir.path().join(k), v).unwrap();
         }
         let steps = plan(&options(dir.path(), true), Path::new("/bin/cfrg"));
-        let Action::Command { args, env, .. } = &steps[4].action else {
+        let Action::Command { args, env, .. } = &steps[5].action else {
             panic!("gitlab-key must run")
         };
         assert_eq!(args, &["/scripts/gitlab-key-renew.sh"]);
@@ -473,7 +507,14 @@ mod tests {
         let steps = plan(&o, Path::new("/bin/cfrg"));
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
-            ["native", "settings", "wiki", "sweep", "gitlab-key"]
+            [
+                "native",
+                "settings",
+                "wiki",
+                "sweep",
+                "releases",
+                "gitlab-key"
+            ]
         );
         let Action::Command { args, .. } = &steps[1].action else {
             panic!("settings must run")
@@ -541,5 +582,34 @@ mod tests {
             panic!()
         };
         assert!(args.contains(&"--apply".to_string()) && args.contains(&"reconcile".to_string()));
+    }
+
+    #[test]
+    fn the_releases_step_finishes_open_release_intents_with_the_serve_binary_next_to_cfrg() {
+        let dir = tempfile::tempdir().unwrap();
+        // no serve configuration mounted: a no-op that says so
+        let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
+        let Action::Noop(why) = &steps[4].action else {
+            panic!("not a no-op");
+        };
+        assert!(why.contains("serve configuration"));
+        // mounted: `cfrg-serve release-resume` with the config and the credentials directory in the environment
+        let serve = dir.path().join("serve-config.json");
+        fs::write(&serve, "{}").unwrap();
+        let mut o = options(dir.path(), false);
+        o.serve_config = serve.clone();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        assert_eq!(steps[4].name, "releases");
+        let Action::Command { program, args, env } = &steps[4].action else {
+            panic!("not a command");
+        };
+        assert_eq!(program, Path::new("/bin/cfrg-serve"));
+        assert_eq!(args, &["release-resume"]);
+        assert_eq!(env["FORGE_BRIDGE_CONFIG"], serve.display().to_string());
+        assert_eq!(
+            env["FORGE_BRIDGE_SECRETS"],
+            dir.path().display().to_string()
+        );
+        assert!(env.values().all(|v| !v.contains("password")));
     }
 }

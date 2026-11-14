@@ -8,7 +8,7 @@ use cfrg_serve::{
 use std::{env, path::PathBuf, process::ExitCode};
 use tokio::{net::TcpListener, sync::watch};
 
-const USAGE: &str = "usage: cfrg-serve serve | cfrg-serve release-upload <github|gitlab|all> OWNER/REPO TAG [--plan] | cfrg-serve sync OWNER/REPO TAG [--plan]\n\
+const USAGE: &str = "usage: cfrg-serve serve | cfrg-serve release-upload <github|gitlab|all> OWNER/REPO TAG [--plan] | cfrg-serve sync OWNER/REPO TAG [--plan] | cfrg-serve release-resume\n\
 config from FORGE_BRIDGE_CONFIG (default /config/config.json), credentials from FORGE_BRIDGE_SECRETS (default /secrets)";
 
 fn main() -> ExitCode {
@@ -52,6 +52,7 @@ async fn run(args: &[String]) -> cfrg_serve::config::Result<u8> {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
             Ok(outcome.exit as u8)
         }
+        ["release-resume"] => release_resume(&config_path, &secrets).await,
         ["sync", repo, tag] | ["sync", repo, tag, "--plan"] => {
             let dry = strs.len() == 4;
             let ctx = release::Ctx::new(
@@ -87,15 +88,20 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
         creds.get("github_token").is_some() || creds.get("github_app_key").is_some(),
         creds.get("gitlab_token").is_some(),
     );
-    let relay: Option<std::sync::Arc<dyn cfrg_serve::relay::Relay>> = match &config.relay {
-        Some(r) => {
-            cfrg_serve::live::LiveRelay::from_config(r)?.map(|l| std::sync::Arc::new(l) as _)
-        }
+    let live = match &config.relay {
+        Some(r) => cfrg_serve::live::LiveRelay::from_config(r)?,
         None => None,
     };
+    let journal: Option<std::sync::Arc<dyn cfrg_serve::journal::Journal>> =
+        live.as_ref().map(|l| std::sync::Arc::new(l.journal()) as _);
+    let relay: Option<std::sync::Arc<dyn cfrg_serve::relay::Relay>> =
+        live.map(|l| std::sync::Arc::new(l) as _);
     let relay_on = relay.is_some();
     let (bridge, workers) = Bridge::new(config, creds, relay)?;
     bridge.run_workers(workers);
+    if let Some(journal) = journal {
+        bridge.attach_journal(journal);
+    }
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut ports = serde_json::Map::new();
     let mut tasks = Vec::new();
@@ -129,4 +135,40 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
         let _ = task.await;
     }
     Ok(0)
+}
+
+/// Finishes every open release intent of the journal (the daily run's step): one sync each, the intent cleared when it is synced.
+/// Exit 0 when none is left open, 1 when one could not be finished (the next daily run tries again).
+async fn release_resume(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u8> {
+    use cfrg_serve::journal::Journal;
+    let config = Config::load(&PathBuf::from(config_path))?;
+    let Some(relay) = &config.relay else {
+        println!("release-resume: no relay database is configured: nothing to resume");
+        return Ok(0);
+    };
+    let creds =
+        Credentials::load(&PathBuf::from(secrets)).merge(&PathBuf::from(&relay.credentials_dir));
+    let Some(live) = cfrg_serve::live::LiveRelay::from_config(relay)? else {
+        println!("release-resume: the relay database login is not mounted: nothing to resume");
+        return Ok(0);
+    };
+    let journal = live.journal();
+    let open = journal.open_intents()?;
+    let ctx = release::Ctx::new(config, creds)?;
+    let mut left = 0;
+    for (repo, tag) in &open {
+        let outcome = release::sync(&ctx, repo, tag, false).await;
+        if outcome.exit == 0 {
+            journal.clear(repo, tag)?;
+            println!("release-resume: {repo} {tag}: synced");
+        } else {
+            left += 1;
+            println!(
+                "release-resume: {repo} {tag}: exit {}, left open",
+                outcome.exit
+            );
+        }
+    }
+    println!("release-resume: {} open, {left} left", open.len());
+    Ok(u8::from(left > 0))
 }
