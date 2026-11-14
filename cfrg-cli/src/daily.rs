@@ -41,9 +41,13 @@ pub struct Options {
     /// The GitLab key renewal script: a script you provide (run with bash).
     #[arg(long, default_value = "/scripts/gitlab-key-renew.sh")]
     gitlab_key_script: PathBuf,
-    /// The GitHub write gate's directory (its volume): `<dir>/kill-switch` is the kill switch, `<dir>/paused` the pause folder. Without the directory the `settings` and `wiki` steps refuse.
+    /// The GitHub write gate's directory (its volume): `<dir>/kill` is the kill switch (the Frankfurt gate's `/state/kill`), `<dir>/paused` the pause folder. Without the directory the `settings` and `wiki` steps refuse.
     #[arg(long, default_value = "/gate")]
     gate_dir: PathBuf,
+    /// The GitHub gate's catalogue (its `gate-config.json`, the ConfigMap `github-gate-files`): the `settings` step writes a GitHub copy
+    /// only when the catalogue lists it (`github_copy_owned`). Without the file no GitHub copy is owned and none is written.
+    #[arg(long, default_value = "/gate-files/gate-config.json")]
+    gate_catalog: PathBuf,
     /// The serve configuration (for the `releases` step: forge addresses, organisations, the relay database login).
     #[arg(long, default_value = "/app/serve-config.json")]
     serve_config: PathBuf,
@@ -211,7 +215,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         ]);
         args.extend([
             "--github-kill-switch".into(),
-            options.gate_dir.join("kill-switch").display().to_string(),
+            options.gate_dir.join("kill").display().to_string(),
         ]);
         args.extend([
             "--github-paused-dir".into(),
@@ -227,10 +231,14 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             env,
         }
     };
-    let settings = gated(
-        "settings",
-        vec!["--max-writes".into(), options.max_writes.to_string()],
-    );
+    let mut settings_args = vec!["--max-writes".into(), options.max_writes.to_string()];
+    if options.gate_catalog.is_file() {
+        settings_args.extend([
+            "--github-gate-catalog".into(),
+            options.gate_catalog.display().to_string(),
+        ]);
+    }
+    let settings = gated("settings", settings_args);
     let wiki = match (credential(dir, "wiki_deploy_key"), credential(dir, "wiki_known_hosts"), credential(dir, "wiki_key_id").and_then(|id| id.parse::<u64>().ok())) {
         (Some(_), Some(_), Some(id)) => gated(
             "wiki",
@@ -438,6 +446,7 @@ mod tests {
             ca: "/ca/ca.crt".into(),
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
             gate_dir: "/nonexistent-gate".into(),
+            gate_catalog: "/nonexistent-gate-config.json".into(),
             serve_config: "/nonexistent-serve-config.json".into(),
             copy_script: "/nonexistent-copy.sh".into(),
             max_writes: 20,
@@ -534,6 +543,25 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_step_passes_the_gate_catalogue_when_it_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = tempfile::tempdir().unwrap();
+        gate_world(dir.path(), gate.path(), false);
+        let catalog = gate.path().join("gate-config.json");
+        fs::write(&catalog, "{}").unwrap();
+        let mut o = options(dir.path(), false);
+        o.gate_dir = gate.path().to_owned();
+        o.gate_catalog = catalog.clone();
+        let steps = plan(&o, Path::new("/bin/cfrg"));
+        let Action::Command { args, .. } = &steps[1].action else {
+            panic!("settings must run")
+        };
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--github-gate-catalog" && w[1] == catalog.display().to_string()));
+    }
+
+    #[test]
     fn settings_and_wiki_run_behind_the_gate_files_with_bounded_limits() {
         let dir = tempfile::tempdir().unwrap();
         let gate = tempfile::tempdir().unwrap();
@@ -561,6 +589,8 @@ mod tests {
                 && args.contains(&"--apply".to_string())
         );
         assert!(args.windows(2).any(|w| w == ["--max-writes", "20"]));
+        // The catalogue is passed only when the file is there; the test world has none.
+        assert!(!args.contains(&"--github-gate-catalog".to_string()));
         assert!(
             args.contains(&"--github-kill-switch".to_string())
                 && args.contains(&"--github-paused-dir".to_string())
