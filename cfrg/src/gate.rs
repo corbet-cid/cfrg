@@ -1030,7 +1030,10 @@ mod tests {
         assert_eq!(plan.updates, ["refs/heads/main", "refs/heads/new"]);
         assert_eq!(plan.prune, ["refs/heads/stale", "refs/tags/old"]);
         assert!(plan.conflicts.is_empty());
-        assert!(plan.kept.is_empty(), "a copy-only tag is deleted with the primary's retirement of it");
+        assert!(
+            plan.kept.is_empty(),
+            "a copy-only tag is deleted with the primary's retirement of it"
+        );
         assert!(plan.hold(10).is_none());
         assert!(!plan.is_empty());
     }

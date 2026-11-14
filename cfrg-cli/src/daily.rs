@@ -176,7 +176,10 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         common(&mut env);
         let mut args: Vec<String> = ["native", "--placement"].map(String::from).to_vec();
         args.push(options.placement.display().to_string());
-        args.extend(["--state".into(), options.state.display().to_string()]);
+        args.extend([
+            "--state".into(),
+            options.state.join("native.json").display().to_string(),
+        ]);
         if dry {
             args.extend(["--operation".into(), "plan".into()]);
         } else {
@@ -212,7 +215,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         args.push(options.placement.display().to_string());
         args.extend([
             "--state".into(),
-            options.state.display().to_string(),
+            options.state.join("native.json").display().to_string(),
             "--operation".into(),
             operation.into(),
         ]);
