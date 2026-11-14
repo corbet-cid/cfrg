@@ -68,7 +68,7 @@ credentials directory, named by `FORGE_BRIDGE_SECRETS` (default `/secrets`). Unk
 | `aliases` | no | `{provider: {primary path: copy path}}` for the few copies that carry another name. |
 | `placement` | no | Path of the placement document. It declares the contributed projects (never touched) and, for the wiki leg, the repositories. |
 | `wiki` | no | `{state, key, known_hosts, key_id}`: the state directory, the SSH deploy key (private half; `<key>.pub` beside it), the `known_hosts` file and the optional id of the deploy key on GitLab. Absent: a wiki event is answered 503. |
-| `hook_commands` | no | `{copy, downsync, lockrefresh, gate}`: the argv of the command a hook runs; the job's arguments are appended. A hook whose key is absent answers 503. cfrg ships none of these commands. |
+| `hook_commands` | no | `{copy, downsync, lockrefresh, gate, handoff, enroll}`: the argv of the command a hook runs; the job's arguments are appended. A hook whose key is absent answers 503. cfrg ships none of these commands. |
 | `relay` | no | `{config, placement, credentials_dir, database_ca}`: the in-process relay. `config` is the relay configuration (next section), `placement` the placement it derives its repositories from, `credentials_dir` defaults to `/credentials`, `database_ca` is the CA file the database login is verified against. Absent: the relay routes answer 503. |
 | `replay` | no | `{ttl_seconds, capacity}`: how long (default 86400) and how many (default 10000) delivery ids are remembered. |
 
@@ -79,7 +79,7 @@ Routes (`cfrg-serve/src/server.rs`, function `route`). A listener answers nothin
 | `internal` | `POST /hooks/release` | `hmac_forgejo` | A published, non-draft release is uploaded to the GitHub and GitLab copies ([release upload](release-upload.md)). |
 | `internal` | `POST /hooks/sync` | `hmac_forgejo` | `{"repository": "OWNER/REPO", "tag": "vX"}`: a tag pusher's hint that the tag is on a copy now. |
 | `internal` | `POST /hooks/forgejo` | `hmac_forgejo` | Issues, comments and pull requests of the primary go to the relay; a `wiki` event starts the wiki push. |
-| `internal` | `POST /hooks/copy`, `/hooks/downsync`, `/hooks/gate`, `/hooks/lockrefresh` | `hmac_forgejo` | Run the matching `hook_commands` entry. |
+| `internal` | `POST /hooks/copy`, `/hooks/downsync`, `/hooks/enroll`, `/hooks/gate`, `/hooks/handoff`, `/hooks/lockrefresh` | `hmac_forgejo` | Run the matching `hook_commands` entry. |
 | `public` | `POST /hooks/github` | `hmac_github` | GitHub issue, comment and pull request events go to the relay. |
 | `public` | `POST /hooks/gitlab` | `hmac_gitlab` | The same for GitLab (Standard Webhooks signature). |
 | both | `GET /healthz` | none | Liveness. |
@@ -166,12 +166,12 @@ There is no field for CI: a placement that carries one is refused (`cfrg/tests/i
 
 ## Daily run (`cfrg daily`)
 
-`cfrg daily` runs the five steps below in order (Renovate is not one of them: run it as its own job), each alone: a failing step is logged and the next still runs, and the
+`cfrg daily` runs the steps below in order (Renovate is not one of them: run it as its own job), each alone: a failing step is logged and the next still runs, and the
 command exits non-zero if any failed. A step whose credential is absent is a no-op that says so. It is started by a
 scheduler you provide (cron, a systemd timer, a Kubernetes CronJob); cfrg has no scheduler. Code:
 `cfrg-cli/src/daily.rs`. Options: `--credentials-dir` (`CFRG_CREDENTIALS_DIRECTORY`), `--config`
 (`CFRG_RELAY_CONFIG`), `--placement` (`CFRG_PLACEMENT`), `--state`, `--ca` (`CFRG_DAILY_CA`),
-`--gitlab-key-script`, `--gate-dir`, `--max-writes`, `--dry` (`DAILY_DRY_RUN`).
+`--gitlab-key-script`, `--copy-script`, `--gate-dir`, `--max-writes`, `--dry` (`DAILY_DRY_RUN`).
 
 | Step | Runs | Needs in the credentials directory |
 |---|---|---|
@@ -180,3 +180,6 @@ scheduler you provide (cron, a systemd timer, a Kubernetes CronJob); cfrg has no
 | `wiki` | `cfrg native --operation wiki --apply` | `native-env`, `wiki_deploy_key`, `wiki_known_hosts`, `wiki_key_id` |
 | `sweep` | `cfrg relay sweep` | the database files `host port dbname username password` |
 | `gitlab-key` | the script named by `--gitlab-key-script` (not shipped with cfrg) | `gitlab_token`, `forgejo_push` and the database files |
+| `copy` | the script named by `--copy-script` (the very one `hook_commands.copy` runs per push), without a repository: the catch-up for a missed push or new-repository event (`COPY_DRY=1` when `--dry`) | the script file (a no-op when it is not mounted) |
+
+The hooks `/hooks/handoff` (a published release, or a packaging tag `aur/<pkgver>-<pkgrel>` of the owner) and `/hooks/enroll` (a push to `main` that changes the root file `ccvl-downstream.json`) plan one job each: `OWNER/REPO TAG` and `OWNER/REPO AFTER`. Code and tests: `cfrg-serve/src/hooks/handoff.rs`, `enroll.rs`.

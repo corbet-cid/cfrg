@@ -7,6 +7,8 @@
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
 //!   releases     `cfrg-serve release-resume`: finishes the release uploads a restart cut off (the journal `release_intents`), when the serve config is there
+//!   releases     `cfrg-serve release-resume`: finishes the open release intents
+//!   copy         the git copy of every repository (the script of `/hooks/copy` without a repository): the catch-up for a missed push or new-repository event
 //!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
@@ -45,6 +47,10 @@ pub struct Options {
     /// The serve configuration (for the `releases` step: forge addresses, organisations, the relay database login).
     #[arg(long, default_value = "/app/serve-config.json")]
     serve_config: PathBuf,
+    /// The git copy's script, the very one `cfrg-serve`'s `/hooks/copy` runs per push (`hook_commands.copy`): the `copy` step runs it
+    /// WITHOUT a repository, so it covers every repository the forge lists (the catch-up for a missed event).
+    #[arg(long, default_value = "/hooks/copy.sh")]
+    copy_script: PathBuf,
     /// Writes of one `settings` run and pushes of one `wiki` run (bounded per run).
     #[arg(long, default_value_t = 20)]
     max_writes: usize,
@@ -311,6 +317,23 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
                 env,
             }
         };
+    // copy: the hook's own script, no repository argument = all of them. Dry: the script is told to plan only (`COPY_DRY=1`).
+    let copy = if options.copy_script.is_file() {
+        let mut env = BTreeMap::new();
+        if dry {
+            env.insert("COPY_DRY".into(), "1".into());
+        }
+        Action::Command {
+            program: "/bin/sh".into(),
+            args: vec![options.copy_script.display().to_string()],
+            env,
+        }
+    } else {
+        Action::Noop(format!(
+            "the git copy script {} is not mounted",
+            options.copy_script.display()
+        ))
+    };
     vec![
         Step {
             name: "native",
@@ -335,6 +358,10 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         Step {
             name: "gitlab-key",
             action: gitlab_key,
+        },
+        Step {
+            name: "copy",
+            action: copy,
         },
     ]
 }
@@ -412,6 +439,7 @@ mod tests {
             gitlab_key_script: "/scripts/gitlab-key-renew.sh".into(),
             gate_dir: "/nonexistent-gate".into(),
             serve_config: "/nonexistent-serve-config.json".into(),
+            copy_script: "/nonexistent-copy.sh".into(),
             max_writes: 20,
             dry,
         }
@@ -429,7 +457,8 @@ mod tests {
                 "wiki",
                 "sweep",
                 "releases",
-                "gitlab-key"
+                "gitlab-key",
+                "copy"
             ]
         );
         assert!(steps.iter().all(|s| matches!(s.action, Action::Noop(_))));
@@ -520,7 +549,8 @@ mod tests {
                 "wiki",
                 "sweep",
                 "releases",
-                "gitlab-key"
+                "gitlab-key",
+                "copy"
             ]
         );
         let Action::Command { args, .. } = &steps[1].action else {
@@ -618,5 +648,29 @@ mod tests {
             dir.path().display().to_string()
         );
         assert!(env.values().all(|v| !v.contains("password")));
+    }
+
+    #[test]
+    fn the_copy_step_runs_the_hook_script_without_a_repository_and_plans_only_when_dry() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("copy.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        for dry in [false, true] {
+            let mut o = options(dir.path(), dry);
+            o.copy_script = script.clone();
+            let steps = plan(&o, Path::new("/bin/cfrg"));
+            let copy = steps.last().unwrap();
+            assert_eq!(copy.name, "copy");
+            let Action::Command { program, args, env } = &copy.action else {
+                panic!("copy must run")
+            };
+            assert_eq!(program, Path::new("/bin/sh"));
+            assert_eq!(
+                args,
+                &[script.display().to_string()],
+                "no repository argument: all of them"
+            );
+            assert_eq!(env.get("COPY_DRY").map(String::as_str), dry.then_some("1"));
+        }
     }
 }
