@@ -415,3 +415,27 @@ async fn one_copy_can_be_synced_alone() {
     );
     assert!(w.gh.all().is_empty());
 }
+
+/// A downstream's pointer release carries notes only: zero assets, hence no checksum file. It is a valid release for
+/// every repository (the notes name the upstream release), it syncs and a re-run writes nothing.
+#[tokio::test]
+async fn a_release_without_assets_syncs_its_notes_and_reruns_as_a_noop() {
+    let w = World::with(|st| {
+        st.files.clear();
+        st.served.clear();
+    })
+    .await;
+    let first = w.sync(false).await;
+    assert_eq!(first.exit, 0, "{first:?}");
+    assert_eq!(statuses(&first), ["synced", "synced"], "{first:?}");
+    {
+        let st = w.st.lock().unwrap();
+        assert_eq!(st.g_releases[0]["body"], "Notes\r\nline two");
+        assert!(st.l_files.is_empty() && st.l_links.is_empty());
+    }
+    assert!(w.gh_stored().is_empty());
+    let writes = (w.gh.writes().len(), w.gl.writes().len());
+    let again = w.sync(false).await;
+    assert_eq!(statuses(&again), ["in_sync", "in_sync"], "{again:?}");
+    assert_eq!((w.gh.writes().len(), w.gl.writes().len()), writes);
+}
