@@ -146,6 +146,49 @@ fn key_parts(text: &str) -> Vec<String> {
     text.split_whitespace().take(2).map(String::from).collect()
 }
 
+/// The id of the deploy key (matched by its type and key material, i.e. its fingerprint) from the instance-wide key list; best effort: the list
+/// needs an administrator, so a refusal only leaves the id unknown (a project that already has the key teaches it through its own list).
+fn lookup_key_id(
+    io: &mut dyn Transport,
+    dest: &Destination,
+    public_key: &str,
+    key_id: &mut Option<u64>,
+) -> bool {
+    for page in 1..=20 {
+        let Ok(response) = gitlab(
+            io,
+            dest,
+            "GET",
+            format!("/deploy_keys?per_page=100&page={page}"),
+            None,
+        ) else {
+            return false;
+        };
+        let Ok(list) = expect(response, &[200]) else {
+            return false;
+        };
+        let Some(keys) = list.as_array() else {
+            return false;
+        };
+        if let Some(id) = keys
+            .iter()
+            .find(|k| {
+                k["key"]
+                    .as_str()
+                    .is_some_and(|t| key_parts(t) == key_parts(public_key))
+            })
+            .and_then(|k| k["id"].as_u64())
+        {
+            *key_id = Some(id);
+            return true;
+        }
+        if keys.len() < 100 {
+            break;
+        }
+    }
+    false
+}
+
 /// Enable the wiki deploy key with `can_push` on one project. Idempotent: an enabled key
 /// with push is left alone.
 fn ensure_key(
@@ -153,7 +196,7 @@ fn ensure_key(
     dest: &Destination,
     project: &str,
     public_key: &str,
-    key_id: Option<u64>,
+    key_id: &mut Option<u64>,
 ) -> Result<&'static str> {
     let mut found = None;
     for page in 1..=20 {
@@ -174,6 +217,10 @@ fn ensure_key(
                 .is_some_and(|k| key_parts(k) == key_parts(public_key))
             {
                 found = Some(key.clone());
+                // The id of the key is the same on every project it is enabled on: remember it for the projects that lack it.
+                if let Some(id) = key["id"].as_u64() {
+                    key_id.get_or_insert(id);
+                }
             }
         }
         if keys.len() < 100 {
@@ -212,7 +259,7 @@ fn ensure_key(
         }
         // GitLab refuses to create a key that already exists on another project (400, fingerprint taken):
         // it is enabled by its id instead, and then given push on this project.
-        None if key_id.is_some() => {
+        None if key_id.is_some() || lookup_key_id(io, dest, public_key, key_id) => {
             let id = key_id.ok_or("No key id")?;
             expect(
                 gitlab(
@@ -371,6 +418,8 @@ pub struct Session<'a> {
     source_origin: String,
     source_env: Environment,
     public_key: Option<String>,
+    /// The id of the deploy key on GitLab: `--wiki-key-id` as an override, else learnt from GitLab during the run.
+    key_id: Option<u64>,
     ssh: Option<Environment>,
     scratch: tempfile::TempDir,
     rows: Vec<Value>,
@@ -415,6 +464,7 @@ impl<'a> Session<'a> {
             ),
         );
         Ok(Self {
+            key_id: options.key_id,
             options,
             secrets,
             source_origin: origin,
@@ -622,7 +672,7 @@ impl<'a> Session<'a> {
             dest,
             &project,
             self.public_key.as_deref().ok_or("No wiki key")?,
-            self.options.key_id,
+            &mut self.key_id,
         )?;
         if self.pushes > 0 {
             std::thread::sleep(self.options.push_gap);
@@ -909,5 +959,67 @@ mod tests {
             .to_string_lossy()
             .contains("StrictHostKeyChecking=yes"));
         assert!(command.to_string_lossy().contains("-F /dev/null"));
+    }
+
+    struct Gitlab {
+        project_keys: Vec<Value>,
+        all_keys: Option<Vec<Value>>,
+        seen: Vec<String>,
+    }
+    impl Transport for Gitlab {
+        fn send(&mut self, request: Request) -> Result<Response> {
+            self.seen.push(request.path.clone());
+            let body = if request.path.starts_with("/api/v4/deploy_keys") {
+                match &self.all_keys {
+                    Some(k) => json!(k),
+                    None => {
+                        return Ok(Response {
+                            status: 403,
+                            body: json!({}),
+                        })
+                    }
+                }
+            } else {
+                json!(self.project_keys)
+            };
+            Ok(Response { status: 200, body })
+        }
+    }
+    fn gitlab_dest() -> Destination {
+        serde_json::from_value(json!({"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"T"},"path":"g/r","namespace":"2","repository_id":"7","mirror_user":"9","password_env":"T","interval_seconds":600})).unwrap()
+    }
+    const PUB: &str = "ssh-ed25519 AAAAkey wiki@bridge";
+
+    #[test]
+    fn the_key_id_is_learnt_from_the_instance_list_by_fingerprint_when_the_project_lacks_the_key() {
+        let mut io = Gitlab {
+            project_keys: vec![],
+            all_keys: Some(vec![
+                json!({"id": 5, "key": "ssh-ed25519 OTHER x"}),
+                json!({"id": 42, "key": "ssh-ed25519 AAAAkey comment"}),
+            ]),
+            seen: vec![],
+        };
+        let mut id = None;
+        assert!(lookup_key_id(&mut io, &gitlab_dest(), PUB, &mut id));
+        assert_eq!(id, Some(42));
+    }
+
+    #[test]
+    fn a_refused_instance_list_leaves_the_id_unknown_and_a_project_that_has_the_key_teaches_it() {
+        let mut io = Gitlab {
+            project_keys: vec![],
+            all_keys: None,
+            seen: vec![],
+        };
+        let mut id = None;
+        assert!(!lookup_key_id(&mut io, &gitlab_dest(), PUB, &mut id));
+        assert_eq!(id, None);
+        io.project_keys = vec![json!({"id": 9, "key": PUB, "can_push": true})];
+        assert_eq!(
+            ensure_key(&mut io, &gitlab_dest(), "7", PUB, &mut id).unwrap(),
+            "key-present"
+        );
+        assert_eq!(id, Some(9), "the id found on one project serves the others");
     }
 }

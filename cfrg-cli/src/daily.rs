@@ -58,7 +58,7 @@ pub struct Options {
     /// Writes of one `settings` run and pushes of one `wiki` run (bounded per run).
     #[arg(long, default_value_t = 20)]
     max_writes: usize,
-    /// The id of the wiki deploy key on GitLab (not a secret; optional).
+    /// Override of the wiki deploy key's id on GitLab (it is otherwise found by the key's fingerprint).
     #[arg(long, env = "DAILY_WIKI_KEY_ID")]
     wiki_key_id: Option<u64>,
     /// Look only: every step plans or tests, nothing is written.
@@ -242,8 +242,7 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         ]);
     }
     let settings = gated("settings", settings_args);
-    // The id of the deploy key on GitLab is no secret: an optional setting of the job (DAILY_WIKI_KEY_ID); without it a copy that needs the
-    // key enabled by id reports that row, every other copy works (the key is found or created by its own fingerprint).
+    // The id of the wiki deploy key on GitLab is found at run time by the key's fingerprint (the mounted public half); DAILY_WIKI_KEY_ID only overrides it.
     let wiki = match (credential(dir, "wiki_deploy_key"), credential(dir, "wiki_known_hosts")) {
         (Some(_), Some(_)) => {
             let mut extra = vec![

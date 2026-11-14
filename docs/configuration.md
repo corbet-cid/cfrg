@@ -177,7 +177,7 @@ scheduler you provide (cron, a systemd timer, a Kubernetes CronJob); cfrg has no
 |---|---|---|
 | `native` | `cfrg native --operation reconcile --apply` (plan when `--dry`) | `forgejo-token`; `cfrg native` reads the provider tokens from the same files (`gitlab-token`; GitHub: `github-token` or an installation token minted from `github-app-id` + `github-app-key` per owner; `bitbucket-token`, without it Bitbucket is skipped with one log line) |
 | `settings` | `cfrg native --operation settings --apply`, at most `--max-writes` copies | `forgejo-token` and the provider files above; `<gate-dir>/paused` must exist (the GitHub write gate's pause folder, `<gate-dir>/kill-switch` its kill switch) |
-| `wiki` | `cfrg native --operation wiki --apply` | `forgejo-token`, the provider files above, `wiki_deploy_key` (+ `wiki_deploy_key.pub`), `wiki_known_hosts`; the GitLab deploy key id is the optional setting `DAILY_WIKI_KEY_ID` |
+| `wiki` | `cfrg native --operation wiki --apply` | `forgejo-token`, the provider files above, `wiki_deploy_key` (+ `wiki_deploy_key.pub`), `wiki_known_hosts`; the GitLab deploy key id is found by the key's fingerprint at run time (`DAILY_WIKI_KEY_ID` only overrides) |
 | `sweep` | `cfrg relay sweep` | the database files `host port dbname username password` |
 | `gitlab-key` | the script named by `--gitlab-key-script` (not shipped with cfrg) | `gitlab_token`, `forgejo_push` and the database files |
 | `copy` | the script named by `--copy-script` (the very one `hook_commands.copy` runs per push), without a repository: the catch-up for a missed push or new-repository event (`COPY_DRY=1` when `--dry`) | the script file (a no-op when it is not mounted) |
