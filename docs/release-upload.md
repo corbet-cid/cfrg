@@ -41,3 +41,5 @@ when the sync ends with exit 0. Open intents are finished on service start and b
 idempotent ("identical, read back"), so a re-run is safe. There is no queue and no timer beyond that.
 
 The push of this repository to its git copy is a serve event too (`/hooks/copy`, workloads `forge-bridge/hooks`): see [deployment](deployment.md).
+
+How the git copy is kept: [deployment](deployment.md).
