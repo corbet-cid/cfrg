@@ -288,37 +288,33 @@ mod tests {
 
     #[test]
     fn two_concurrent_writers_on_one_namespace_are_at_least_a_gap_apart() {
-        use std::{
-            sync::{Arc, Mutex},
-            time::Instant,
-        };
+        use std::sync::{Arc, Mutex};
+        // Deterministic: every writer claims at the SAME logical second from its own thread, so the waits the store hands out ARE the
+        // schedule (a writer that sleeps its wait wakes at now + wait). No wall clock, no sleep: the spacing is asserted on the claims.
+        const NOW: u64 = 1_000;
+        const GAP: u64 = 1;
         let store = Arc::new(Mutex::new(MemStore::default()));
-        let start = Instant::now();
-        let times: Vec<_> = (0..3)
+        let mut waits: Vec<u64> = (0..3)
             .map(|_| {
                 let store = Arc::clone(&store);
                 std::thread::spawn(move || {
-                    let clock = SystemClock;
-                    // The claim is the only locked step; the wait is slept once, outside the lock.
-                    let wait = store
+                    store
                         .lock()
                         .unwrap()
-                        .pace_claim(Forge::Forgejo, "org", clock.now(), 1, None)
-                        .unwrap();
-                    clock.sleep(wait);
-                    start.elapsed()
+                        .pace_claim(Forge::Forgejo, "org", NOW, GAP, None)
+                        .unwrap()
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
             .map(|t| t.join().unwrap())
             .collect();
-        let mut times = times;
-        times.sort();
-        for pair in times.windows(2) {
+        waits.sort_unstable();
+        assert_eq!(waits[0], 0, "the first writer goes at once: {waits:?}");
+        for pair in waits.windows(2) {
             assert!(
-                pair[1] - pair[0] >= std::time::Duration::from_millis(900),
-                "{times:?}"
+                pair[1] - pair[0] >= GAP,
+                "writers closer than the gap: {waits:?}"
             );
         }
     }
