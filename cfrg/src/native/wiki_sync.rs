@@ -346,7 +346,8 @@ impl Count {
 
 /// Resolves the name of a credential (the placement's `token_env`) to its value. The command
 /// line reads the environment; `cfrg-serve` reads its credentials directory.
-pub type Secrets<'a> = &'a dyn Fn(&str) -> Result<String>;
+/// Token by the endpoint's `token_env` name and the `owner/repo` it is used for (a GitHub App token is per owner).
+pub type Secrets<'a> = &'a dyn Fn(&str, &str) -> Result<String>;
 
 pub struct WikiOptions {
     pub key: Option<PathBuf>,
@@ -410,7 +411,7 @@ impl<'a> Session<'a> {
             &origin,
             format!(
                 "Authorization: token {}",
-                secrets(&placement.source.token_env)?
+                secrets(&placement.source.token_env, "")?
             ),
         );
         Ok(Self {
@@ -556,7 +557,8 @@ impl<'a> Session<'a> {
                 format!(
                     "Authorization: Basic {}",
                     base64(
-                        format!("oauth2:{}", (self.secrets)(&dest.endpoint.token_env)?).as_bytes()
+                        format!("oauth2:{}", (self.secrets)(&dest.endpoint.token_env, path)?)
+                            .as_bytes()
                     )
                 ),
             ))
@@ -698,7 +700,7 @@ impl<'a> Session<'a> {
                     base64(
                         format!(
                             "x-access-token:{}",
-                            (self.secrets)(&dest.endpoint.token_env)?
+                            (self.secrets)(&dest.endpoint.token_env, path)?
                         )
                         .as_bytes()
                     )

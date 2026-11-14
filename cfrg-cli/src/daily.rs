@@ -2,7 +2,7 @@
 //!
 //! Six steps, in this order, each ALONE: a failing step is logged and the next one still runs; the command exits non-zero when any step
 //! failed, so the job fails. (Renovate is not one of them: run it as its own job.) A step whose code or credential is not ready is a NO-OP that says so (and succeeds):
-//!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when the credential file `native-env` (KEY=VALUE lines) is there
+//!   native       `cfrg native` drift reconcile (`--operation plan` when dry), when `forgejo-token` is there (it reads the per-credential files of the credentials directory like the relay)
 //!   settings     `cfrg native --operation settings --apply` (copy settings, bounded by `--max-writes`), behind the GitHub gate's kill switch and pause folder
 //!   wiki         `cfrg native --operation wiki --apply` (copy wikis, bounded pushes), same gate files and the wiki deploy key
 //!   sweep        `cfrg relay sweep` (dry: only objects pending for ten years, a connection test of the database login)
@@ -58,6 +58,9 @@ pub struct Options {
     /// Writes of one `settings` run and pushes of one `wiki` run (bounded per run).
     #[arg(long, default_value_t = 20)]
     max_writes: usize,
+    /// The id of the wiki deploy key on GitLab (not a secret; optional).
+    #[arg(long, env = "DAILY_WIKI_KEY_ID")]
+    wiki_key_id: Option<u64>,
     /// Look only: every step plans or tests, nothing is written.
     #[arg(long, env = "DAILY_DRY_RUN")]
     dry: bool,
@@ -146,16 +149,6 @@ fn database(dir: &Path, ca: &Path) -> Option<String> {
 }
 
 /// `KEY=VALUE` lines of a credential file, for the child's environment only.
-fn env_file(dir: &Path, name: &str) -> Option<BTreeMap<String, String>> {
-    let text = credential(dir, name)?;
-    Some(
-        text.lines()
-            .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-            .collect(),
-    )
-}
-
 pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
     let dir = &options.credentials_dir;
     let dry = options.dry;
@@ -173,19 +166,26 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             dir.display().to_string(),
         );
     };
-    let native = match env_file(dir, "native-env") {
-        None => Action::Noop("the provider credentials of cfrg native (native-env) are not in the credentials directory yet".into()),
-        Some(mut env) => {
-            common(&mut env);
-            let mut args: Vec<String> = ["native", "--placement"].map(String::from).to_vec();
-            args.push(options.placement.display().to_string());
-            args.extend(["--state".into(), options.state.display().to_string()]);
-            if dry {
-                args.extend(["--operation".into(), "plan".into()]);
-            } else {
-                args.extend(["--operation".into(), "reconcile".into(), "--apply".into()]);
-            }
-            Action::Command { program: exe.to_owned(), args, env }
+    // `cfrg native` reads the same per-credential files as the relay and serve (forgejo-token, gitlab-token, the GitHub App's github-app-id and
+    // github-app-key; a Bitbucket credential is skipped by native itself with one log line); the step needs the Forgejo token at least.
+    let missing_native = credential(dir, "forgejo-token").is_none();
+    let native = if missing_native {
+        Action::Noop("refused: forgejo-token is not in the credentials directory".into())
+    } else {
+        let mut env = BTreeMap::new();
+        common(&mut env);
+        let mut args: Vec<String> = ["native", "--placement"].map(String::from).to_vec();
+        args.push(options.placement.display().to_string());
+        args.extend(["--state".into(), options.state.display().to_string()]);
+        if dry {
+            args.extend(["--operation".into(), "plan".into()]);
+        } else {
+            args.extend(["--operation".into(), "reconcile".into(), "--apply".into()]);
+        }
+        Action::Command {
+            program: exe.to_owned(),
+            args,
+            env,
         }
     };
     // settings and wiki: the copy settings and the copy wikis, only behind the gate's files (kill switch, pause folder) and, for the wiki, the deploy key.
@@ -198,9 +198,12 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         ))
     };
     let gated = |operation: &str, extra: Vec<String>| -> Action {
-        let Some(mut env) = env_file(dir, "native-env") else {
-            return Action::Noop("the provider credentials of cfrg native (native-env) are not in the credentials directory yet".into());
-        };
+        if missing_native {
+            return Action::Noop(
+                "refused: forgejo-token is not in the credentials directory".into(),
+            );
+        }
+        let mut env = BTreeMap::new();
         if let Some(why) = &gate_missing {
             return Action::Noop(format!("refused: {why}"));
         }
@@ -239,21 +242,24 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
         ]);
     }
     let settings = gated("settings", settings_args);
-    let wiki = match (credential(dir, "wiki_deploy_key"), credential(dir, "wiki_known_hosts"), credential(dir, "wiki_key_id").and_then(|id| id.parse::<u64>().ok())) {
-        (Some(_), Some(_), Some(id)) => gated(
-            "wiki",
-            vec![
+    // The id of the deploy key on GitLab is no secret: an optional setting of the job (DAILY_WIKI_KEY_ID); without it a copy that needs the
+    // key enabled by id reports that row, every other copy works (the key is found or created by its own fingerprint).
+    let wiki = match (credential(dir, "wiki_deploy_key"), credential(dir, "wiki_known_hosts")) {
+        (Some(_), Some(_)) => {
+            let mut extra = vec![
                 "--wiki-key".into(),
                 dir.join("wiki_deploy_key").display().to_string(),
                 "--wiki-known-hosts".into(),
                 dir.join("wiki_known_hosts").display().to_string(),
-                "--wiki-key-id".into(),
-                id.to_string(),
                 "--wiki-max-pushes".into(),
                 options.max_writes.to_string(),
-            ],
-        ),
-        _ => Action::Noop("refused: the wiki credentials (wiki_deploy_key, wiki_known_hosts, wiki_key_id) are not all in the credentials directory".into()),
+            ];
+            if let Some(id) = options.wiki_key_id {
+                extra.extend(["--wiki-key-id".into(), id.to_string()]);
+            }
+            gated("wiki", extra)
+        }
+        _ => Action::Noop("refused: the wiki credentials (wiki_deploy_key, wiki_known_hosts) are not both in the credentials directory".into()),
     };
     let sweep = match database(dir, &options.ca) {
         None => Action::Noop("the database credentials (host port dbname username password) are not in the credentials directory".into()),
@@ -458,6 +464,7 @@ mod tests {
             serve_config: "/nonexistent-serve-config.json".into(),
             copy_script: "/nonexistent-copy.sh".into(),
             max_writes: 20,
+            wiki_key_id: None,
             dry,
         }
     }
@@ -490,7 +497,7 @@ mod tests {
             ("dbname", "forge_bridge"),
             ("username", "u"),
             ("password", "p'w\\x"),
-            ("native-env", "A=1\nB=2\n"),
+            ("forgejo-token", "t"),
             ("gitlab_token", "g"),
             ("forgejo_push", "f"),
             ("gitlab_token", "g"),
@@ -531,19 +538,22 @@ mod tests {
             args.windows(2).any(|w| w == ["--operation", "plan"])
                 && !args.contains(&"--apply".to_string())
         );
-        assert_eq!(env["A"], "1");
+        assert_eq!(
+            env["CFRG_CREDENTIALS_DIRECTORY"],
+            dir.path().display().to_string()
+        );
+        assert!(
+            !env.keys().any(|k| k.ends_with("TOKEN")),
+            "no token travels in the environment"
+        );
     }
 
     fn gate_world(dir: &Path, gate: &Path, wiki: bool) {
-        for (k, v) in [("native-env", "A=1"), ("host", "db")] {
+        for (k, v) in [("forgejo-token", "t"), ("host", "db")] {
             fs::write(dir.join(k), v).unwrap();
         }
         if wiki {
-            for (k, v) in [
-                ("wiki_deploy_key", "k"),
-                ("wiki_known_hosts", "h"),
-                ("wiki_key_id", "77"),
-            ] {
+            for (k, v) in [("wiki_deploy_key", "k"), ("wiki_known_hosts", "h")] {
                 fs::write(dir.join(k), v).unwrap();
             }
         }
@@ -612,7 +622,7 @@ mod tests {
         );
         assert!(
             args.windows(2).any(|w| w == ["--wiki-max-pushes", "20"])
-                && args.windows(2).any(|w| w == ["--wiki-key-id", "77"])
+                && !args.contains(&"--wiki-key-id".to_string())
         );
         // dry: neither writes
         o.dry = true;
@@ -651,7 +661,7 @@ mod tests {
     #[test]
     fn a_real_run_reconciles_and_applies() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("native-env"), "A=1").unwrap();
+        fs::write(dir.path().join("forgejo-token"), "t").unwrap();
         let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
         let Action::Command { args, .. } = &steps[0].action else {
             panic!()

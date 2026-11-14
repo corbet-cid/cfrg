@@ -3,32 +3,42 @@
 //! plan. The work is `cfrg::native::wiki_sync`, shared with `cfrg-serve`.
 use super::Options;
 use cfrg::{
-    native::{
-        http::Http,
-        wiki_sync::{Session, WikiOptions},
-        Placement,
-    },
+    native::wiki_sync::{Session, WikiOptions},
     Result,
 };
-use std::{fs, time::Duration};
-
-fn secret(env: &str) -> Result<String> {
-    cfrg::native::env_name(env)?;
-    std::env::var(env)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| format!("{env} is not set").into())
-}
+use std::{os::unix::fs::PermissionsExt, time::Duration};
 
 pub fn run(options: &Options) -> Result<()> {
-    let placement = Placement::from_document(&fs::read(&options.placement)?)?;
+    let creds = super::creds::Creds::new(options.credentials_dir.clone());
+    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
-    let mut io = Http::open(&options.state, options.apply)?;
+    let mut io = creds.open(&options.state, options.apply)?;
+    // ssh refuses a key file the group can read, and a mounted Secret is: a push uses a private copy (0600) of the key and the host pins.
+    let private = tempfile::tempdir()?;
+    let (mut key, mut known_hosts) = (options.wiki_key.clone(), options.wiki_known_hosts.clone());
+    if options.apply {
+        if let (Some(k), Some(h)) = (&options.wiki_key, &options.wiki_known_hosts) {
+            let (pk, ph) = (
+                private.path().join("key"),
+                private.path().join("known_hosts"),
+            );
+            for (from, to) in [
+                (k.clone(), pk.clone()),
+                (k.with_extension("pub"), pk.with_extension("pub")),
+                (h.clone(), ph.clone()),
+            ] {
+                std::fs::copy(&from, &to).map_err(|e| format!("{}: {e}", from.display()))?;
+                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))?;
+            }
+            (key, known_hosts) = (Some(pk), Some(ph));
+        }
+    }
+    let secrets = |env: &str, path: &str| creds.token(env, path);
     let mut session = Session::new(
         &placement,
         WikiOptions {
-            key: options.wiki_key.clone(),
-            known_hosts: options.wiki_known_hosts.clone(),
+            key,
+            known_hosts,
             max_pushes: options.wiki_max_pushes,
             push_gap: Duration::from_secs(options.wiki_push_gap_secs),
             provider: options.provider.clone(),
@@ -37,7 +47,7 @@ pub fn run(options: &Options) -> Result<()> {
             github_kill_switch: options.github_kill_switch.clone(),
             github_paused_dir: options.github_paused_dir.clone(),
         },
-        &secret,
+        &secrets,
     )?;
     let listed = cfgj::native::list_repositories(&mut io, &placement.source)?;
     for repo in &listed {

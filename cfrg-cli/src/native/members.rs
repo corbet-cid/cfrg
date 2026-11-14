@@ -9,10 +9,7 @@ use cfrg::{
     access::IdentityMap,
     contributed::Contributed,
     copy_access::{self, Copy},
-    native::{
-        http::{Http, Pacing},
-        Placement, Provider,
-    },
+    native::{http::Pacing, Provider},
     Result,
 };
 use serde_json::{json, Value};
@@ -24,9 +21,10 @@ pub fn run(options: &Options) -> Result<()> {
             "Member sync is read-only until the identity table is decided and reviewed".into(),
         );
     }
-    let placement = Placement::from_document(&std::fs::read(&options.placement)?)?;
+    let creds = super::creds::Creds::new(options.credentials_dir.clone());
+    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
-    let mut io = Http::open(&options.state, false)?;
+    let mut io = creds.open(&options.state, false)?;
     // Our own forge: one read a second.
     io.set_pacing(Pacing {
         read: 1,

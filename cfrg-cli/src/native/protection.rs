@@ -5,9 +5,9 @@ use super::Options;
 use cfrg::{
     contributed::Contributed,
     native::{
-        http::{Http, Transport},
+        http::Transport,
         settings::{Protection, Target},
-        Endpoint, Placement, Provider,
+        Endpoint, Provider,
     },
     Result,
 };
@@ -53,10 +53,11 @@ pub fn run(options: &Options) -> Result<()> {
         .as_ref()
         .ok_or("--copies-from REPORT (a settings run) is required")?;
     let report: Value = serde_json::from_slice(&std::fs::read(file)?)?;
-    let placement = Placement::from_document(&std::fs::read(&options.placement)?)?;
+    let creds = super::creds::Creds::new(options.credentials_dir.clone());
+    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let contributed = Contributed::from_placement(&placement, &[])?;
-    let mut io = Http::open(&options.state, false)?;
+    let mut io = creds.open(&options.state, false)?;
     let primaries: BTreeMap<String, cfgj::native::Primary> =
         cfgj::native::list_primaries(&mut io, &placement.source)?
             .into_iter()

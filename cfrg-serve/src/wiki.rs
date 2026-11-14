@@ -25,7 +25,7 @@ pub fn sync(cfg: &Config, creds: &Credentials, forgejo_id: &str) -> Result<Value
     // The placement names its credentials by `token_env`; the credentials directory holds them under the bridge's names.
     let resolve = {
         let creds = creds.clone();
-        move |name: &str| -> cfrg::Result<String> {
+        move |name: &str, _path: &str| -> cfrg::Result<String> {
             let key = match name {
                 "CFRG_FORGEJO_TOKEN" => "wiki_forgejo_token",
                 "CFRG_GITLAB_TOKEN" => "gitlab_token",

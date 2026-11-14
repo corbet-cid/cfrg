@@ -97,8 +97,8 @@ impl State {
     }
 }
 
-/// Resolves a token by the endpoint's `token_env` name.
-pub type SecretFn = Box<dyn Fn(&str) -> Result<String> + Send>;
+/// Resolves a token by the endpoint's `token_env` name and the request path (a GitHub App token is per owner).
+pub type SecretFn = Box<dyn Fn(&str, &str) -> Result<String>>;
 
 pub struct Http {
     state_path: PathBuf,
@@ -293,7 +293,7 @@ impl Http {
         }
         let mut env = environment();
         let secret = match &self.secrets {
-            Some(resolve) => resolve(&request.endpoint.token_env)?,
+            Some(resolve) => resolve(&request.endpoint.token_env, &request.path)?,
             None => token(&request.endpoint.token_env)?,
         };
         env.insert("CFRG_NATIVE_TOKEN".into(), secret.into());

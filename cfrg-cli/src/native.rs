@@ -1,4 +1,5 @@
 mod copy;
+mod creds;
 mod members;
 mod protection;
 mod settings;
@@ -27,6 +28,10 @@ pub struct Options {
     /// derived from Forgejo's own mirror list and the placement (design 3.7).
     #[arg(long)]
     state: PathBuf,
+    /// The directory of the credential files (`forgejo-token`, `gitlab-token`, `github-token` or the App's `github-app-id` and `github-app-key`, `bitbucket-token`);
+    /// a name not found there falls back to the environment variable of the endpoint.
+    #[arg(long, env = "CFRG_CREDENTIALS_DIRECTORY")]
+    credentials_dir: Option<PathBuf>,
     #[arg(long)]
     repository: Option<String>,
     /// Reconcile one provider without changing other declared destinations.
@@ -154,6 +159,7 @@ pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         wiki_key: None,
         wiki_known_hosts: None,
         wiki_key_id: None,
+        credentials_dir: None,
         wiki_max_pushes: 20,
         wiki_push_gap_secs: 2,
     };
@@ -183,6 +189,7 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
         wiki_key: None,
         wiki_known_hosts: None,
         wiki_key_id: None,
+        credentials_dir: None,
         wiki_max_pushes: 20,
         wiki_push_gap_secs: 2,
     };
@@ -192,7 +199,8 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
 }
 
 fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
-    let placement = Placement::from_document(&fs::read(&options.placement)?)?;
+    let creds = creds::Creds::new(options.credentials_dir.clone());
+    let placement = creds.placement(&fs::read(&options.placement)?)?;
     placement.validate()?;
     if options.apply
         && matches!(
@@ -215,7 +223,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     {
         return Err("Selected repository is not declared".into());
     }
-    let mut io = Http::open(&options.state, options.apply)?;
+    let mut io = creds.open(&options.state, options.apply)?;
     let mut report = Vec::new();
     let mut incomplete = false;
     if copy_only && placement.copy.is_none() {

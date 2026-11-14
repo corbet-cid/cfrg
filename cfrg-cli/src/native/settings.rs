@@ -13,11 +13,11 @@ use cfrg::{
     contributed::Contributed,
     native::{
         github_copy_owned,
-        http::{Http, Transport},
+        http::Transport,
         links::{self, PublicGithub},
         owned_by,
         settings::{self, Field, Observed, Plan, Target},
-        Endpoint, Placement, Provider,
+        Endpoint, Provider,
     },
     Result,
 };
@@ -93,7 +93,8 @@ fn field_name(field: Field) -> String {
 }
 
 pub fn run(options: &Options) -> Result<()> {
-    let placement = Placement::from_document(&std::fs::read(&options.placement)?)?;
+    let creds = super::creds::Creds::new(options.credentials_dir.clone());
+    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let contributed = Contributed::from_placement(&placement, &[])?;
     let write = options.apply;
@@ -121,10 +122,11 @@ pub fn run(options: &Options) -> Result<()> {
                 .into(),
         );
     }
-    let mut io = Http::open(&options.state, write)?;
+    let mut io = creds.open(&options.state, write)?;
     let mut rows = Vec::new();
     let mut counts: BTreeMap<(String, String), Count> = BTreeMap::new();
     let mut incomplete = false;
+    let mut bitbucket_logged = false;
 
     let primaries = cfgj::native::list_primaries(&mut io, &placement.source)?;
     let mut stopped: BTreeMap<&'static str, String> = BTreeMap::new();
@@ -161,6 +163,13 @@ pub fn run(options: &Options) -> Result<()> {
         let mut mirrors_cache: Option<Vec<Value>> = None;
         for (provider, name, origin, token_env) in PROVIDERS {
             if options.provider.as_deref().is_some_and(|only| only != name) {
+                continue;
+            }
+            if provider == Provider::Bitbucket && !creds.available(token_env) {
+                if !bitbucket_logged {
+                    eprintln!("Bitbucket: skipped: no Bitbucket credential mounted");
+                    bitbucket_logged = true;
+                }
                 continue;
             }
             let dest = declared.and_then(|r| {
@@ -551,6 +560,7 @@ mod tests {
         Options {
             placement,
             state: dir.join("state.json"),
+            credentials_dir: None,
             repository: None,
             provider: provider.map(String::from),
             existing_only: false,
