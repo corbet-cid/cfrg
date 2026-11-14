@@ -247,6 +247,8 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             let mut env = BTreeMap::new();
             common(&mut env);
             env.insert("CFRG_RELAY_DATABASE".into(), url);
+            // the relay reads its provider credentials from $CREDENTIALS_DIRECTORY (docs/relay.md); without it every forge was refused
+            env.insert("CREDENTIALS_DIRECTORY".into(), dir.display().to_string());
             let mut args = vec!["relay".to_owned(), "sweep".into()];
             if dry {
                 args.extend(["--older-than".into(), "315360000".into()]);
@@ -471,6 +473,11 @@ mod tests {
         assert_eq!(args, &["relay", "sweep", "--older-than", "315360000"]);
         assert!(env["CFRG_RELAY_DATABASE"].contains("password='p\\'w\\\\x'"));
         assert!(env["CFRG_RELAY_DATABASE"].contains("sslmode=verify-full"));
+        assert_eq!(
+            env["CREDENTIALS_DIRECTORY"],
+            dir.path().display().to_string(),
+            "the relay finds its provider credentials"
+        );
         let Action::Command { args, env, .. } = &steps[0].action else {
             unreachable!()
         };
