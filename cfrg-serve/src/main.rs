@@ -84,7 +84,7 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
         .map(|k| (*k).to_owned())
         .collect();
     let (github, gitlab) = (
-        creds.get("github_token").is_some(),
+        creds.get("github_token").is_some() || creds.get("github_app_key").is_some(),
         creds.get("gitlab_token").is_some(),
     );
     let relay: Option<std::sync::Arc<dyn cfrg_serve::relay::Relay>> = match &config.relay {

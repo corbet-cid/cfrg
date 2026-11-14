@@ -37,6 +37,35 @@ async fn asset_list(
     Ok(far)
 }
 
+/// The bearer for the copy: a plain `github-token` if one is mounted, else the GitHub App's installation token for the
+/// copy's owner (the App is installed per organisation; `github-app-id` and `github-app-key`). `None`: no credential at all.
+async fn github_token(ctx: &Ctx, api: &str, repo: &str) -> Result<Option<String>, String> {
+    if let Some(t) = ctx.creds.get("github_token") {
+        return Ok(Some(t.to_owned()));
+    }
+    let (Some(id), Some(key)) = (
+        ctx.creds.get("github_app_id"),
+        ctx.creds.get("github_app_key"),
+    ) else {
+        return Ok(None);
+    };
+    let app_id: u64 = id
+        .trim()
+        .parse()
+        .map_err(|_| "github-app-id is not a number".to_owned())?;
+    let creds = cghb::relay::AppCredentials {
+        app_id,
+        private_key_pem: cghb::relay::Redacted::new(key),
+    };
+    let driver = cghb::relay::GithubRelay::new(&creds, api).map_err(|e| e.to_string())?;
+    let target = cghb::relay::Repo::parse(repo).map_err(|e| e.to_string())?;
+    let t = driver
+        .installation_token(&target)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(t.expose().to_owned()))
+}
+
 pub async fn sync(ctx: &Ctx, primary: &mut Primary, dry: bool) -> Result<CopyResult, Stop> {
     let gh = &ctx.cfg.github;
     let repo = ctx.cfg.copy_path("github", &primary.repo);
@@ -49,11 +78,15 @@ pub async fn sync(ctx: &Ctx, primary: &mut Primary, dry: bool) -> Result<CopyRes
             ),
         ));
     }
-    let Some(token) = ctx.creds.get("github_token") else {
-        return Ok(result(
-            "blocked_ci",
-            "no GitHub credential in this deployment",
-        ));
+    let token = match github_token(ctx, &gh.api, &repo).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Ok(result(
+                "blocked_ci",
+                "no GitHub credential in this deployment",
+            ))
+        }
+        Err(why) => return Ok(result("failed", why)),
     };
     let bearer = format!("Bearer {token}");
     let headers = [
