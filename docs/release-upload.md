@@ -22,5 +22,20 @@ The request is a hint: the module is told `OWNER/REPO TAG` and reads everything 
 
 Statuses: `in_sync`, `synced`, `no_copy`, `skipped`, `refused` (done); `pending_tag`, `blocked_ci`, `rate_limited` (exit
 75: incomplete, not a fault); `failed` (exit 1). Bitbucket is reported `skipped` (git and tags only). There is no retry
-loop: the next event completes a stopped copy. A repository is uploaded only when its GitHub organisation or GitLab group
+loop of its own: the next event, the start of the service or the daily run completes a stopped copy (see Release intents). A repository is uploaded only when its GitHub organisation or GitLab group
 is listed in the configuration (`github.orgs`, `gitlab.groups`; [configuration](configuration.md)).
+
+## GitHub credential
+
+The GitHub copy takes a plain `github-token` if one is mounted, otherwise the installation token of the GitHub App
+(`github-app-id`, `github-app-key`) for the organisation that owns the copy: the App is installed per organisation, and
+the installation is resolved with the App JWT and cached in memory (`cghb`). Nothing is configured per organisation.
+
+## Release intents
+
+A restart (any Secret change restarts the pod) must not lose a release in flight, and no second release event arrives to
+retry it. The route therefore writes an intent (table `release_intents` in the bridge database, `repo`, `tag`, `since`)
+BEFORE it answers 202; when the intent cannot be written it answers 503 and the forge redelivers. The intent is cleared
+when the sync ends with exit 0. Open intents are finished on service start and by the daily run
+(`cfrg-serve release-resume`, the `releases` step of `cfrg daily`; exit 1 while one stays open). The upload itself is
+idempotent ("identical, read back"), so a re-run is safe. There is no queue and no timer beyond that.
