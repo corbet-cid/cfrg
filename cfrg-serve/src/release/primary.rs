@@ -61,6 +61,14 @@ impl Primary {
                 "the repository is not readable on the primary (HTTP {status}; a private one needs the forge read token)"
             )));
         };
+        // A moved or renamed repository answers at its old path through Forgejo's redirect: the copies are named by the CURRENT path
+        // (an intent journaled before the move must not look for the copy at the old one).
+        if let Some(current) = info["full_name"]
+            .as_str()
+            .filter(|n| !n.eq_ignore_ascii_case(&self.repo))
+        {
+            self.repo = current.to_owned();
+        }
         if info["mirror"].as_bool() == Some(true) {
             return Ok(Some(
                 "a pull mirror of someone else's project: releases of contributed projects are not relayed (R11)".into(),

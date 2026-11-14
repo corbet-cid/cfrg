@@ -361,6 +361,13 @@ fn forgejo(st: &Arc<Mutex<State>>, r: &Req) -> Resp {
     {
         return bytes_resp(st.dispatch_status, vec![]);
     }
+    if p == "/api/v1/repos/example-fsl/oldccvl" {
+        // Forgejo answers a moved repository at its old path (redirect) with the current full name.
+        return json_resp(
+            200,
+            json!({"mirror": st.mirror, "private": false, "full_name": "example-fsl/ccvl"}),
+        );
+    }
     if p == "/api/v1/repos/example-fsl/ccvl" {
         return json_resp(200, json!({"mirror": st.mirror, "private": false}));
     }

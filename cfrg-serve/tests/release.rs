@@ -439,3 +439,15 @@ async fn a_release_without_assets_syncs_its_notes_and_reruns_as_a_noop() {
     assert_eq!(statuses(&again), ["in_sync", "in_sync"], "{again:?}");
     assert_eq!((w.gh.writes().len(), w.gl.writes().len()), writes);
 }
+
+#[tokio::test]
+async fn a_release_journaled_under_the_old_path_of_a_moved_repository_syncs_to_the_copies_of_the_current_path(
+) {
+    let w = World::new().await;
+    let out = cfrg_serve::release::sync(&w.ctx, "example-fsl/oldccvl", &w.tag, false).await;
+    assert_eq!(out.exit, 0, "{out:?}");
+    assert!(
+        !w.gh_stored().is_empty(),
+        "the copy at the current path got the assets"
+    );
+}

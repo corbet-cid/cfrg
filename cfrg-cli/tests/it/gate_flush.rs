@@ -611,7 +611,8 @@ fn a_copy_only_branch_is_pruned_next_to_a_surviving_relay_head_pull_ref_tag_and_
     assert_eq!(dry["flush"][0]["verdict"], "would push", "{dry}");
     assert_eq!(
         dry["flush"][0]["pruned"],
-        serde_json::json!(["refs/heads/stale"])
+        serde_json::json!(["refs/heads/stale", "refs/tags/gh-only"]),
+        "a tag that exists only on the copy is pruned like a copy-only branch (R42)"
     );
     assert!(
         f.dest_refs().contains(&"refs/heads/stale".to_string()),
@@ -622,7 +623,7 @@ fn a_copy_only_branch_is_pruned_next_to_a_surviving_relay_head_pull_ref_tag_and_
     assert_eq!(done["flush"][0]["verdict"], "pushed", "{done}");
     assert_eq!(
         done["flush"][0]["pruned"],
-        serde_json::json!(["refs/heads/stale"])
+        serde_json::json!(["refs/heads/stale", "refs/tags/gh-only"])
     );
     assert_eq!(
         f.dest_refs(),
@@ -631,10 +632,9 @@ fn a_copy_only_branch_is_pruned_next_to_a_surviving_relay_head_pull_ref_tag_and_
             "refs/heads/legacy",
             "refs/heads/main",
             "refs/pull/1/head",
-            "refs/tags/gh-only",
             "refs/tags/v1",
         ],
-        "stale is gone; the relay head, the pull ref, the copy-only tag and the default branch survive"
+        "stale and the copy-only tag are gone; the relay head, the pull ref and the default branch survive"
     );
     assert_eq!(f.rev("dest/o/r.git", "main"), f.rev("src.git", "main"));
     assert_eq!(
@@ -643,7 +643,7 @@ fn a_copy_only_branch_is_pruned_next_to_a_surviving_relay_head_pull_ref_tag_and_
         "the relay head is untouched"
     );
 
-    // What is left over (a copy-only tag, the default branch, the relay head) does not keep the repository out of sync.
+    // What is left over (the default branch, the relay head) does not keep the repository out of sync.
     let again = f.flush();
     assert_eq!(again["flush"][0]["verdict"], "in sync, dequeued", "{again}");
     assert_eq!(f.status()["pushes"]["hour"], 1);
@@ -943,7 +943,8 @@ fn a_copy_only_branch_that_moved_after_the_plan_is_not_deleted() {
     assert_eq!(second["flush"][0]["verdict"], "pushed", "{second}");
     assert_eq!(
         f.dest_refs(),
-        ["refs/heads/main", "refs/tags/spare", "refs/tags/v1"]
+        ["refs/heads/main", "refs/tags/v1"],
+        "the copy-only tag `spare` went with the push (R42)"
     );
     assert_eq!(f.rev("dest/o/r.git", "main"), f.rev("src.git", "main"));
 }
