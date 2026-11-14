@@ -451,3 +451,19 @@ async fn a_release_journaled_under_the_old_path_of_a_moved_repository_syncs_to_t
         "the copy at the current path got the assets"
     );
 }
+
+/// An unreadable Actions setting fails closed and says why; it is never reported as "Actions is on".
+#[tokio::test]
+async fn an_unreadable_actions_setting_fails_closed_with_its_real_reason() {
+    let w = World::new().await;
+    w.st.lock().unwrap().g_actions_status = 403;
+    let out = w.sync(false).await;
+    assert_eq!(status_of(&out, "github"), "blocked_ci");
+    let detail = out.copies["github"].detail.clone();
+    assert!(
+        detail.contains("cannot read the Actions setting") && detail.contains("HTTP 403"),
+        "{detail}"
+    );
+    assert!(!detail.contains("Actions is on"), "{detail}");
+    assert!(w.gh.writes().is_empty());
+}

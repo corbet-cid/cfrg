@@ -255,11 +255,29 @@ pub async fn sync(ctx: &Ctx, primary: &mut Primary, dry: bool) -> Result<CopyRes
     let (status, perms) = api
         .get_json(&format!("/repos/{repo}/actions/permissions"))
         .await?;
-    if status != 200 || perms.is_none_or(|p| p["enabled"].as_bool() != Some(false)) {
+    // Fail closed with the real reason: an unreadable answer is never reported as "Actions is on".
+    if status != 200 {
         return Ok(result(
             "blocked_ci",
-            "Actions is on (or its state cannot be read) on the GitHub copy; R6/R7: nothing is written until CI is off there",
+            format!(
+                "cannot read the Actions setting of the GitHub copy (HTTP {status}); R6/R7: nothing is written until CI is provably off there"
+            ),
         ));
+    }
+    match perms.as_ref().and_then(|p| p["enabled"].as_bool()) {
+        Some(false) => {}
+        Some(true) => {
+            return Ok(result(
+                "blocked_ci",
+                "Actions is on for the GitHub copy; R6/R7: nothing is written until CI is off there",
+            ));
+        }
+        None => {
+            return Ok(result(
+                "blocked_ci",
+                "cannot read the Actions setting of the GitHub copy (the answer has no `enabled` field); R6/R7: nothing is written until CI is provably off there",
+            ));
+        }
     }
     if let Err(Stop::Contract(error)) = primary.verify_all().await {
         return Ok(result(

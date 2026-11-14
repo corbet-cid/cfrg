@@ -184,6 +184,8 @@ pub struct State {
     pub draft: bool,
     pub g_tags: HashMap<String, String>,
     pub g_actions: bool,
+    /// The HTTP status the Actions-permissions endpoint answers (200 normally).
+    pub g_actions_status: u16,
     pub g_releases: Vec<Value>,
     pub g_assets: HashMap<u64, BTreeMap<String, GAsset>>,
     pub g_limit: bool,
@@ -264,6 +266,7 @@ impl World {
             draft: false,
             g_tags: HashMap::from([(tag.clone(), COMMIT.to_owned())]),
             g_actions: false,
+            g_actions_status: 200,
             g_releases: vec![],
             g_assets: HashMap::new(),
             g_limit: false,
@@ -417,7 +420,14 @@ fn github(st: &Arc<Mutex<State>>, store_url: &str, r: &Req) -> Resp {
             }
         }
         ("GET", ["repos", "example-fsl", "ccvl", "actions", "permissions"]) => {
-            json_resp(200, json!({"enabled": st.g_actions}))
+            if st.g_actions_status == 200 {
+                json_resp(200, json!({"enabled": st.g_actions}))
+            } else {
+                json_resp(
+                    st.g_actions_status,
+                    json!({"message": "Resource not accessible by integration"}),
+                )
+            }
         }
         ("GET", ["repos", "example-fsl", "ccvl", "releases"]) => {
             json_resp(200, Value::Array(st.g_releases.clone()))
