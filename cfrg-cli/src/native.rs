@@ -105,6 +105,10 @@ enum Operation {
     /// default branch, archived state, issues, wiki, CI) in line with its Forgejo primary.
     /// Read-only without `--apply`; a copy that would have to become public is only reported.
     Settings,
+    /// Read-only. Prints the placement as every other operation sees it: the declared rows plus the rows derived from
+    /// the `derive` policy, with the `derive-hold` rows on standard error. For a consumer that has to know every repository's copies
+    /// (the content replication, the relay's allow list) without a hand list.
+    Resolve,
     /// R43: the membership the copies need (read or triage, never write), planned from the
     /// primary's members. Read-only until the identity table is decided.
     Members,
@@ -122,6 +126,7 @@ pub fn run(options: Options) -> Result<()> {
         Operation::Members => return members::run(&options),
         Operation::Protection => return protection::run(&options),
         Operation::Wiki => return wiki::run(&options),
+        Operation::Resolve => return resolve(&options),
         _ => {}
     }
     let (report, incomplete, result) = execute(&options)?;
@@ -141,6 +146,30 @@ pub fn run(options: Options) -> Result<()> {
 /// Read-only verification of the declared push mirrors of one repository (or
 /// all): source identity and the state of every mirror, nothing changed. Used
 /// by `cfrg serve`.
+/// `--operation resolve`: the declared and the derived rows as one placement document on standard output.
+fn resolve(options: &Options) -> Result<()> {
+    if options.apply {
+        return Err("Resolve is read-only".into());
+    }
+    let creds = creds::Creds::new(options.credentials_dir.clone());
+    let mut placement = creds.placement(&fs::read(&options.placement)?)?;
+    placement.validate()?;
+    let mut io = creds.open(&options.state, false)?;
+    for row in derive::apply(
+        &creds,
+        &mut placement,
+        &mut io,
+        options.repository.as_deref(),
+    )? {
+        if row["state"] == "derive-hold" {
+            eprintln!("{row}");
+        }
+    }
+    placement.validate()?;
+    println!("{}", serde_json::to_string(&placement)?);
+    Ok(())
+}
+
 pub fn verify(placement: &Path, state: &Path, repository: Option<&str>) -> Result<Value> {
     let options = Options {
         placement: placement.into(),

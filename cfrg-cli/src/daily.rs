@@ -11,6 +11,7 @@
 //!   copy         the git copy of every repository (the script of `/hooks/copy` without a repository): the catch-up for a missed push or new-repository event
 //!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
+//! `--operation resolve` of `cfrg native` prints the declared and derived rows as one placement.
 //! `--only native,settings --repository OWNER/REPO` runs those steps for one repository: `/hooks/place` (a repository placed on the forge's event).
 //!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
