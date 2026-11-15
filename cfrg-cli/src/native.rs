@@ -458,11 +458,19 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     let removable = removable(dest.absent, held);
                     if let Some(value) = &mirror {
                         if removable && options.apply && options.operation == Operation::Reconcile {
-                            api.delete(
-                                &mut io,
-                                value["remote_name"].as_str().ok_or("Missing remote name")?,
-                            )?;
-                            mirrors.retain(|m| m["remote_name"] != value["remote_name"]);
+                            let remote =
+                                value["remote_name"].as_str().ok_or("Missing remote name")?;
+                            match delete_mirror(&mut io, &api, &placement.source, repo, remote)? {
+                                Deleted::Yes => {
+                                    mirrors.retain(|m| m["remote_name"] != value["remote_name"]);
+                                }
+                                Deleted::Held(reason) => {
+                                    // One refused deletion must not stop the pass: record it and go on.
+                                    incomplete = true;
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"delete-held", "reason":reason}));
+                                    continue;
+                                }
+                            }
                         } else {
                             incomplete = true;
                         }
@@ -1089,6 +1097,62 @@ fn create_owned(
     Ok(value)
 }
 
+enum Deleted {
+    Yes,
+    Held(String),
+}
+
+/// Deletes one push mirror. Forgejo answers HTTP 423 (Locked) to every write on an ARCHIVED repository, so the
+/// archive is lifted for the call and put back afterwards (also when the deletion fails). Any other refusal of
+/// the deletion, or a repository that cannot be unarchived, is a hold for that one mirror, not an error of the step.
+fn delete_mirror(
+    io: &mut dyn Transport,
+    api: &cfgj::native::Mirrors,
+    endpoint: &cfrg::native::Endpoint,
+    repo: &Repository,
+    remote: &str,
+) -> Result<Deleted> {
+    let error = match api.delete(io, remote) {
+        Ok(()) => return Ok(Deleted::Yes),
+        Err(error) => error.to_string(),
+    };
+    if !error.contains("HTTP 423") {
+        return Ok(Deleted::Held(error));
+    }
+    let archive = |io: &mut dyn Transport, archived: bool| -> Result<u16> {
+        Ok(io
+            .send(cfrg::native::http::Request {
+                endpoint: endpoint.clone(),
+                auth: cfrg::native::http::Auth::Token,
+                method: "PATCH",
+                path: format!("/api/v1/repos/{}", repo.path),
+                body: Some(json!({"archived":archived})),
+                scope: format!("{}/api", endpoint.origin),
+                creation: false,
+            })?
+            .status)
+    };
+    let status = archive(io, false)?;
+    if status != 200 {
+        return Ok(Deleted::Held(format!(
+            "archived repository; unarchiving answered HTTP {status}"
+        )));
+    }
+    let result = api.delete(io, remote);
+    let restored = archive(io, true)?;
+    if restored != 200 {
+        return Err(format!(
+            "{} could not be archived again (HTTP {restored}); archive it by hand",
+            repo.path
+        )
+        .into());
+    }
+    Ok(match result {
+        Ok(()) => Deleted::Yes,
+        Err(error) => Deleted::Held(error.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1249,67 @@ mod tests {
         assert!(!same_host(&on_host, "https://bitbucket.org/team/new.git"));
         assert!(!same_host(&json!({"remote_name":"m"}), url));
     }
+    #[test]
+    fn a_locked_deletion_on_an_archived_repository_unarchives_deletes_and_archives_again() {
+        struct Seq(Vec<(&'static str, u16)>, Vec<String>);
+        impl Transport for Seq {
+            fn send(
+                &mut self,
+                r: cfrg::native::http::Request,
+            ) -> Result<cfrg::native::http::Response> {
+                self.1.push(format!(
+                    "{} {} {}",
+                    r.method,
+                    r.path,
+                    r.body.map(|b| b.to_string()).unwrap_or_default()
+                ));
+                let (m, status) = self.0.remove(0);
+                assert_eq!(m, r.method);
+                Ok(cfrg::native::http::Response {
+                    status,
+                    body: Value::Null,
+                })
+            }
+        }
+        let placement = Placement::from_document(
+            br#"{"schema":1,"source":{"origin":"https://forge.example","token_env":"T"},"repositories":[{"path":"o/r","source_id":1,"private":false,"default_branch":"main","content":"lfs","hold":null,"destinations":[]}]}"#,
+        )
+        .unwrap();
+        let repo = &placement.repositories[0];
+        let api = cfgj::native::Mirrors {
+            endpoint: &placement.source,
+            repository: repo,
+        };
+        let mut io = Seq(
+            vec![
+                ("DELETE", 423),
+                ("PATCH", 200),
+                ("DELETE", 204),
+                ("PATCH", 200),
+            ],
+            vec![],
+        );
+        assert!(matches!(
+            delete_mirror(&mut io, &api, &placement.source, repo, "remote_mirror_x").unwrap(),
+            Deleted::Yes
+        ));
+        assert!(
+            io.1[1].ends_with("{\"archived\":false}") && io.1[3].ends_with("{\"archived\":true}")
+        );
+        // Unarchiving refused: a hold, no further call.
+        let mut io = Seq(vec![("DELETE", 423), ("PATCH", 403)], vec![]);
+        assert!(matches!(
+            delete_mirror(&mut io, &api, &placement.source, repo, "remote_mirror_x").unwrap(),
+            Deleted::Held(_)
+        ));
+        // A different refusal is a hold without touching the archive.
+        let mut io = Seq(vec![("DELETE", 404)], vec![]);
+        assert!(matches!(
+            delete_mirror(&mut io, &api, &placement.source, repo, "remote_mirror_x").unwrap(),
+            Deleted::Held(_)
+        ));
+    }
+
     /// Answers by method and path; an unexpected request fails the test.
     struct Routes(Vec<(&'static str, &'static str, u16, Value)>);
     impl Transport for Routes {

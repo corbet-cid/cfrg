@@ -61,9 +61,26 @@ fn base64(input: &[u8]) -> String {
 /// A git environment without ambient configuration: no system or global config, no prompt,
 /// no ssh config, plus the given settings.
 fn git_env(extra: &[(&str, String)]) -> Environment {
+    git_env_from(&|key| std::env::var_os(key), extra)
+}
+
+fn git_env_from(
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+    extra: &[(&str, String)],
+) -> Environment {
     let mut env = Environment::new();
-    for key in ["PATH", "HOME", "LANG", "TMPDIR"] {
-        if let Some(value) = std::env::var_os(key) {
+    // The trust store of the image's git too: without SSL_CERT_FILE every https call fails ("unable to get local issuer certificate").
+    for key in [
+        "PATH",
+        "HOME",
+        "LANG",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+    ] {
+        if let Some(value) = lookup(key) {
             env.insert(key.into(), value);
         }
     }
@@ -122,6 +139,20 @@ fn git(root: &Path, env: Environment, args: &[&str], secs: u64) -> Result<String
         .with_stderr_events()
         .without_child_stderr()
         .run(&argv, true)
+}
+
+/// Like [`git`], but the error carries what git said (only for calls whose refusal has a known harmless reason).
+fn git_reading_stderr(root: &Path, env: Environment, args: &[&str], secs: u64) -> Result<String> {
+    let mut argv = vec!["git".to_string()];
+    argv.extend(args.iter().map(|a| (*a).to_string()));
+    Runner::new(root.to_path_buf(), env, Duration::from_secs(secs))?
+        .with_stderr_events()
+        .run(&argv, true)
+}
+
+/// GitLab's refusal for a project whose wiki repository has not been created yet.
+fn wiki_not_created(error: &str) -> bool {
+    error.contains("repository for this wiki does not exist yet")
 }
 
 fn gitlab(
@@ -613,12 +644,17 @@ impl<'a> Session<'a> {
                 ),
             ))
         };
-        let text = git(
+        let text = match git_reading_stderr(
             self.scratch.path(),
             copy_env()?,
             &["ls-remote", "--", &copy_url, "refs/heads/*"],
             60,
-        )?;
+        ) {
+            Ok(text) => text,
+            // GitLab answers 128 "A repository for this wiki does not exist yet" until the first page: an empty copy.
+            Err(error) if wiki_not_created(&error.to_string()) => String::new(),
+            Err(error) => return Err(error),
+        };
         let copy = wiki::read_copy(&text, &branch);
         let ancestor = match &copy {
             Copy::At(at) if *at != source_head => {
@@ -920,6 +956,29 @@ mod tests {
         assert_eq!(base64(b"oauth2:t"), "b2F1dGgyOnQ=");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn a_wiki_that_gitlab_has_not_created_yet_is_an_empty_copy() {
+        assert!(wiki_not_created(
+            "git failed: exit status: 128\nremote: A repository for this wiki does not exist yet.\nfatal: repository 'x' not found"
+        ));
+        assert!(!wiki_not_created(
+            "git failed: exit status: 128\nfatal: unable to access"
+        ));
+    }
+
+    #[test]
+    fn git_keeps_the_trust_store_of_the_environment() {
+        let env = git_env_from(
+            &|k| (k == "SSL_CERT_FILE").then(|| "/ca-bundle.crt".into()),
+            &[],
+        );
+        assert_eq!(
+            env.get(&OsString::from("SSL_CERT_FILE")),
+            Some(&"/ca-bundle.crt".into())
+        );
+        assert!(!env.contains_key(&OsString::from("SECRET_TOKEN")));
     }
 
     #[test]

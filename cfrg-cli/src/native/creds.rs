@@ -150,16 +150,10 @@ impl Creds {
         if let Some(t) = self.minted.borrow().get(&owner) {
             return Ok(t.clone());
         }
-        let app_id: u64 = id.parse().map_err(|_| "github-app-id is not a number")?;
-        let creds = cghb::relay::AppCredentials {
-            app_id,
-            private_key_pem: cghb::relay::Redacted::new(key.to_owned()),
-        };
-        let driver = cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
-            .map_err(|e| e.to_string())?;
+        let rt = cfrg_relay::live::runtime()?;
+        let driver = app_driver(&rt, id, key)?;
         let repo =
             cghb::relay::Repo::parse(&format!("{owner}/{name}")).map_err(|e| e.to_string())?;
-        let rt = cfrg_relay::live::runtime()?;
         let token = rt
             .block_on(driver.installation_token(&repo))
             .map_err(|e| format!("GitHub App token for {owner}: {e}"))?;
@@ -198,6 +192,25 @@ impl Creds {
             eprintln!("{name}: skipped ({n} destinations): no {name} credential mounted");
         }
     }
+}
+
+/// The GitHub App client. octocrab's tower buffer spawns a task when the client is built, so it is built with the
+/// runtime entered (built outside one it panics: "there is no reactor running").
+fn app_driver(
+    rt: &std::rc::Rc<cfrg_relay::live::Runtime>,
+    id: &str,
+    key: &str,
+) -> Result<cghb::relay::GithubRelay> {
+    let app_id: u64 = id.parse().map_err(|_| "github-app-id is not a number")?;
+    let creds = cghb::relay::AppCredentials {
+        app_id,
+        private_key_pem: cghb::relay::Redacted::new(key.to_owned()),
+    };
+    let _entered = rt.enter();
+    Ok(
+        cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
+            .map_err(|e| e.to_string())?,
+    )
 }
 
 #[cfg(test)]
@@ -276,4 +289,41 @@ mod tests {
         let e = c.token("CFRG_GITLAB_TOKEN", "").unwrap_err().to_string();
         assert!(e.contains("CFRG_GITLAB_TOKEN"));
     }
+
+    #[test]
+    fn the_github_app_client_is_built_inside_the_runtime() {
+        let rt = cfrg_relay::live::runtime().unwrap();
+        app_driver(&rt, "1", TEST_KEY).expect("the client builds without a ambient runtime");
+        assert!(app_driver(&rt, "x", TEST_KEY).is_err());
+    }
+
+    /// A throwaway key made for this test.
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDANkf7nr8u3CoA
+ta2unUZe3C0SDjUwZ8FnP2Vv23YOe8jjecqsUSJC5o9Ibcm0izM/SOR94BF+TQ7I
+Vwnad1c/bfY3t4vkjut/vgYItDhRPlKo5Su2KfkM1Fr1U7czosdPcavwjZLT1kRO
+wgJipKG1tdSQ9yR+NnTfztSMLwGaQjaCyWwuCaUwBkyoMnstUZ4qMWm04CQq0Z/q
+RtHnxxM9NW9+kPq8Oj7n9vzji3w58MhsmYxg4YX5iZUAiddcUemCgRtIAqWS7LA/
+CMLWRdHOletg81UI55oQtIM6fV3oGjTAiw2bglB5ZCoGEsGZeOIOo1FkE8eoaX3A
+8TV65cH3AgMBAAECggEAMWAAP7e4vs3ZkFMbKYbHI+kFPuUdbrDIcsBLS1+hxPix
+UxXfJUK2PV9CoUVqkhFL+c68u0UK2VnsGTSamF8dr3KM1CU3L2AzSJ5EqIm7Ccur
+qi0sfF/t1Qjb0LdPkVkYP+UgWOvVMsuQwnZ97F8EF0x9LTv/SNiuTyuvV89fZwN3
+N8qOqdTAp3PYDRALG3AHVtO0dD0t1vlVpzMS6DKY6miISPwNxQdTvokgGMuycRi0
+hSMbiDTZFN1WtnekqA+hmYCHAXqttH/9FPN0DBxKVQBFenQVj+qH7KoSHk/IcX8/
+qbl1om0DsUoHi2Zt9tOasYPf14xhu9sEFD+4vBJ+YQKBgQDmQXxqz4asw9RYp2rm
+Uiqte6l1Gza3/rFNNPLf9n1M8WCLIivgTlejHYlq5/MHPk8ix++fKiuhQIWgBHq9
+jFvvQiw0StU/KyN6wT69Zn7cCJFSAF7crsgd2wjRaSzTANGji4zvO64QxtAwdJGq
+MA2Zj0daCTsMS/JqfiDi7toEsQKBgQDVs+JydBFmyaVsSYaSS0g6+4U+lI7bEgeG
+7yl8tk9ea83LmNXVBqHVKqf70hXMweu9EEE8SESlmvIsAR4IGfNtkyDvK4A5//3c
+I67Y7yAzJGUfRiCgnl4y6Wkb6C/C46N741UUJGR+vR7L+Rc76yLob89FY0R+1gdu
+RHGh4c57JwKBgQDedpDVxbGxw/aqvP5Mj0CKorrj2Sox9RKqrKin+EexilijtJ09
+t5N2lngJYRbufaYJzbBXUHAc+PDh3NIVxsGgVYfN8is8P9qkpIaQibGxt1loJ9F/
+WCMirVhEs2BKcTUa1R6SmU+hB+Vnm4iNLKZHIiZm+Boj1FDf0QLHHsxn0QKBgQCj
+JOELX3Cpd+fB85+4r6BE5x+h1uf4dpsoeAzEGKoe+03w0IzuRFHn2tjDdm8OEj1V
+6MLksoc1pkSbM38p0CX20QujiyIpJTU4ikVBd8ytPmu0pGTkOgLP+0Ey/N75ea+l
+NLgO2HmgB+Eq9s61/5x2tmUWI+J2sg6aL8ZQP4LSoQKBgA4+v8bENG9mD8DwzZ8S
+zx3kvQMhvVcNG1UsVHFM8+cz7ZLL+DJNI8NhRzMimRzK4cCG5JC6ECU7+DoJqkEA
+GznTp7eNx7tS2xvNkCx4h/CL8wgos/oqNRguT3NOIhcKbW5RMjmXaPL7JNsyJgEh
+6wTJw2JnLNN/+RdkVeWmxi9u
+-----END PRIVATE KEY-----";
 }

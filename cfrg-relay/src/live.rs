@@ -22,7 +22,7 @@ use cfrg::{
     },
 };
 use std::{cell::RefCell, collections::BTreeMap, fs, path::PathBuf, rc::Rc};
-use tokio::runtime::Runtime;
+pub use tokio::runtime::Runtime;
 
 /// The fixed credential names (files of the credentials directory).
 pub const FORGEJO_TOKEN: &str = "forgejo-token";

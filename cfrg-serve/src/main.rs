@@ -138,7 +138,9 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
 }
 
 /// Finishes every open release intent of the journal (the daily run's step): one sync each, the intent cleared when it is synced.
-/// Exit 0 when none is left open, 1 when one could not be finished (the next daily run tries again).
+/// Exit 0 when none failed, 1 when one failed (the next daily run tries again). An intent whose sync answers 75
+/// (incomplete, not a fault: the tag is not on a copy yet because its push mirror has not run) stays open and is
+/// listed as waiting; it does not fail the step.
 async fn release_resume(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u8> {
     use cfrg_serve::journal::Journal;
     let config = Config::load(&PathBuf::from(config_path))?;
@@ -157,7 +159,7 @@ async fn release_resume(config_path: &str, secrets: &str) -> cfrg_serve::config:
     let reader = std::sync::Arc::clone(&journal);
     let open = cfrg_serve::journal::blocking(move || reader.open_intents()).await?;
     let ctx = release::Ctx::new(config, creds)?;
-    let mut left = 0;
+    let mut exits = Vec::new();
     for (repo, tag) in &open {
         let outcome = release::sync(&ctx, repo, tag, false).await;
         if outcome.exit == 0 {
@@ -166,13 +168,39 @@ async fn release_resume(config_path: &str, secrets: &str) -> cfrg_serve::config:
             cfrg_serve::journal::blocking(move || writer.clear(&repo_name, &tag_name)).await?;
             println!("release-resume: {repo} {tag}: synced");
         } else {
-            left += 1;
+            let state = if outcome.exit == 75 {
+                "waiting for its copy"
+            } else {
+                "failed"
+            };
             println!(
-                "release-resume: {repo} {tag}: exit {}, left open",
+                "release-resume: {repo} {tag}: exit {}, left open ({state})",
                 outcome.exit
             );
         }
+        exits.push(outcome.exit);
     }
-    println!("release-resume: {} open, {left} left", open.len());
-    Ok(u8::from(left > 0))
+    println!(
+        "release-resume: {} open, {} left",
+        open.len(),
+        exits.iter().filter(|e| **e != 0).count()
+    );
+    Ok(resume_exit(&exits))
+}
+
+/// 1 when any sync failed (neither done nor 75, "incomplete, not a fault").
+fn resume_exit(exits: &[i32]) -> u8 {
+    u8::from(exits.iter().any(|e| *e != 0 && *e != 75))
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::resume_exit;
+
+    #[test]
+    fn only_a_real_failure_fails_the_resume_step() {
+        assert_eq!(resume_exit(&[]), 0);
+        assert_eq!(resume_exit(&[0, 75]), 0);
+        assert_eq!(resume_exit(&[75, 1]), 1);
+    }
 }
