@@ -54,10 +54,12 @@ pub fn run(options: &Options) -> Result<()> {
         .ok_or("--copies-from REPORT (a settings run) is required")?;
     let report: Value = serde_json::from_slice(&std::fs::read(file)?)?;
     let creds = super::creds::Creds::new(options.credentials_dir.clone());
-    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
+    let mut placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let contributed = Contributed::from_placement(&placement, &[])?;
     let mut io = creds.open(&options.state, false)?;
+    super::derive::apply(&creds, &mut placement, &mut io, None)?;
+    placement.validate()?;
     let primaries: BTreeMap<String, cfgj::native::Primary> =
         cfgj::native::list_primaries(&mut io, &placement.source)?
             .into_iter()

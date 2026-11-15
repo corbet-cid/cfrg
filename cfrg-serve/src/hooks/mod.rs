@@ -19,6 +19,7 @@ pub mod enroll;
 pub mod gate;
 pub mod handoff;
 pub mod lockrefresh;
+pub mod place;
 
 /// One unit of work: run `hook_commands[command]` with `args` appended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,7 @@ const HOOKS: &[(&str, Planner)] = &[
     (gate::PATH, gate::plan),
     (handoff::PATH, handoff::plan),
     (lockrefresh::PATH, lockrefresh::plan),
+    (place::PATH, place::plan),
 ];
 
 pub fn lookup(path: &str) -> Option<&'static str> {

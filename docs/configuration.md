@@ -68,7 +68,7 @@ credentials directory, named by `FORGE_BRIDGE_SECRETS` (default `/secrets`). Unk
 | `aliases` | no | `{provider: {primary path: copy path}}` for the few copies that carry another name. |
 | `placement` | no | Path of the placement document. It declares the contributed projects (never touched) and, for the wiki leg, the repositories. |
 | `wiki` | no | `{state, key, known_hosts, key_id}`: the state directory, the SSH deploy key (private half; `<key>.pub` beside it), the `known_hosts` file and the optional id of the deploy key on GitLab. Absent: a wiki event is answered 503. |
-| `hook_commands` | no | `{copy, downsync, lockrefresh, gate, handoff, enroll}`: the argv of the command a hook runs; the job's arguments are appended. A hook whose key is absent answers 503. cfrg ships none of these commands. |
+| `hook_commands` | no | `{copy, downsync, lockrefresh, gate, handoff, enroll, place}`: the argv of the command a hook runs; the job's arguments are appended. A hook whose key is absent answers 503. cfrg ships none of these commands. |
 | `relay` | no | `{config, placement, credentials_dir, database_ca}`: the in-process relay. `config` is the relay configuration (next section), `placement` the placement it derives its repositories from, `credentials_dir` defaults to `/credentials`, `database_ca` is the CA file the database login is verified against. Absent: the relay routes answer 503. |
 | `replay` | no | `{ttl_seconds, capacity}`: how long (default 86400) and how many (default 10000) delivery ids are remembered. |
 
@@ -79,7 +79,7 @@ Routes (`cfrg-serve/src/server.rs`, function `route`). A listener answers nothin
 | `internal` | `POST /hooks/release` | `hmac_forgejo` | A published, non-draft release is uploaded to the GitHub and GitLab copies ([release upload](release-upload.md)). |
 | `internal` | `POST /hooks/sync` | `hmac_forgejo` | `{"repository": "OWNER/REPO", "tag": "vX"}`: a tag pusher's hint that the tag is on a copy now. |
 | `internal` | `POST /hooks/forgejo` | `hmac_forgejo` | Issues, comments and pull requests of the primary go to the relay; a `wiki` event starts the wiki push. |
-| `internal` | `POST /hooks/copy`, `/hooks/downsync`, `/hooks/enroll`, `/hooks/gate`, `/hooks/handoff`, `/hooks/lockrefresh` | `hmac_forgejo` | Run the matching `hook_commands` entry. |
+| `internal` | `POST /hooks/copy`, `/hooks/downsync`, `/hooks/enroll`, `/hooks/gate`, `/hooks/handoff`, `/hooks/lockrefresh`, `/hooks/place` | `hmac_forgejo` | Run the matching `hook_commands` entry. |
 | `public` | `POST /hooks/github` | `hmac_github` | GitHub issue, comment and pull request events go to the relay. |
 | `public` | `POST /hooks/gitlab` | `hmac_gitlab` | The same for GitLab (Standard Webhooks signature). |
 | both | `GET /healthz` | none | Liveness. |

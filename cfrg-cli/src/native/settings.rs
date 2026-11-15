@@ -94,7 +94,7 @@ fn field_name(field: Field) -> String {
 
 pub fn run(options: &Options) -> Result<()> {
     let creds = super::creds::Creds::new(options.credentials_dir.clone());
-    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
+    let mut placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let contributed = Contributed::from_placement(&placement, &[])?;
     let write = options.apply;
@@ -123,6 +123,8 @@ pub fn run(options: &Options) -> Result<()> {
         );
     }
     let mut io = creds.open(&options.state, write)?;
+    super::derive::apply(&creds, &mut placement, &mut io, None)?;
+    placement.validate()?;
     let mut rows = Vec::new();
     let mut counts: BTreeMap<(String, String), Count> = BTreeMap::new();
     let mut incomplete = false;

@@ -3,6 +3,7 @@ use crate::{failure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod derive;
 pub mod http;
 pub mod links;
 pub mod settings;
@@ -33,6 +34,10 @@ pub struct Placement {
     /// by us, and their copies on our forge run no Actions. See `docs/contributed.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contributed: Vec<ContributedProject>,
+    /// The policy that derives the default copies of every listed repository that is not declared above (see
+    /// `derive`). `repositories` then keeps only real exceptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive: Option<derive::Derive>,
 }
 
 /// One contributed project: its own repository and the other places the same project is found (our copies, a second home).
@@ -154,7 +159,7 @@ fn sync_on_commit_default() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Gitlab,
@@ -312,6 +317,9 @@ impl Placement {
         }
         if let Some(copy) = &self.copy {
             copy.validate()?;
+        }
+        if let Some(derive) = &self.derive {
+            derive.validate()?;
         }
         // The declaration of contributed projects, and that none of them has a mirror destination (R11).
         crate::contributed::Contributed::from_placement(self, &[])?;

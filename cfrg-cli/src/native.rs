@@ -1,5 +1,6 @@
 mod copy;
 mod creds;
+mod derive;
 mod members;
 mod protection;
 mod settings;
@@ -200,7 +201,7 @@ pub fn rename(placement: &Path, state: &Path, repository: Option<&str>) -> Resul
 
 fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     let creds = creds::Creds::new(options.credentials_dir.clone());
-    let placement = creds.placement(&fs::read(&options.placement)?)?;
+    let mut placement = creds.placement(&fs::read(&options.placement)?)?;
     placement.validate()?;
     if options.apply
         && matches!(
@@ -212,8 +213,20 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     }
     let contributed = cfrg::contributed::Contributed::from_placement(&placement, &[])?;
     let contributed_paths = contributed.source_paths();
+    let mut io = creds.open(&options.state, options.apply)?;
     // `--provider copy` runs the copy pass alone; it covers every repository the forge lists, declared or not.
     let copy_only = options.provider.as_deref() == Some("copy");
+    let mut report = Vec::new();
+    // The derived default copies of every listed repository that is not declared (placement `derive`).
+    if !copy_only {
+        report.extend(derive::apply(
+            &creds,
+            &mut placement,
+            &mut io,
+            options.repository.as_deref(),
+        )?);
+        placement.validate()?;
+    }
     if !copy_only
         && options.repository.as_ref().is_some_and(|path| {
             !placement.repositories.iter().any(|r| r.path == *path)
@@ -223,8 +236,6 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
     {
         return Err("Selected repository is not declared".into());
     }
-    let mut io = creds.open(&options.state, options.apply)?;
-    let mut report = Vec::new();
     let mut incomplete = false;
     if copy_only && placement.copy.is_none() {
         return Err("The placement declares no copy".into());

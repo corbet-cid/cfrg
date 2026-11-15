@@ -177,8 +177,15 @@ impl Creds {
     /// The placement without the destinations whose credential is not mounted, each provider named once in the log.
     pub fn placement(&self, document: &[u8]) -> Result<Placement> {
         let mut placement = Placement::from_document(document)?;
+        self.credentialed(&mut placement, 0);
+        Ok(placement)
+    }
+
+    /// Drops the destinations whose credential is not mounted from the repositories at `from` and after (the derived
+    /// rows are appended behind the declared ones and pass through the same rule).
+    pub fn credentialed(&self, placement: &mut Placement, from: usize) {
         let mut skipped = BTreeMap::new();
-        for repo in &mut placement.repositories {
+        for repo in placement.repositories.iter_mut().skip(from) {
             repo.destinations.retain(|d| {
                 let ok = d.provider != Provider::Bitbucket || self.available(&d.endpoint.token_env);
                 if !ok {
@@ -190,7 +197,6 @@ impl Creds {
         for (name, n) in skipped {
             eprintln!("{name}: skipped ({n} destinations): no {name} credential mounted");
         }
-        Ok(placement)
     }
 }
 

@@ -10,9 +10,11 @@ use std::{os::unix::fs::PermissionsExt, time::Duration};
 
 pub fn run(options: &Options) -> Result<()> {
     let creds = super::creds::Creds::new(options.credentials_dir.clone());
-    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
+    let mut placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let mut io = creds.open(&options.state, options.apply)?;
+    super::derive::apply(&creds, &mut placement, &mut io, None)?;
+    placement.validate()?;
     // ssh refuses a key file the group can read, and a mounted Secret is: a push uses a private copy (0600) of the key and the host pins.
     let private = tempfile::tempdir()?;
     let (mut key, mut known_hosts) = (options.wiki_key.clone(), options.wiki_known_hosts.clone());

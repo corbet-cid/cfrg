@@ -22,9 +22,11 @@ pub fn run(options: &Options) -> Result<()> {
         );
     }
     let creds = super::creds::Creds::new(options.credentials_dir.clone());
-    let placement = creds.placement(&std::fs::read(&options.placement)?)?;
+    let mut placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
     let mut io = creds.open(&options.state, false)?;
+    super::derive::apply(&creds, &mut placement, &mut io, None)?;
+    placement.validate()?;
     // Our own forge: one read a second.
     io.set_pacing(Pacing {
         read: 1,
