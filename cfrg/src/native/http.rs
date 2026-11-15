@@ -109,6 +109,37 @@ pub struct Http {
     pacing: Pacing,
     /// Where a token comes from when it is not in the process environment (a credentials directory).
     secrets: Option<SecretFn>,
+    /// Consecutive permission refusals (HTTP 403 without a rate limit) per scope; any answer below 400 resets it.
+    refusals: std::collections::BTreeMap<String, u32>,
+}
+
+/// Marks a 403 that refuses one request (a permission the credential does not hold, e.g. a GitHub App with
+/// `Administration: read` asked to change a setting). It is not a stop: the caller fails that one row.
+pub const REFUSED_MARK: &str = "refused for this request";
+
+/// Permission refusals in a row, on one scope and without a success in between, that still end the run: an account
+/// that is flagged or suspended answers every request with 403, and the run must not go on asking.
+const MAX_CONSECUTIVE_REFUSALS: u32 = 3;
+
+/// Counts one more permission refusal on `scope`; true when it is the one that ends the run.
+fn refusal_ends_the_run(
+    refusals: &mut std::collections::BTreeMap<String, u32>,
+    scope: &str,
+) -> bool {
+    let streak = refusals.entry(scope.to_string()).or_default();
+    *streak += 1;
+    *streak >= MAX_CONSECUTIVE_REFUSALS
+}
+
+/// Whether the response headers say the 403 is a rate limit (primary: `x-ratelimit-remaining: 0`; secondary: `retry-after`).
+fn is_rate_limited(headers: &str) -> bool {
+    headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(key, value)| {
+            key.eq_ignore_ascii_case("retry-after")
+                || (key.eq_ignore_ascii_case("x-ratelimit-remaining") && value.trim() == "0")
+        })
 }
 
 pub fn now() -> Result<u64> {
@@ -143,6 +174,7 @@ impl Http {
                 apply,
                 pacing: Pacing::default(),
                 secrets: None,
+                refusals: Default::default(),
             }),
             Err(e) => {
                 fs::remove_file(&lock_path)?;
@@ -380,15 +412,20 @@ impl Http {
         if write && status < 500 {
             self.state.pending.remove(&request.scope);
         }
-        if status == 429 || status == 402 {
+        let headers_text = fs::read_to_string(headers.path())?;
+        let rate_limited_403 = status == 403 && is_rate_limited(&headers_text);
+        if status < 400 {
+            self.refusals.remove(&request.scope);
+        }
+        if status == 429 || status == 402 || rate_limited_403 {
             let observed_at = now()?;
             let retry_at = if status == 402 {
                 None
             } else {
-                retry_after(&fs::read_to_string(headers.path())?, observed_at)
+                retry_after(&headers_text, observed_at)
             };
             self.state.windows.insert(
-                request.scope,
+                request.scope.clone(),
                 Window {
                     observed_at,
                     status,
@@ -397,6 +434,14 @@ impl Http {
             );
         }
         self.save()?;
+        if status == 403
+            && !rate_limited_403
+            && !refusal_ends_the_run(&mut self.refusals, &request.scope)
+        {
+            return Err(failure(format!(
+                "Native API HTTP 403; {REFUSED_MARK}; the run goes on"
+            )));
+        }
         if matches!(status, 401 | 403 | 429 | 402) || status >= 500 {
             return Err(failure(format!(
                 "Native API HTTP {status}; stopped without retry; window/intent recorded"
@@ -468,6 +513,29 @@ mod tests {
         assert_eq!(http.credential("CFRG_TEST_ABSENT_9z", "a/b"), None);
     }
     use super::*;
+    #[test]
+    fn a_403_without_a_rate_limit_fails_one_request_and_three_in_a_row_end_the_run() {
+        let mut refusals = std::collections::BTreeMap::new();
+        assert!(!refusal_ends_the_run(&mut refusals, "github/corbet-libre"));
+        assert!(!refusal_ends_the_run(&mut refusals, "github/corbet-libre"));
+        // another scope has its own streak
+        assert!(!refusal_ends_the_run(&mut refusals, "gitlab/x"));
+        assert!(refusal_ends_the_run(&mut refusals, "github/corbet-libre"));
+        // the refusal message must not look like a stop to the callers that match on it
+        assert!(
+            !format!("Native API HTTP 403; {REFUSED_MARK}; the run goes on")
+                .contains("stopped without retry")
+        );
+    }
+    #[test]
+    fn only_rate_limit_headers_make_a_403_a_rate_limit() {
+        assert!(is_rate_limited("HTTP/2 403\r\nRetry-After: 60\r\n"));
+        assert!(is_rate_limited("x-ratelimit-remaining: 0\r\n"));
+        assert!(!is_rate_limited(
+            "x-ratelimit-remaining: 4999\r\ncontent-type: application/json\r\n"
+        ));
+        assert!(!is_rate_limited("HTTP/2 403\r\n"));
+    }
     #[test]
     fn reads_cannot_shorten_write_or_creation_pacing() {
         let mut state = State {

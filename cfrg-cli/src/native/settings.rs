@@ -155,6 +155,18 @@ pub fn run(options: &Options) -> Result<()> {
             .repositories
             .iter()
             .find(|r| r.source_id == primary.id);
+        // The derive policy's exclusions (scratch and probe repositories) hold for EVERY provider, not
+        // only for the derived Bitbucket and GitLab rows: an undeclared, excluded primary gets no copy
+        // settings anywhere (a declared row is the owner's explicit word and stays).
+        if declared.is_none()
+            && placement
+                .derive
+                .as_ref()
+                .is_some_and(|derive| cfrg::native::derive::is_excluded(derive, &primary.path))
+        {
+            rows.push(json!({"source":primary.path, "state":"excluded", "note":"derive.exclude: this repository has no copies"}));
+            continue;
+        }
         // What a Bitbucket copy's description may link to: the GitHub copy of this primary
         // when anyone can see it (GitHub is read before Bitbucket), and whether the primary
         // has wiki pages at all (read once, only when a link needs it).
@@ -362,16 +374,29 @@ pub fn run(options: &Options) -> Result<()> {
                 }
                 let applied = match provider {
                     Provider::Github => {
-                        cghb::settings::apply(&mut io, &target, &primary.settings, &plan.changes)?
+                        cghb::settings::apply(&mut io, &target, &primary.settings, &plan.changes)
                     }
                     Provider::Gitlab => {
-                        cglb::settings::apply(&mut io, &target, &primary.settings, &plan.changes)?
+                        cglb::settings::apply(&mut io, &target, &primary.settings, &plan.changes)
                     }
                     Provider::Bitbucket => {
-                        cbkt::settings::apply(&mut io, &target, &primary.settings, &plan.changes)?
+                        cbkt::settings::apply(&mut io, &target, &primary.settings, &plan.changes)
                     }
                 };
                 written += 1;
+                let applied = match applied {
+                    Ok(applied) => applied,
+                    // The credential lacks the right to change this copy (R65: the GitHub App holds
+                    // `Administration: read`): the row is drift, named by field and wanted value in
+                    // `plan`, reported and not failed. The run goes on with the next repository.
+                    Err(error) if error.to_string().contains(cfrg::native::http::REFUSED_MARK) => {
+                        let mut drift = row(&primary.path, name, &path, "drift", &plan, None);
+                        drift["refused"] =
+                            json!("HTTP 403: the credential may not change these settings");
+                        return Ok(drift);
+                    }
+                    Err(error) => return Err(error),
+                };
                 count.changed += 1;
                 Ok(row(
                     &primary.path,

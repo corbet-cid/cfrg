@@ -230,6 +230,12 @@ fn destination(
 }
 
 /// `*` matches any run of characters (also none and also `/`); everything else matches itself.
+/// Whether the policy excludes this primary path (lowercase glob match), whatever the provider.
+pub fn is_excluded(derive: &Derive, path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    derive.exclude.iter().any(|pattern| glob(pattern, &lower))
+}
+
 pub fn glob(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     let (first, last) = (parts[0], parts[parts.len() - 1]);
@@ -769,6 +775,16 @@ mod tests {
         assert_eq!(out.holds[0].provider, Provider::Bitbucket);
     }
 
+    #[test]
+    fn the_exclusion_helper_matches_scratch_paths_case_insensitively() {
+        let mut p = placement(json!([]), json!([]));
+        let derive = p.derive.as_mut().unwrap();
+        derive.exclude = vec!["*/delete-me-*".into(), "ds-*/*".into()];
+        let derive = &*derive;
+        assert!(is_excluded(derive, "corbet-labs/Delete-Me-.profile"));
+        assert!(is_excluded(derive, "ds-probe/x"));
+        assert!(!is_excluded(derive, "corbet-libre/clck"));
+    }
     #[test]
     fn globs_match_runs_and_anchor_both_ends() {
         assert!(glob("ds-*/*", "ds-probe/stress"));

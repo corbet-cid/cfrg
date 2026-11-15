@@ -41,6 +41,11 @@ changes the licence and some defaults.
   only, and commits with the git identity you have configured. Nothing is preset.
 - `cfrg-serve`: `forge_hosts` defaults to the host of `forge_web` instead of a preset host name.
 
+- Native API: an HTTP 403 that is not a rate limit (no `Retry-After`, `x-ratelimit-remaining` not 0) refuses that one request
+  instead of stopping the provider for the run; three such refusals in a row on one scope, without a success in between (a
+  flagged or suspended account), still end the run. `settings` reports a refused write as a `drift` row naming the fields and
+  wanted values, not as an error. The `derive.exclude` patterns now also hold for the `settings` rows of every provider.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

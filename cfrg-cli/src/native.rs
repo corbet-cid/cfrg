@@ -1183,6 +1183,18 @@ fn delete_mirror(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_permission_refusal_does_not_stop_the_run() {
+        let refusal = format!(
+            "Native API HTTP 403; {}; the run goes on",
+            cfrg::native::http::REFUSED_MARK
+        );
+        assert!(!stops_the_run(&refusal));
+        assert!(stops_the_run(
+            "Native API HTTP 403; stopped without retry; window/intent recorded"
+        ));
+    }
     #[test]
     fn sync_requires_every_actual_remote_but_not_absent_destinations() {
         let managed = vec![json!("remote_mirror_ready")];
