@@ -85,6 +85,14 @@ pub struct OwnerMap {
 pub enum Target {
     Namespace(String),
     Off(bool),
+    /// The copies live under another path than the primary's, and say why: the destination is pinned to
+    /// `<path_prefix>/<repository>` (the owner's Bitbucket workspace is not the Forgejo organisation's name). Renaming the
+    /// organisation later is one edit of `path_prefix`.
+    Mapped {
+        namespace: String,
+        path_prefix: String,
+        path_reason: String,
+    },
 }
 
 /// One repository as the forge lists it.
@@ -146,6 +154,19 @@ impl Derive {
                     }
                     Target::Namespace(ns) if ns.is_empty() || ns.chars().any(char::is_control) => {
                         return Err(failure("Empty derive namespace"))
+                    }
+                    Target::Mapped {
+                        namespace,
+                        path_prefix,
+                        path_reason,
+                    } if namespace.is_empty()
+                        || super::component(path_prefix).is_err()
+                        || path_reason.trim().is_empty()
+                        || path_reason.chars().any(char::is_control) =>
+                    {
+                        return Err(failure(
+                            "A mapped derive target needs a namespace, a path prefix and a reason",
+                        ))
                     }
                     _ => {}
                 }
@@ -325,6 +346,21 @@ pub fn resolve(
             match target {
                 Some(Target::Namespace(ns)) => {
                     destinations.push(destination(provider, template, ns, &source.path));
+                }
+                Some(Target::Mapped {
+                    namespace,
+                    path_prefix,
+                    path_reason,
+                }) => {
+                    let mut dest = destination(
+                        provider,
+                        template,
+                        namespace,
+                        &format!("{path_prefix}/{name}"),
+                    );
+                    dest.path_reason = Some(path_reason.clone());
+                    dest.recorded_path = dest.path.clone();
+                    destinations.push(dest);
                 }
                 Some(Target::Off(_)) => {}
                 None => {
@@ -520,6 +556,30 @@ mod tests {
             held,
             [(Provider::Gitlab, false), (Provider::Bitbucket, true)]
         );
+    }
+
+    #[test]
+    fn a_mapped_owner_pins_the_destination_under_its_workspace() {
+        let mut p = placement(json!([]), json!([]));
+        p.derive.as_mut().unwrap().owners.insert(
+            "corbet-new".into(),
+            OwnerMap {
+                gitlab: Some(Target::Namespace("333".into())),
+                bitbucket: Some(Target::Mapped {
+                    namespace: "CORE".into(),
+                    path_prefix: "cvector".into(),
+                    path_reason:
+                        "owner decision: the organisation's Bitbucket workspace is cvector".into(),
+                }),
+            },
+        );
+        run(&mut p, &[src(80, "corbet-new/Thing", false)], &[]);
+        let r = row(&p, "corbet-new/Thing");
+        assert_eq!(r.destinations[0].path, "corbet-new/Thing");
+        let bb = &r.destinations[1];
+        assert!(bb.pinned());
+        assert_eq!(r.destination_path(bb), "cvector/thing");
+        p.validate().unwrap();
     }
 
     #[test]

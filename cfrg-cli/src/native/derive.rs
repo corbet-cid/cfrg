@@ -6,7 +6,7 @@ use cfrg::{
     native::{
         derive::{resolve, routes_lfs, Outcome, Source},
         http::{expect, Auth, Request, Transport},
-        Endpoint, Placement,
+        Endpoint, Placement, Provider,
     },
     Result,
 };
@@ -159,6 +159,86 @@ fn uses_lfs(io: &mut dyn Transport, endpoint: &Endpoint, source: &Source) -> Res
         .is_some_and(|text| routes_lfs(&text)))
 }
 
+/// The path of a push mirror's remote address on `host` (`https://host/a/b.git`, `git@host:a/b.git`, `ssh://git@host/a/b.git`).
+fn mirror_path(address: &str, host: &str) -> Option<String> {
+    let rest = address.split_once("://").map_or(address, |(_, r)| r);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    let rest = rest.strip_prefix(host)?;
+    let path = rest.trim_start_matches([':', '/']).trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// A derived destination has no recorded name or identity. When the primary was renamed, its push mirror still points at the old
+/// path: record that path and the destination's identity (GitLab project id, Bitbucket uuid), so the rename pass renames the copy
+/// instead of creating a second one. Reads only; a failed lookup leaves the destination as derived (the copy is then created anew).
+fn follow_renames(io: &mut dyn Transport, placement: &mut Placement, from: usize) -> Vec<Value> {
+    let source = placement.source.clone();
+    let mut found = Vec::new();
+    for repo in placement.repositories.iter_mut().skip(from) {
+        let mirrors = match get(
+            io,
+            &source,
+            format!("/api/v1/repos/{}/push_mirrors?limit=50&page=1", repo.path),
+        ) {
+            Ok(r) if r.status == 200 => r.body,
+            _ => continue,
+        };
+        for dest in repo.destinations.iter_mut().filter(|d| !d.pinned()) {
+            let host = dest
+                .endpoint
+                .origin
+                .trim_start_matches("https://")
+                .trim_start_matches("api.")
+                .to_string();
+            let Some(old) = mirrors
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["remote_address"].as_str())
+                .find_map(|a| mirror_path(a, &host))
+            else {
+                continue;
+            };
+            if old.eq_ignore_ascii_case(&dest.path) {
+                continue;
+            }
+            let (auth, path) = match dest.provider {
+                Provider::Gitlab => (
+                    Auth::PrivateToken,
+                    format!("/api/v4/projects/{}", cfrg::native::encode(&old)),
+                ),
+                Provider::Bitbucket => (Auth::Bearer, format!("/2.0/repositories/{old}")),
+                Provider::Github => continue,
+            };
+            let live = io.send(Request {
+                endpoint: dest.endpoint.clone(),
+                auth,
+                method: "GET",
+                path,
+                body: None,
+                scope: format!("{}/api", dest.endpoint.origin),
+                creation: false,
+            });
+            let id = match (&live, dest.provider) {
+                (Ok(r), Provider::Gitlab) if r.status == 200 => {
+                    r.body["id"].as_u64().map(|i| i.to_string())
+                }
+                (Ok(r), Provider::Bitbucket) if r.status == 200 => {
+                    r.body["uuid"].as_str().map(String::from)
+                }
+                _ => None,
+            };
+            if let Some(id) = id {
+                found.push(json!({"state": "derived-rename", "source": repo.path, "provider": dest.provider, "from": old}));
+                dest.repository_id = Some(id);
+                dest.recorded_path = old;
+            }
+        }
+    }
+    found
+}
+
 /// Adds the derived rows to `placement` (a no-op without a `derive` policy). `only` limits the pass to one repository
 /// (an event). Returns the report rows: one `derived` row and one `derive-hold` row per owner and provider.
 pub fn apply(
@@ -178,8 +258,10 @@ pub fn apply(
         uses_lfs(io, &endpoint, s)
     })?;
     creds.credentialed(placement, before);
+    let renames = follow_renames(io, placement, before);
     let mut rows = vec![json!({"state": "derived", "count": outcome.derived.len(),
         "repositories": outcome.derived, "skipped": outcome.skipped})];
+    rows.extend(renames);
     for hold in &outcome.holds {
         eprintln!(
             "{}",
@@ -227,6 +309,17 @@ mod tests {
                     json!([])
                 });
             }
+            if path.ends_with("/push_mirrors") {
+                // cnew was renamed: its mirror still points at the old GitLab project.
+                return ok(if path.contains("/cnew/") {
+                    json!([{"remote_address": "https://gitlab.com/corbet-infra/oldname.git"}])
+                } else {
+                    json!([])
+                });
+            }
+            if path == "/api/v4/projects/corbet-infra%2Foldname" {
+                return ok(json!({"id": 55}));
+            }
             if path == "/api/v1/repos/corbet-infra/cbig/contents/.gitattributes" {
                 return ok(json!({"content": "KiBmaWx0ZXI9bGZzCg=="}));
             }
@@ -272,8 +365,23 @@ mod tests {
             cfrg::native::Content::Lfs
         );
         assert_eq!(rows[0]["count"], 2);
-        let holds: Vec<_> = rows[1..]
+        let renamed = &placement.repositories[0].destinations[0];
+        assert_eq!(
+            (
+                renamed.repository_id.as_deref(),
+                renamed.recorded_path.as_str()
+            ),
+            (Some("55"), "corbet-infra/oldname")
+        );
+        assert!(rows
             .iter()
+            .any(|r| r["state"] == "derived-rename" && r["from"] == "corbet-infra/oldname"));
+        assert!(placement.repositories[1].destinations[0]
+            .repository_id
+            .is_none());
+        let holds: Vec<_> = rows
+            .iter()
+            .filter(|r| r["state"] == "derive-hold")
             .map(|r| (r["owner"].clone(), r["provider"].clone()))
             .collect();
         assert_eq!(
@@ -291,6 +399,29 @@ mod tests {
                 .filter(|p| p.contains("/contents/"))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn a_mirror_address_gives_its_destination_path() {
+        for (address, host) in [
+            ("https://gitlab.com/org/old.git", "gitlab.com"),
+            ("git@gitlab.com:org/old.git", "gitlab.com"),
+            ("ssh://git@bitbucket.org/org/old.git", "bitbucket.org"),
+            (
+                "https://x-token-auth@bitbucket.org/org/old",
+                "bitbucket.org",
+            ),
+        ] {
+            assert_eq!(
+                mirror_path(address, host).as_deref(),
+                Some("org/old"),
+                "{address}"
+            );
+        }
+        assert_eq!(
+            mirror_path("https://github.com/org/old.git", "gitlab.com"),
+            None
         );
     }
 
