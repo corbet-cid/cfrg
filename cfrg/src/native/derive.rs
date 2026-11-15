@@ -358,12 +358,14 @@ pub fn resolve(
             Content::NativeGit
         };
         if content == Content::Lfs {
-            if let Some(reason) = &derive.bitbucket_lfs_hold {
-                for dest in destinations
-                    .iter_mut()
-                    .filter(|d| d.provider == Provider::Bitbucket)
-                {
-                    dest.hold = Some(reason.clone());
+            for dest in destinations
+                .iter_mut()
+                .filter(|d| d.provider == Provider::Bitbucket)
+            {
+                if derive.bitbucket_lfs_ssh {
+                    dest.use_ssh = true;
+                } else {
+                    dest.hold = derive.bitbucket_lfs_hold.clone();
                 }
             }
         }
