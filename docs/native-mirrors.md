@@ -228,7 +228,7 @@ derivation completely, even with no destinations.
 | owner | `derive.owners[owner]`: the GitLab group id and the Bitbucket project key |
 | visibility | the row's `private`; the settings pass (R42) makes every copy match it |
 | content | `lfs` when `.gitattributes` of the default branch has `filter=lfs` (pointers-only copies, R4; with `bitbucket_lfs_hold` set the Bitbucket destination carries that hold), `profile` for `.github`, else `native-git` |
-| no row | declared, contributed, fork, pull mirror, empty repository (its first commit places it, see `/hooks/place`), an owner that is neither mapped nor an organisation |
+| no row | declared, contributed, excluded, fork, pull mirror, empty repository (its first commit places it, see `/hooks/place`), an owner that is neither mapped nor an organisation |
 | never | GitHub (paced, gate-managed, stays declared); any CI on a copy (R6, R7) |
 
 ```json
@@ -238,11 +238,14 @@ derivation completely, even with no destinations.
   "bitbucket": {"endpoint": {"origin": "https://api.bitbucket.org", "token_env": "CFRG_BITBUCKET_TOKEN"}, "mirror_user": "{uuid}",
                 "password_env": "CFRG_BITBUCKET_TOKEN", "interval_seconds": 3600},
   "bitbucket_lfs_hold": "reason",
+  "profile_providers": ["bitbucket"],
+  "exclude": ["*/delete-me-*", "ds-*/*"],
   "owners": {"corbet-infra": {"gitlab": "144006931", "bitbucket": "CORE"}, "corbet-knowledge": {"gitlab": "144007206", "bitbucket": false}}
 }
 ```
 
-A provider key of an owner that is `false` is a decision (no copy there). A key that is absent, or an organisation
+`profile_providers` limits where a `.github` repository goes (absent: everywhere). `exclude` keeps throwaway repositories out
+(`*` matches any run of characters, lowercase `owner/repo`). A provider key of an owner that is `false` is a decision (no copy there). A key that is absent, or an organisation
 missing from `owners`, is a HOLD: no copy is made, no error is raised, and the report carries ONE `derive-hold` row per
 owner and provider with every affected repository. It clears itself on the first pass after the group or project is
 added to `owners`. A rename follows the primary (the derived destination has no recorded name, so a renamed repository

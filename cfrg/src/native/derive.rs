@@ -43,6 +43,13 @@ pub struct Derive {
     /// endpoint refuses the API token, so such a copy waits for the SSH push mirror.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitbucket_lfs_hold: Option<String>,
+    /// Providers a `.github` (profile) repository is copied to. Absent: every derived provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_providers: Option<Vec<Provider>>,
+    /// Throwaway and scratch repositories get no copy: lowercase `owner/repo` patterns where `*` matches any run of
+    /// characters (`*/delete-me-*`, `ds-*/*`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -141,6 +148,15 @@ impl Derive {
             }
         }
         if self
+            .exclude
+            .iter()
+            .any(|p| p.is_empty() || p != &p.to_ascii_lowercase())
+        {
+            return Err(failure(
+                "Derive exclude patterns are lowercase and not empty",
+            ));
+        }
+        if self
             .bitbucket_lfs_hold
             .as_deref()
             .is_some_and(|reason| reason.trim().is_empty() || reason.chars().any(char::is_control))
@@ -186,6 +202,26 @@ fn destination(
         remote_name: None,
         lock_exception: None,
     }
+}
+
+/// `*` matches any run of characters (also none and also `/`); everything else matches itself.
+pub fn glob(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    if !text.starts_with(first) || text.len() < first.len() + last.len() || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// True when the content of a `.gitattributes` file routes anything through Git LFS.
@@ -235,6 +271,10 @@ pub fn resolve(
             skip("contributed");
             continue;
         }
+        if derive.exclude.iter().any(|pattern| glob(pattern, &lower)) {
+            skip("excluded");
+            continue;
+        }
         if source.mirror {
             skip("pull-mirror");
             continue;
@@ -260,11 +300,20 @@ pub fn resolve(
             skip("unmapped-user");
             continue;
         }
+        let profile = name == ".github";
         let mut destinations = Vec::new();
         for provider in [Provider::Gitlab, Provider::Bitbucket] {
             let Some(template) = derive.template(provider) else {
                 continue;
             };
+            if profile
+                && derive
+                    .profile_providers
+                    .as_ref()
+                    .is_some_and(|only| !only.contains(&provider))
+            {
+                continue;
+            }
             let target = map.and_then(|m| match provider {
                 Provider::Gitlab => m.gitlab.as_ref(),
                 _ => m.bitbucket.as_ref(),
@@ -297,7 +346,7 @@ pub fn resolve(
             skip("no-destination");
             continue;
         }
-        let content = if name == ".github" {
+        let content = if profile {
             Content::Profile
         } else if lfs(source)? {
             Content::Lfs
@@ -607,6 +656,43 @@ mod tests {
             .unwrap()
             .gitlab = Some(Target::Off(true));
         assert!(yes.validate().is_err());
+    }
+
+    #[test]
+    fn scratch_repositories_are_excluded_and_profile_repositories_go_where_declared() {
+        let mut p = placement(json!([]), json!([]));
+        let derive = p.derive.as_mut().unwrap();
+        derive.exclude = vec!["*/delete-me-*".into(), "corbet-new/tmp-*".into()];
+        derive.profile_providers = Some(vec![Provider::Bitbucket]);
+        let out = run(
+            &mut p,
+            &[
+                src(70, "corbet-infra/delete-me-.github", false),
+                src(71, "corbet-new/tmp-x", false),
+                src(72, "corbet-infra/.github", false),
+            ],
+            &[],
+        );
+        assert_eq!(out.skipped.get("excluded"), Some(&2));
+        let profile = row(&p, "corbet-infra/.github");
+        assert_eq!(profile.destinations.len(), 1);
+        assert_eq!(profile.destinations[0].provider, Provider::Bitbucket);
+        // A profile repository of an owner with no Bitbucket project is only held there, not on GitLab.
+        let mut q = placement(json!([]), json!([]));
+        q.derive.as_mut().unwrap().profile_providers = Some(vec![Provider::Bitbucket]);
+        let out = run(&mut q, &[src(73, "corbet-new/.github", false)], &[]);
+        assert_eq!(out.holds.len(), 1);
+        assert_eq!(out.holds[0].provider, Provider::Bitbucket);
+    }
+
+    #[test]
+    fn globs_match_runs_and_anchor_both_ends() {
+        assert!(glob("ds-*/*", "ds-probe/stress"));
+        assert!(glob("*/delete-me-*", "corbet-labs/delete-me-.github"));
+        assert!(glob("a*b*c", "aXbYc") && glob("a*b", "ab") && glob("*", "") && glob("x", "x"));
+        assert!(
+            !glob("a*b", "ba") && !glob("a*c", "ab") && !glob("x", "xy") && !glob("ab*ab", "ab")
+        );
     }
 
     #[test]
