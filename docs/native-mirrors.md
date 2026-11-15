@@ -13,6 +13,12 @@ touch: reconciliation never removes, replaces or creates a mirror of a held repo
 destination (it reports `held` or `held-untouched`).
 Omission is not deletion.
 
+A Bitbucket destination whose Forgejo mirror logs in under another name than the user the branch
+restrictions admit (the access-token login `x-token-auth`) declares the admitted user as
+`restriction_user` (a user uuid); without it the restrictions admit `mirror_user`. The mirror
+password (`password_env`) is read from the credentials directory like the API token, the environment
+only as the fallback of a hand run.
+
 Keep the desired placement in the repository that owns deployment configuration.
 Use `--provider gitlab --existing-only` to enroll existing projects while project
 creation is cooling down. Missing destinations are reported without POSTing;

@@ -120,6 +120,10 @@ pub struct Destination {
     /// Immutable destination identity once known. Required for existing repos.
     pub repository_id: Option<String>,
     pub mirror_user: String,
+    /// Bitbucket only: the user the branch restrictions admit (a user uuid). Without it the restrictions admit `mirror_user`,
+    /// which is right only while the mirror logs in as that user; a mirror that logs in as `x-token-auth` declares the uuid here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restriction_user: Option<String>,
     pub password_env: String,
     #[serde(default)]
     pub use_ssh: bool,
@@ -167,6 +171,13 @@ pub enum Content {
 }
 
 impl Destination {
+    /// The user a Bitbucket branch restriction admits.
+    pub fn restriction_user(&self) -> &str {
+        self.restriction_user
+            .as_deref()
+            .unwrap_or(&self.mirror_user)
+    }
+
     /// Only a declared reason pins the path; every other destination follows the
     /// primary's name.
     pub fn pinned(&self) -> bool {
@@ -757,6 +768,20 @@ mod tests {
         assert_eq!(plan_move("g/s/x", "g/s/y"), Move::Rename { leaf: "y" });
         assert_eq!(plan_move("a/x", "b/x"), Move::Transfer);
         assert_eq!(plan_move("g/s/x", "g/x"), Move::Transfer);
+    }
+
+    #[test]
+    fn a_bitbucket_restriction_admits_the_declared_user_else_the_mirror_login() {
+        let base = GITLAB.replace("\"gitlab\"", "\"bitbucket\"");
+        let plain = declared_repo(&base);
+        assert_eq!(plain.destinations[0].restriction_user(), "9");
+        let declared = base.replace(
+            "\"mirror_user\":\"9\"",
+            "\"mirror_user\":\"x-token-auth\",\"restriction_user\":\"{uuid}\"",
+        );
+        let repo = declared_repo(&declared);
+        assert_eq!(repo.destinations[0].mirror_user, "x-token-auth");
+        assert_eq!(repo.destinations[0].restriction_user(), "{uuid}");
     }
 
     fn declared_repo(destinations: &str) -> Repository {

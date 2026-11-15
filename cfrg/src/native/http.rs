@@ -150,6 +150,16 @@ impl Http {
             }
         }
     }
+    /// A credential by its environment name: the credentials directory first, the process environment as the fallback of a hand run.
+    pub fn credential(&self, env: &str, path: &str) -> Option<String> {
+        if let Some(resolve) = &self.secrets {
+            if let Ok(value) = resolve(env, path) {
+                return Some(value);
+            }
+        }
+        std::env::var(env).ok()
+    }
+
     /// Resolve tokens through `secrets` (by the endpoint's `token_env` name) instead of the environment.
     pub fn with_secrets(mut self, secrets: SecretFn) -> Self {
         self.secrets = Some(secrets);
@@ -438,6 +448,25 @@ fn retry_after(headers: &str, now: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_credential_comes_from_the_directory_resolver_before_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Http::open(&dir.path().join("state.json"), false)
+            .unwrap()
+            .with_secrets(Box::new(|env, _| {
+                if env == "CFRG_TEST_FROM_DIR" {
+                    Ok("from-dir".to_string())
+                } else {
+                    Err("none".into())
+                }
+            }));
+        assert_eq!(
+            http.credential("CFRG_TEST_FROM_DIR", "a/b").as_deref(),
+            Some("from-dir")
+        );
+        assert_eq!(http.credential("CFRG_TEST_ABSENT_9z", "a/b"), None);
+    }
     use super::*;
     #[test]
     fn reads_cannot_shorten_write_or_creation_pacing() {

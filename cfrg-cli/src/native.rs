@@ -575,7 +575,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         Provider::Gitlab => {
                             cglb::native::protect(&mut io, &dest, &repo.default_branch, write)?
                         }
-                        Provider::Bitbucket => cbkt::native::protect(&mut io, &dest, write)?,
+                        Provider::Bitbucket => cbkt::native::restrict(
+                            &mut io,
+                            &dest,
+                            write,
+                            &[dest.restriction_user()],
+                        )?,
                         Provider::Github => cghb::native::protect(&mut io, repo, &dest, write)?,
                     }
                 } else {
@@ -1004,8 +1009,9 @@ fn create_owned(
         cglb::native::deny_branch_writes(io, dest)?;
         String::new()
     } else {
-        let value = std::env::var(&dest.password_env)
-            .map_err(|_| "Missing mirror credential environment reference")?;
+        let value = io
+            .credential(&dest.password_env, &dest.path)
+            .ok_or("Missing mirror credential environment reference")?;
         if value.is_empty() || !value.bytes().all(|b| b.is_ascii_graphic()) {
             return Err("Invalid mirror credential format".into());
         }
