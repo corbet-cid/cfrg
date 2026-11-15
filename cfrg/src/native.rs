@@ -376,8 +376,11 @@ impl Placement {
                         ));
                     }
                 }
-                if dest.use_ssh && dest.provider != Provider::Gitlab {
-                    return Err(failure("SSH enrollment requires GitLab deploy keys"));
+                if dest.use_ssh && !matches!(dest.provider, Provider::Gitlab | Provider::Bitbucket)
+                {
+                    return Err(failure(
+                        "SSH enrollment requires GitLab deploy keys or a Bitbucket account key",
+                    ));
                 }
                 if dest.mirror_user.is_empty()
                     || dest.mirror_user.contains('@')
@@ -620,6 +623,25 @@ mod tests {
               {{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"namespace":"CORE","mirror_user":"{{u}}","password_env":"B","interval_seconds":3600,"hold":null,"remote_name":null{extra}}}
             ]}}]}}"#
         )
+    }
+
+    #[test]
+    fn ssh_push_mirrors_are_for_gitlab_and_bitbucket_only() {
+        let doc = |provider: &str, origin: &str| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"repositories":[
+                {{"path":"team/new","source_id":1,"private":false,"default_branch":"main","content":"native-git","hold":null,"destinations":[
+                  {{"provider":"{provider}","endpoint":{{"origin":"{origin}","token_env":"G"}},"path":"team/new","namespace":"CORE","repository_id":null,"mirror_user":"{{u}}","password_env":"G","use_ssh":true,"interval_seconds":3600,"hold":null,"remote_name":null}}
+                ]}}]}}"#
+            )
+        };
+        let ok = |provider: &str, origin: &str| {
+            Placement::from_document(doc(provider, origin).as_bytes())
+                .unwrap()
+                .validate()
+        };
+        assert!(ok("bitbucket", "https://api.bitbucket.org").is_ok());
+        assert!(ok("github", "https://api.github.com").is_err());
     }
 
     #[test]

@@ -615,6 +615,19 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         Provider::Gitlab => {
                             cglb::native::protect(&mut io, &dest, &repo.default_branch, write)?
                         }
+                        Provider::Bitbucket if dest.use_ssh => match &mirror {
+                            // The key of the Forgejo SSH push mirror lives on the mirror account; restrictions admit that user.
+                            Some(value) => {
+                                cbkt::native::enroll_key(&mut io, &dest, value, write)?
+                                    && cbkt::native::restrict(
+                                        &mut io,
+                                        &dest,
+                                        write,
+                                        &[dest.restriction_user()],
+                                    )?
+                            }
+                            None => false,
+                        },
                         Provider::Bitbucket => cbkt::native::restrict(
                             &mut io,
                             &dest,
@@ -652,7 +665,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 }
                 if mirror.is_none() && write {
                     let value = create_owned(&api, &mut io, &dest, &url)?;
-                    if dest.use_ssh {
+                    if dest.use_ssh && dest.provider == Provider::Gitlab {
                         cglb::native::protect_ssh(
                             &mut io,
                             &dest,
@@ -663,6 +676,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         if let Some(old) = &replaced {
                             // The new key is enrolled: the old mirror's key is an orphan.
                             cglb::native::forget_key(&mut io, &dest, old)?;
+                        }
+                    }
+                    if dest.use_ssh && dest.provider == Provider::Bitbucket {
+                        cbkt::native::enroll_key(&mut io, &dest, &value, true)?;
+                        if let Some(old) = &replaced {
+                            cbkt::native::forget_key(&mut io, &dest, old)?;
                         }
                     }
                     mirrors.push(value.clone());
@@ -1046,7 +1065,9 @@ fn create_owned(
     url: &str,
 ) -> Result<Value> {
     let password = if dest.use_ssh {
-        cglb::native::deny_branch_writes(io, dest)?;
+        if dest.provider == cfrg::native::Provider::Gitlab {
+            cglb::native::deny_branch_writes(io, dest)?;
+        }
         String::new()
     } else {
         let value = io

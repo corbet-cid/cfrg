@@ -22,7 +22,7 @@
             outputHashes."cglb-0.1.0" = "sha256-x5LDSo21BSsh/NbNzFkpn2IeXX4oglkHjXcPQrpTRno=";
             outputHashes."cghb-0.1.0" = "sha256-hJ8V41lvqBVbvhIMqbFAyjzKYY1la7jwXXLe/trLL6k=";
             outputHashes."cfgj-0.1.0" = "sha256-AP7zM++9wRllDIhq/eMTizeRAKgkpRqe1rGpqu6wajk=";
-            outputHashes."cbkt-0.1.0" = "sha256-JbcmeI3ZjpQuIzmXboW0bcXNRvyKOz7h+WQfQmK5448=";
+            outputHashes."cbkt-0.1.0" = "sha256-5TxMXsZh1ZZesRKqpzEPKVYFLtt2Iv/gS3giCaHJou4=";
           };
           cargoBuildFlags = [ "-p" package ];
           env = pkgs.lib.optionalAttrs (self ? rev) { CFRG_SOURCE_REVISION = self.rev; };

@@ -300,7 +300,7 @@ dependencies = [
 [[package]]
 name = "cbkt"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cbkt?rev=447ddb037f6d9ddc3e1be74573c7cbdffe07e54d#447ddb037f6d9ddc3e1be74573c7cbdffe07e54d"
+source = "git+https://git.corbet.ch/corbet-libre/cbkt?rev=7d18d7c5303a86723b8acd3c644f91969c341291#7d18d7c5303a86723b8acd3c644f91969c341291"
 dependencies = [
  "cfrg",
  "serde_json",
