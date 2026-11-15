@@ -96,6 +96,15 @@ impl Creds {
 
     pub fn token(&self, env: &str, path: &str) -> Result<String> {
         env_name(env)?;
+        // Creating and reading a push mirror needs `write:repository`, which the relay's `forgejo-token` (issues only) must not have:
+        // those requests use `forgejo-mirror-token` when the directory holds one.
+        if let (Some(dir), "CFRG_FORGEJO_TOKEN", true) =
+            (&self.dir, env, path.contains("/push_mirrors"))
+        {
+            if let Some(t) = read(dir, "forgejo-mirror-token") {
+                return Ok(t);
+            }
+        }
         if let (Some(dir), Some(file)) = (&self.dir, file_for(env)) {
             if let Some(t) = read(dir, file) {
                 return Ok(t);
@@ -204,6 +213,25 @@ mod tests {
         assert_eq!(c.token("CFRG_FORGEJO_TOKEN", "").unwrap(), "f");
         assert_eq!(c.token("CFRG_GITLAB_TOKEN", "/projects/1").unwrap(), "g");
         assert!(c.available("CFRG_GITLAB_TOKEN"));
+    }
+
+    #[test]
+    fn push_mirror_requests_use_the_mirror_token_when_there_is_one() {
+        let d = dir(&[("forgejo-token", "f"), ("forgejo-mirror-token", "m")]);
+        let c = Creds::new(Some(d.path().to_owned()));
+        assert_eq!(
+            c.token("CFRG_FORGEJO_TOKEN", "/repos/o/r/push_mirrors")
+                .unwrap(),
+            "m"
+        );
+        assert_eq!(c.token("CFRG_FORGEJO_TOKEN", "/repos/o/r").unwrap(), "f");
+        let without = dir(&[("forgejo-token", "f")]);
+        let c = Creds::new(Some(without.path().to_owned()));
+        assert_eq!(
+            c.token("CFRG_FORGEJO_TOKEN", "/repos/o/r/push_mirrors")
+                .unwrap(),
+            "f"
+        );
     }
 
     #[test]
