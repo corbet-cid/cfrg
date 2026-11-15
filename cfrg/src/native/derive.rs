@@ -43,6 +43,10 @@ pub struct Derive {
     /// endpoint refuses the API token, so such a copy waits for the SSH push mirror.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitbucket_lfs_hold: Option<String>,
+    /// When true the Bitbucket destination of an LFS repository is an SSH push mirror (`use_ssh`): Forgejo then pushes git history
+    /// only, so the copy carries pointers and no hold is needed. Takes precedence over `bitbucket_lfs_hold`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bitbucket_lfs_ssh: bool,
     /// Providers a `.github` (profile) repository is copied to. Absent: every derived provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_providers: Option<Vec<Provider>>,
@@ -514,6 +518,24 @@ mod tests {
             held,
             [(Provider::Gitlab, false), (Provider::Bitbucket, true)]
         );
+    }
+
+    #[test]
+    fn lfs_over_ssh_needs_no_hold() {
+        let mut p = placement(json!([]), json!([]));
+        p.derive.as_mut().unwrap().bitbucket_lfs_ssh = true;
+        run(
+            &mut p,
+            &[
+                src(14, "corbet-infra/big", true),
+                src(15, "corbet-infra/plain", true),
+            ],
+            &["corbet-infra/big"],
+        );
+        let d = &row(&p, "corbet-infra/big").destinations;
+        assert_eq!((d[1].use_ssh, d[1].hold.is_none()), (true, true));
+        assert!(!d[0].use_ssh);
+        assert!(!row(&p, "corbet-infra/plain").destinations[1].use_ssh);
     }
 
     #[test]
