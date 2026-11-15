@@ -407,328 +407,348 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 }) {
                     continue;
                 }
-                // Where this destination must live now, and every name it may
-                // still be known under (the file's last record, the live name).
-                let mut dest = declared_dest.clone();
-                dest.path = repo.destination_path(declared_dest);
-                let url = destination_url(&dest, &dest.path);
-                let mut known = names(&dest.path, &declared_dest.recorded_path, None);
-                let (mut mirror, owner) = locate(&dest, &mirrors, &known)?;
-                // An owned mirror whose address is none of this destination's
-                // names: the destination was renamed (an address cannot be edited).
-                let mut stale_owned = stale_of(&mirrors, &mirror, &owner);
-                let workspace_scope = format!(
-                    "{}/workspace/{}",
-                    dest.endpoint.origin,
-                    dest.path.split('/').next().ok_or("Missing workspace")?
-                );
-                if dest.provider == Provider::Bitbucket
-                    && mirror.as_ref().is_some_and(|m| {
-                        m["last_error"]
-                            .as_str()
-                            .is_some_and(|s| s.contains("HTTP 402") || s.contains("error: 402"))
-                    })
-                {
-                    io.state.windows.insert(
-                        workspace_scope.clone(),
-                        cfrg::native::http::Window {
-                            observed_at: cfrg::native::http::now()?,
-                            status: 402,
-                            retry_at: None,
-                        },
+                let outcome: Result<()> = (|| -> Result<()> {
+                    // Where this destination must live now, and every name it may
+                    // still be known under (the file's last record, the live name).
+                    let mut dest = declared_dest.clone();
+                    dest.path = repo.destination_path(declared_dest);
+                    let url = destination_url(&dest, &dest.path);
+                    let mut known = names(&dest.path, &declared_dest.recorded_path, None);
+                    let (mut mirror, owner) = locate(&dest, &mirrors, &known)?;
+                    // An owned mirror whose address is none of this destination's
+                    // names: the destination was renamed (an address cannot be edited).
+                    let mut stale_owned = stale_of(&mirrors, &mirror, &owner);
+                    let workspace_scope = format!(
+                        "{}/workspace/{}",
+                        dest.endpoint.origin,
+                        dest.path.split('/').next().ok_or("Missing workspace")?
                     );
-                    io.save()?;
-                }
-                let held = source_held
-                    || dest.hold.is_some()
-                    || io
-                        .state
-                        .windows
-                        .get(&workspace_scope)
-                        .is_some_and(|w| w.status == 402);
-                if held {
-                    incomplete = true;
-                }
-                if dest.absent || held {
-                    if stale_owned.is_some() {
-                        return Err("Owned mirror points at another destination".into());
+                    if dest.provider == Provider::Bitbucket
+                        && mirror.as_ref().is_some_and(|m| {
+                            m["last_error"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("HTTP 402") || s.contains("error: 402"))
+                        })
+                    {
+                        io.state.windows.insert(
+                            workspace_scope.clone(),
+                            cfrg::native::http::Window {
+                                observed_at: cfrg::native::http::now()?,
+                                status: 402,
+                                retry_at: None,
+                            },
+                        );
+                        io.save()?;
                     }
-                    // A hold means: do not touch. Only a declared absence, with nothing holding the
-                    // repository or the destination, removes an owned mirror.
-                    let removable = removable(dest.absent, held);
-                    if let Some(value) = &mirror {
-                        if removable && options.apply && options.operation == Operation::Reconcile {
-                            let remote =
-                                value["remote_name"].as_str().ok_or("Missing remote name")?;
-                            match delete_mirror(&mut io, &api, &placement.source, repo, remote)? {
-                                Deleted::Yes => {
-                                    mirrors.retain(|m| m["remote_name"] != value["remote_name"]);
-                                }
-                                Deleted::Held(reason) => {
-                                    // One refused deletion must not stop the pass: record it and go on.
-                                    incomplete = true;
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"delete-held", "reason":reason}));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            incomplete = true;
-                        }
-                    }
-                    let state = match (&mirror, removable) {
-                        (None, true) => "absent",
-                        (None, false) => "held",
-                        (Some(_), true)
-                            if options.apply && options.operation == Operation::Reconcile =>
-                        {
-                            "absent"
-                        }
-                        (Some(_), true) => "delete-planned",
-                        (Some(_), false) => "held-untouched",
-                    };
-                    report
-                        .push(json!({"source":repo.path, "destination":dest.path, "state":state}));
-                    continue;
-                }
-                if options.operation == Operation::Status {
-                    // Status reads the primary only. A mirror that still points at
-                    // an earlier name of the destination is a rename waiting for
-                    // `cfrg native --operation rename --apply`.
-                    let pending = stale_owned.is_some()
-                        || mirror
-                            .as_ref()
-                            .is_some_and(|m| !cfgj::native::address_matches(m, &url));
-                    let state = if pending { "rename-pending" } else { "checked" };
-                    report.push(json!({"source":repo.path, "destination":dest.path, "state":state, "mirror":mirror.as_ref().or(stale_owned.as_ref()).map(cfgj::native::status)}));
-                    incomplete |= pending || mirror.is_none();
-                    continue;
-                }
-                let write = options.apply
-                    && matches!(options.operation, Operation::Reconcile | Operation::Rename);
-                let naming = match dest.provider {
-                    Provider::Gitlab => cglb::native::naming(&mut io, &dest, write)?,
-                    Provider::Bitbucket => cbkt::native::naming(&mut io, &dest, write)?,
-                    Provider::Github => cghb::native::naming(&mut io, &dest, write)?,
-                };
-                let was = match naming {
-                    Naming::Current => None,
-                    Naming::Renamed { from } => {
-                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"renamed", "from":from}));
-                        Some(from)
-                    }
-                    Naming::Planned { from } => {
-                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"rename-planned", "from":from}));
+                    let held = source_held
+                        || dest.hold.is_some()
+                        || io
+                            .state
+                            .windows
+                            .get(&workspace_scope)
+                            .is_some_and(|w| w.status == 402);
+                    if held {
                         incomplete = true;
-                        continue;
                     }
-                    Naming::Blocked { from, reason } => {
-                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"rename-blocked", "from":from, "reason":reason}));
-                        incomplete = true;
-                        continue;
-                    }
-                };
-                if let Some(from) = &was {
-                    known = names(
-                        &dest.path,
-                        &declared_dest.recorded_path,
-                        Some(from.as_str()),
-                    );
-                    let (found, owner) = locate(&dest, &mirrors, &known)?;
-                    stale_owned = stale_of(&mirrors, &found, &owner);
-                    mirror = found;
-                }
-                if mirror.is_none() {
-                    if let Some(old) = stale_owned.take() {
-                        // The destination's identity was just verified by id. The
-                        // mirror is ours by record, it points at no name of this
-                        // destination and at no other declared destination of
-                        // this repository, on the same host: an earlier name.
-                        let others: Vec<String> = repo
-                            .destinations
-                            .iter()
-                            .filter(|other| !std::ptr::eq(*other, declared_dest))
-                            .map(|other| destination_url(other, &repo.destination_path(other)))
-                            .collect();
-                        if dest.repository_id.is_none()
-                            || !same_host(&old, &url)
-                            || others
-                                .iter()
-                                .any(|other| cfgj::native::address_matches(&old, other))
-                        {
+                    if dest.absent || held {
+                        if stale_owned.is_some() {
                             return Err("Owned mirror points at another destination".into());
                         }
-                        mirror = Some(old);
-                    }
-                }
-                if options.operation == Operation::Rename {
-                    let stale = was.is_some()
-                        || mirror
-                            .as_ref()
-                            .is_some_and(|m| !cfgj::native::address_matches(m, &url));
-                    if !stale {
+                        // A hold means: do not touch. Only a declared absence, with nothing holding the
+                        // repository or the destination, removes an owned mirror.
+                        let removable = removable(dest.absent, held);
+                        if let Some(value) = &mirror {
+                            if removable
+                                && options.apply
+                                && options.operation == Operation::Reconcile
+                            {
+                                let remote =
+                                    value["remote_name"].as_str().ok_or("Missing remote name")?;
+                                match delete_mirror(&mut io, &api, &placement.source, repo, remote)?
+                                {
+                                    Deleted::Yes => {
+                                        mirrors
+                                            .retain(|m| m["remote_name"] != value["remote_name"]);
+                                    }
+                                    Deleted::Held(reason) => {
+                                        // One refused deletion must not stop the pass: record it and go on.
+                                        incomplete = true;
+                                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"delete-held", "reason":reason}));
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                incomplete = true;
+                            }
+                        }
+                        let state = match (&mirror, removable) {
+                            (None, true) => "absent",
+                            (None, false) => "held",
+                            (Some(_), true)
+                                if options.apply && options.operation == Operation::Reconcile =>
+                            {
+                                "absent"
+                            }
+                            (Some(_), true) => "delete-planned",
+                            (Some(_), false) => "held-untouched",
+                        };
                         report.push(
+                            json!({"source":repo.path, "destination":dest.path, "state":state}),
+                        );
+                        return Ok(());
+                    }
+                    if options.operation == Operation::Status {
+                        // Status reads the primary only. A mirror that still points at
+                        // an earlier name of the destination is a rename waiting for
+                        // `cfrg native --operation rename --apply`.
+                        let pending = stale_owned.is_some()
+                            || mirror
+                                .as_ref()
+                                .is_some_and(|m| !cfgj::native::address_matches(m, &url));
+                        let state = if pending { "rename-pending" } else { "checked" };
+                        report.push(json!({"source":repo.path, "destination":dest.path, "state":state, "mirror":mirror.as_ref().or(stale_owned.as_ref()).map(cfgj::native::status)}));
+                        incomplete |= pending || mirror.is_none();
+                        return Ok(());
+                    }
+                    let write = options.apply
+                        && matches!(options.operation, Operation::Reconcile | Operation::Rename);
+                    let naming = match dest.provider {
+                        Provider::Gitlab => cglb::native::naming(&mut io, &dest, write)?,
+                        Provider::Bitbucket => cbkt::native::naming(&mut io, &dest, write)?,
+                        Provider::Github => cghb::native::naming(&mut io, &dest, write)?,
+                    };
+                    let was = match naming {
+                        Naming::Current => None,
+                        Naming::Renamed { from } => {
+                            report.push(json!({"source":repo.path, "destination":dest.path, "state":"renamed", "from":from}));
+                            Some(from)
+                        }
+                        Naming::Planned { from } => {
+                            report.push(json!({"source":repo.path, "destination":dest.path, "state":"rename-planned", "from":from}));
+                            incomplete = true;
+                            return Ok(());
+                        }
+                        Naming::Blocked { from, reason } => {
+                            report.push(json!({"source":repo.path, "destination":dest.path, "state":"rename-blocked", "from":from, "reason":reason}));
+                            incomplete = true;
+                            return Ok(());
+                        }
+                    };
+                    if let Some(from) = &was {
+                        known = names(
+                            &dest.path,
+                            &declared_dest.recorded_path,
+                            Some(from.as_str()),
+                        );
+                        let (found, owner) = locate(&dest, &mirrors, &known)?;
+                        stale_owned = stale_of(&mirrors, &found, &owner);
+                        mirror = found;
+                    }
+                    if mirror.is_none() {
+                        if let Some(old) = stale_owned.take() {
+                            // The destination's identity was just verified by id. The
+                            // mirror is ours by record, it points at no name of this
+                            // destination and at no other declared destination of
+                            // this repository, on the same host: an earlier name.
+                            let others: Vec<String> = repo
+                                .destinations
+                                .iter()
+                                .filter(|other| !std::ptr::eq(*other, declared_dest))
+                                .map(|other| destination_url(other, &repo.destination_path(other)))
+                                .collect();
+                            if dest.repository_id.is_none()
+                                || !same_host(&old, &url)
+                                || others
+                                    .iter()
+                                    .any(|other| cfgj::native::address_matches(&old, other))
+                            {
+                                return Err("Owned mirror points at another destination".into());
+                            }
+                            mirror = Some(old);
+                        }
+                    }
+                    if options.operation == Operation::Rename {
+                        let stale = was.is_some()
+                            || mirror
+                                .as_ref()
+                                .is_some_and(|m| !cfgj::native::address_matches(m, &url));
+                        if !stale {
+                            report.push(
                             json!({"source":repo.path, "destination":dest.path, "state":"current"}),
                         );
-                        continue;
+                            return Ok(());
+                        }
                     }
-                }
-                // A rename never creates: a destination that is missing is reported.
-                let allow_create = !options.existing_only && options.operation != Operation::Rename;
-                let target = match dest.provider {
-                    Provider::Gitlab => cglb::native::ensure_destination_repo(
-                        &mut io,
-                        repo,
-                        &dest,
-                        write,
-                        allow_create,
-                    )?,
-                    Provider::Bitbucket => cbkt::native::ensure_destination_repo(
-                        &mut io,
-                        repo,
-                        &dest,
-                        write,
-                        allow_create,
-                    )?,
-                    Provider::Github => cghb::native::ensure_destination_repo(
-                        &mut io,
-                        repo,
-                        &dest,
-                        write,
-                        allow_create,
-                    )?,
-                };
-                if dest.use_ssh && target.is_some() && mirror.is_none() && write {
-                    let value = create_owned(&api, &mut io, &dest, &url)?;
-                    mirrors.push(value.clone());
-                    mirror = Some(value);
-                }
-                let lock_exempt = dest.lock_exception.is_some()
-                    && dest.provider == Provider::Github
-                    && repo.private;
-                let protected = if target.is_some() && lock_exempt {
-                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"lock-exception", "lock":"unavailable", "reason":dest.lock_exception}));
-                    true
-                } else if target.is_some() {
-                    match dest.provider {
-                        Provider::Gitlab if dest.use_ssh => match &mirror {
-                            Some(value) => cglb::native::protect_ssh(
+                    // A rename never creates: a destination that is missing is reported.
+                    let allow_create =
+                        !options.existing_only && options.operation != Operation::Rename;
+                    let target = match dest.provider {
+                        Provider::Gitlab => cglb::native::ensure_destination_repo(
+                            &mut io,
+                            repo,
+                            &dest,
+                            write,
+                            allow_create,
+                        )?,
+                        Provider::Bitbucket => cbkt::native::ensure_destination_repo(
+                            &mut io,
+                            repo,
+                            &dest,
+                            write,
+                            allow_create,
+                        )?,
+                        Provider::Github => cghb::native::ensure_destination_repo(
+                            &mut io,
+                            repo,
+                            &dest,
+                            write,
+                            allow_create,
+                        )?,
+                    };
+                    if dest.use_ssh && target.is_some() && mirror.is_none() && write {
+                        let value = create_owned(&api, &mut io, &dest, &url)?;
+                        mirrors.push(value.clone());
+                        mirror = Some(value);
+                    }
+                    let lock_exempt = dest.lock_exception.is_some()
+                        && dest.provider == Provider::Github
+                        && repo.private;
+                    let protected = if target.is_some() && lock_exempt {
+                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"lock-exception", "lock":"unavailable", "reason":dest.lock_exception}));
+                        true
+                    } else if target.is_some() {
+                        match dest.provider {
+                            Provider::Gitlab if dest.use_ssh => match &mirror {
+                                Some(value) => cglb::native::protect_ssh(
+                                    &mut io,
+                                    &dest,
+                                    &repo.default_branch,
+                                    value,
+                                    write,
+                                )?,
+                                None => false,
+                            },
+                            Provider::Gitlab => {
+                                cglb::native::protect(&mut io, &dest, &repo.default_branch, write)?
+                            }
+                            Provider::Bitbucket if dest.use_ssh => match &mirror {
+                                // The key of the Forgejo SSH push mirror lives on the mirror account; restrictions admit that user.
+                                Some(value) => {
+                                    cbkt::native::enroll_key(&mut io, &dest, value, write)?
+                                        && cbkt::native::restrict(
+                                            &mut io,
+                                            &dest,
+                                            write,
+                                            &[dest.restriction_user()],
+                                        )?
+                                }
+                                None => false,
+                            },
+                            Provider::Bitbucket => cbkt::native::restrict(
+                                &mut io,
+                                &dest,
+                                write,
+                                &[dest.restriction_user()],
+                            )?,
+                            Provider::Github => cghb::native::protect(&mut io, repo, &dest, write)?,
+                        }
+                    } else {
+                        false
+                    };
+                    if !protected {
+                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"destination-or-protection-required"}));
+                        incomplete = true;
+                        return Ok(());
+                    }
+                    let mut replaced = None;
+                    if mirror
+                        .as_ref()
+                        .is_some_and(|m| !cfgj::native::matches(m, &dest, &url))
+                    {
+                        if write {
+                            // Forgejo has no update API: replace only an owned mirror,
+                            // after destination protection is reverified.
+                            let old = mirror.take().ok_or("Missing mirror")?;
+                            let name = old["remote_name"].as_str().ok_or("Missing remote name")?;
+                            api.delete(&mut io, name)?;
+                            mirrors.retain(|m| m["remote_name"] != old["remote_name"]);
+                            replaced = Some(name.to_string());
+                        } else {
+                            report.push(json!({"source":repo.path, "destination":dest.path, "state":"replace-planned"}));
+                            incomplete = true;
+                            return Ok(());
+                        }
+                    }
+                    if mirror.is_none() && write {
+                        let value = create_owned(&api, &mut io, &dest, &url)?;
+                        if dest.use_ssh && dest.provider == Provider::Gitlab {
+                            cglb::native::protect_ssh(
                                 &mut io,
                                 &dest,
                                 &repo.default_branch,
-                                value,
-                                write,
-                            )?,
-                            None => false,
-                        },
-                        Provider::Gitlab => {
-                            cglb::native::protect(&mut io, &dest, &repo.default_branch, write)?
-                        }
-                        Provider::Bitbucket if dest.use_ssh => match &mirror {
-                            // The key of the Forgejo SSH push mirror lives on the mirror account; restrictions admit that user.
-                            Some(value) => {
-                                cbkt::native::enroll_key(&mut io, &dest, value, write)?
-                                    && cbkt::native::restrict(
-                                        &mut io,
-                                        &dest,
-                                        write,
-                                        &[dest.restriction_user()],
-                                    )?
+                                &value,
+                                true,
+                            )?;
+                            if let Some(old) = &replaced {
+                                // The new key is enrolled: the old mirror's key is an orphan.
+                                cglb::native::forget_key(&mut io, &dest, old)?;
                             }
-                            None => false,
-                        },
-                        Provider::Bitbucket => cbkt::native::restrict(
-                            &mut io,
-                            &dest,
-                            write,
-                            &[dest.restriction_user()],
-                        )?,
-                        Provider::Github => cghb::native::protect(&mut io, repo, &dest, write)?,
+                        }
+                        if dest.use_ssh && dest.provider == Provider::Bitbucket {
+                            cbkt::native::enroll_key(&mut io, &dest, &value, true)?;
+                            if let Some(old) = &replaced {
+                                cbkt::native::forget_key(&mut io, &dest, old)?;
+                            }
+                        }
+                        mirrors.push(value.clone());
+                        mirror = Some(value);
                     }
-                } else {
-                    false
-                };
-                if !protected {
-                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"destination-or-protection-required"}));
-                    incomplete = true;
-                    continue;
-                }
-                let mut replaced = None;
-                if mirror
-                    .as_ref()
-                    .is_some_and(|m| !cfgj::native::matches(m, &dest, &url))
-                {
-                    if write {
-                        // Forgejo has no update API: replace only an owned mirror,
-                        // after destination protection is reverified.
-                        let old = mirror.take().ok_or("Missing mirror")?;
-                        let name = old["remote_name"].as_str().ok_or("Missing remote name")?;
-                        api.delete(&mut io, name)?;
-                        mirrors.retain(|m| m["remote_name"] != old["remote_name"]);
-                        replaced = Some(name.to_string());
+                    if let Some(value) = &mirror {
+                        let target = target.as_ref().ok_or("Missing verified destination")?;
+                        let default_branch_ready = match dest.provider {
+                            Provider::Gitlab => cglb::native::finalize_default_branch(
+                                &mut io, repo, &dest, target, write,
+                            )?,
+                            Provider::Bitbucket => cbkt::native::finalize_default_branch(
+                                &mut io, repo, &dest, target, write,
+                            )?,
+                            Provider::Github => cghb::native::finalize_default_branch(
+                                &mut io, repo, &dest, target, write,
+                            )?,
+                        };
+                        incomplete |= !default_branch_ready;
+                        managed.push(value["remote_name"].clone());
+                        let mut row = json!({"source":repo.path, "destination":dest.path, "state":"configured", "default_branch_ready":default_branch_ready, "mirror":cfgj::native::status(value)});
+                        // A configured mirror is not proof of replication: where the
+                        // destination can be read cheaply, compare the refs themselves.
+                        if dest.provider == Provider::Github
+                            && matches!(
+                                options.operation,
+                                Operation::Plan | Operation::Reconcile | Operation::SyncNow
+                            )
+                        {
+                            let heads = compare_heads(&mut io, &api, repo, &dest)?;
+                            incomplete |= heads["equal"] != true;
+                            row["heads"] = heads;
+                        }
+                        report.push(row);
                     } else {
-                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"replace-planned"}));
                         incomplete = true;
-                        continue;
-                    }
-                }
-                if mirror.is_none() && write {
-                    let value = create_owned(&api, &mut io, &dest, &url)?;
-                    if dest.use_ssh && dest.provider == Provider::Gitlab {
-                        cglb::native::protect_ssh(
-                            &mut io,
-                            &dest,
-                            &repo.default_branch,
-                            &value,
-                            true,
-                        )?;
-                        if let Some(old) = &replaced {
-                            // The new key is enrolled: the old mirror's key is an orphan.
-                            cglb::native::forget_key(&mut io, &dest, old)?;
-                        }
-                    }
-                    if dest.use_ssh && dest.provider == Provider::Bitbucket {
-                        cbkt::native::enroll_key(&mut io, &dest, &value, true)?;
-                        if let Some(old) = &replaced {
-                            cbkt::native::forget_key(&mut io, &dest, old)?;
-                        }
-                    }
-                    mirrors.push(value.clone());
-                    mirror = Some(value);
-                }
-                if let Some(value) = &mirror {
-                    let target = target.as_ref().ok_or("Missing verified destination")?;
-                    let default_branch_ready = match dest.provider {
-                        Provider::Gitlab => cglb::native::finalize_default_branch(
-                            &mut io, repo, &dest, target, write,
-                        )?,
-                        Provider::Bitbucket => cbkt::native::finalize_default_branch(
-                            &mut io, repo, &dest, target, write,
-                        )?,
-                        Provider::Github => cghb::native::finalize_default_branch(
-                            &mut io, repo, &dest, target, write,
-                        )?,
-                    };
-                    incomplete |= !default_branch_ready;
-                    managed.push(value["remote_name"].clone());
-                    let mut row = json!({"source":repo.path, "destination":dest.path, "state":"configured", "default_branch_ready":default_branch_ready, "mirror":cfgj::native::status(value)});
-                    // A configured mirror is not proof of replication: where the
-                    // destination can be read cheaply, compare the refs themselves.
-                    if dest.provider == Provider::Github
-                        && matches!(
-                            options.operation,
-                            Operation::Plan | Operation::Reconcile | Operation::SyncNow
-                        )
-                    {
-                        let heads = compare_heads(&mut io, &api, repo, &dest)?;
-                        incomplete |= heads["equal"] != true;
-                        row["heads"] = heads;
-                    }
-                    report.push(row);
-                } else {
-                    incomplete = true;
-                    report.push(
+                        report.push(
                     json!({"source":repo.path, "destination":dest.path, "state":"create-planned"}),
                 );
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = outcome {
+                    let message = error.to_string();
+                    // A rate window, an auth refusal, a server error or an uncertain write stops the run (the transport recorded why);
+                    // any other refusal belongs to this one destination: record it with the provider's message and go on.
+                    if stops_the_run(&message) {
+                        return Err(error);
+                    }
+                    incomplete = true;
+                    report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"error", "error":message}));
                 }
             }
             if options.provider.is_none() {
@@ -1097,6 +1117,13 @@ fn create_owned(
     Ok(value)
 }
 
+/// Errors that must stop the whole run: the transport's own stops (rate window, auth, server error, uncertain write).
+fn stops_the_run(message: &str) -> bool {
+    message.contains("stopped without retry")
+        || message.contains("Uncertain prior write")
+        || message.contains("interrupted")
+}
+
 enum Deleted {
     Yes,
     Held(String),
@@ -1308,6 +1335,16 @@ mod tests {
             delete_mirror(&mut io, &api, &placement.source, repo, "remote_mirror_x").unwrap(),
             Deleted::Held(_)
         ));
+    }
+
+    #[test]
+    fn only_transport_stops_end_the_run() {
+        assert!(stops_the_run(
+            "Native API HTTP 429; stopped without retry; window/intent recorded"
+        ));
+        assert!(stops_the_run("Uncertain prior write; read provider state"));
+        assert!(!stops_the_run("Native API HTTP 400; no retry"));
+        assert!(!stops_the_run("Native API HTTP 423; no retry"));
     }
 
     /// Answers by method and path; an unexpected request fails the test.
