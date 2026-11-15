@@ -11,6 +11,8 @@
 //!   copy         the git copy of every repository (the script of `/hooks/copy` without a repository): the catch-up for a missed push or new-repository event
 //!   gitlab-key   the GitLab key renewal (`--gitlab-key-script`), when the credentials gitlab_token and forgejo_push are there; dry: nothing is due (a connection test)
 //!
+//! `--only native,settings --repository OWNER/REPO` runs those steps for one repository: `/hooks/place` (a repository placed on the forge's event).
+//!
 //! The database connection string is built here from the files `host port dbname username password` of the credentials directory
 //! (a mounted Secret or a systemd credential directory) and handed to the child as `CFRG_RELAY_DATABASE`; it never appears in an argument or in the output.
 use cfrg::Result;
@@ -64,6 +66,13 @@ pub struct Options {
     /// Look only: every step plans or tests, nothing is written.
     #[arg(long, env = "DAILY_DRY_RUN")]
     dry: bool,
+    /// Run only these steps (comma-separated names), in their usual order.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// The `cfrg native` steps (native, settings, wiki) cover this one repository `OWNER/REPO`: the placement of a repository on the
+    /// forge's event (`/hooks/place`), with the same credentials and gates as the daily run.
+    #[arg(long)]
+    repository: Option<String>,
 }
 
 /// What one step does.
@@ -390,11 +399,32 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
     ]
 }
 
+/// The steps named by `only` (all when empty); with a repository, every `cfrg native` step is limited to it.
+pub fn select(steps: Vec<Step>, only: &[String], repository: Option<&str>) -> Vec<Step> {
+    steps
+        .into_iter()
+        .filter(|step| only.is_empty() || only.iter().any(|name| name == step.name))
+        .map(|mut step| {
+            if let (Some(repository), Action::Command { args, .. }) = (repository, &mut step.action)
+            {
+                if args.first().map(String::as_str) == Some("native") {
+                    args.extend(["--repository".into(), repository.to_owned()]);
+                }
+            }
+            step
+        })
+        .collect()
+}
+
 pub fn run(options: Options) -> Result<()> {
     let exe = std::env::current_exe()?;
     fs::create_dir_all(&options.state).ok();
     fs::create_dir_all("/work/gitlab-key").ok();
-    let steps = plan(&options, &exe);
+    let steps = select(
+        plan(&options, &exe),
+        &options.only,
+        options.repository.as_deref(),
+    );
     let failed = run_steps(&steps);
     if failed.is_empty() {
         Ok(())
@@ -468,7 +498,40 @@ mod tests {
             max_writes: 20,
             wiki_key_id: None,
             dry,
+            only: Vec::new(),
+            repository: None,
         }
+    }
+
+    #[test]
+    fn only_and_repository_limit_the_native_steps_to_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["forgejo-token", "gitlab-token"] {
+            fs::write(dir.path().join(file), "t").unwrap();
+        }
+        let steps = plan(&options(dir.path(), false), Path::new("/bin/cfrg"));
+        let chosen = select(
+            steps.clone(),
+            &["native".into(), "settings".into()],
+            Some("o/r"),
+        );
+        assert_eq!(
+            chosen.iter().map(|s| s.name).collect::<Vec<_>>(),
+            ["native", "settings"]
+        );
+        for step in &chosen {
+            let Action::Command { args, .. } = &step.action else {
+                continue;
+            };
+            assert_eq!(
+                &args[args.len() - 2..],
+                ["--repository", "o/r"],
+                "{}",
+                step.name
+            );
+        }
+        // Without both, nothing changes.
+        assert_eq!(select(steps.clone(), &[], None).len(), steps.len());
     }
 
     #[test]
