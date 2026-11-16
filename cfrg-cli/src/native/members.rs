@@ -16,15 +16,11 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn run(options: &Options) -> Result<()> {
-    if options.apply {
-        return Err(
-            "Member sync is read-only until the identity table is decided and reviewed".into(),
-        );
-    }
+    let apply = options.apply;
     let creds = super::creds::Creds::new(options.credentials_dir.clone());
     let mut placement = creds.placement(&std::fs::read(&options.placement)?)?;
     placement.validate()?;
-    let mut io = creds.open(&options.state, false)?;
+    let mut io = creds.open(&options.state, apply)?;
     super::derive::apply(&creds, &mut placement, &mut io, None)?;
     placement.validate()?;
     // Our own forge: one read a second.
@@ -150,6 +146,17 @@ pub fn run(options: &Options) -> Result<()> {
             "copies_needing_a_grant": {"github":covered("github"), "gitlab":covered("gitlab"), "bitbucket":covered("bitbucket")},
         }));
     }
+    let applied = if apply {
+        // Another credential than the App's: a collaborator write needs Administration: write, which the App does not hold (R65).
+        io.set_pacing(Pacing {
+            read: 2,
+            write: 120,
+            creation: 0,
+        });
+        apply_github(&mut io, &plan.grants, options.max_writes.unwrap_or(5))?
+    } else {
+        Vec::new()
+    };
     let mut grants_by_provider: BTreeMap<&str, usize> = BTreeMap::new();
     for grant in &plan.grants {
         *grants_by_provider.entry(grant.provider).or_default() += 1;
@@ -165,7 +172,184 @@ pub fn run(options: &Options) -> Result<()> {
             "grants_planned": grants_by_provider,
             "grants": plan.grants,
             "unplaced": plan.unplaced,
+            "applied": applied,
         }))?
     );
     Ok(())
+}
+
+/// The credential of the GitHub member writes: the owner's token (the gate's write credential), never the App's.
+const MEMBERS_TOKEN_ENV: &str = "CFRG_GITHUB_MEMBERS_TOKEN";
+
+fn github_request(
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+) -> cfrg::native::http::Request {
+    cfrg::native::http::Request {
+        endpoint: cfrg::native::Endpoint {
+            origin: "https://api.github.com".into(),
+            token_env: MEMBERS_TOKEN_ENV.into(),
+        },
+        auth: cfrg::native::http::Auth::Bearer,
+        method,
+        path,
+        body,
+        scope: "https://api.github.com/members".into(),
+        creation: false,
+    }
+}
+
+/// Whether the permission a collaborator already holds is at least triage (never lowered, never touched).
+fn at_least_triage(permission: &str) -> bool {
+    matches!(permission, "triage" | "write" | "maintain" | "admin")
+}
+
+/// Applies the GitHub grants of the plan: triage for the handle, one paced write each, at most `max` writes per run. A copy
+/// that is not on GitHub yet, or a handle that already holds triage or more, is reported and not written. Only GitHub grants
+/// are applied here (the identity table of 2026-11-16 maps GitHub handles); a stop of the transport ends the run.
+fn apply_github(
+    io: &mut dyn cfrg::native::http::Transport,
+    grants: &[copy_access::Grant],
+    max: usize,
+) -> Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    let mut written = 0usize;
+    for grant in grants.iter().filter(|g| g.provider == "github") {
+        let row = |state: &str| json!({"copy": grant.copy, "handle": grant.handle, "role": grant.native_role, "state": state});
+        if grant.role != copy_access::CopyRole::Triage && grant.role != copy_access::CopyRole::Read
+        {
+            continue;
+        }
+        let path = format!("/repos/{}/collaborators/{}", grant.copy, grant.handle);
+        let seen = io.send(github_request("GET", format!("{path}/permission"), None));
+        let seen = match seen {
+            Ok(response) => response,
+            Err(error) if error.to_string().contains(cfrg::native::http::REFUSED_MARK) => {
+                rows.push(row("refused"));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match seen.status {
+            200 => {
+                // `role_name` is the real role (triage, maintain, ...); the legacy `permission` folds triage into read.
+                let held = seen.body["role_name"]
+                    .as_str()
+                    .or(seen.body["permission"].as_str())
+                    .unwrap_or("none");
+                if at_least_triage(held) {
+                    rows.push(row("already"));
+                    continue;
+                }
+            }
+            404 => {
+                rows.push(row("copy-absent"));
+                continue;
+            }
+            _ => {
+                rows.push(row("unexpected-read"));
+                continue;
+            }
+        }
+        if written >= max {
+            rows.push(row("write-budget-spent"));
+            continue;
+        }
+        written += 1;
+        let put = io.send(github_request(
+            "PUT",
+            path,
+            Some(json!({"permission": grant.native_role})),
+        ));
+        match put {
+            // 201: an invitation was created; 204: the person already is a collaborator and the role was set.
+            Ok(response) if matches!(response.status, 201 | 204) => {
+                rows.push(row(if response.status == 201 {
+                    "invited"
+                } else {
+                    "applied"
+                }))
+            }
+            Ok(_) => rows.push(row("unexpected-write")),
+            Err(error) if error.to_string().contains(cfrg::native::http::REFUSED_MARK) => {
+                rows.push(row("refused"))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfrg::native::http::{Request, Response, Transport};
+
+    struct Seq(Vec<(&'static str, u16, Value)>, Vec<String>);
+    impl Transport for Seq {
+        fn send(&mut self, request: Request) -> Result<Response> {
+            self.1.push(format!("{} {}", request.method, request.path));
+            let (method, status, body) = self.0.remove(0);
+            assert_eq!(method, request.method);
+            Ok(Response { status, body })
+        }
+    }
+
+    fn grant(copy: &str, handle: &str) -> copy_access::Grant {
+        copy_access::Grant {
+            provider: "github",
+            copy: copy.into(),
+            person: "p".into(),
+            handle: handle.into(),
+            role: copy_access::CopyRole::Triage,
+            native_role: "triage",
+        }
+    }
+
+    #[test]
+    fn triage_is_written_only_where_it_is_missing_and_never_lowered() {
+        let grants = vec![
+            grant("o/a", "h"),
+            grant("o/b", "h"),
+            grant("o/c", "h"),
+            grant("o/d", "h"),
+        ];
+        let mut io = Seq(
+            vec![
+                (
+                    "GET",
+                    200,
+                    json!({"permission": "read", "role_name": "read"}),
+                ),
+                ("PUT", 201, Value::Null),
+                (
+                    "GET",
+                    200,
+                    json!({"permission": "read", "role_name": "triage"}),
+                ),
+                ("GET", 404, Value::Null),
+                ("GET", 200, json!({"permission": "none"})),
+            ],
+            vec![],
+        );
+        // budget of one write: o/a is invited, o/b is left alone, o/c is absent, o/d waits for the next run
+        let rows = apply_github(&mut io, &grants, 1).unwrap();
+        let states: Vec<_> = rows.iter().map(|r| r["state"].as_str().unwrap()).collect();
+        assert_eq!(
+            states,
+            ["invited", "already", "copy-absent", "write-budget-spent"]
+        );
+        assert_eq!(io.1.iter().filter(|c| c.starts_with("PUT")).count(), 1);
+        assert!(io.1[1].starts_with("PUT /repos/o/a/collaborators/h"));
+    }
+
+    #[test]
+    fn the_role_written_is_never_above_triage() {
+        assert!(at_least_triage("admin") && at_least_triage("triage") && !at_least_triage("read"));
+        assert_eq!(
+            copy_access::native_role(Provider::Github, copy_access::CopyRole::Triage),
+            "triage"
+        );
+    }
 }

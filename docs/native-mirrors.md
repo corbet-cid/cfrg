@@ -189,14 +189,17 @@ has to lose it (the updater runs on Forgejo).
 
 ## Members of a copy: `--operation members`
 
-Read-only. Reads the primary's non-owner team members and repository collaborators,
+Reads the primary's non-owner team members and repository collaborators,
 applies the one-way role rule of `cfrg::copy_access` and prints the grants it would make and
 the members it cannot place. GitHub: triage. GitLab: Reporter (reads the code, manages
 issues). Bitbucket has no triage role, so a private copy gets read and a public one nothing.
 No role this module can produce may push or merge. `--identities FILE` is the identity table
 (person id, one handle per forge); a member without an entry, or without an account on a
 forge, is reported and never guessed. `--copies-from REPORT` limits the plan to the copies a
-`settings` run found. `--apply` is refused until the identity table is decided and reviewed.
+`settings` run found. Without `--apply` it is read-only. With `--apply` it writes the GitHub grants (GitHub handles only for now), each as one paced
+collaborator write with the role triage, at most `--max-writes` (5) per run: a copy not on GitHub yet, or a handle that already
+holds triage or more, is reported and not written, and no role is ever lowered. The write uses the owner's token from
+`CFRG_GITHUB_MEMBERS_TOKEN`, not the GitHub App's (a collaborator write needs Administration: write, which the App does not hold).
 The default-branch lock of every copy is the receiver lock above.
 
 ## Protection of a copy: `--operation protection`

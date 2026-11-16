@@ -49,6 +49,9 @@ changes the licence and some defaults.
 - `cfrg gate`: `budgets.new_repos_per_day_by_org` gives single organisations their own daily creation cap (a ramp for a
   fresh GitHub App installation); an organisation without an entry keeps `new_repos_per_day_org`.
 
+- `cfrg native --operation members --apply`: writes the planned GitHub grants (triage only, paced, `--max-writes` per run, never lowering a role),
+  with the token in `CFRG_GITHUB_MEMBERS_TOKEN`.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.
