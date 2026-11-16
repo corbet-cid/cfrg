@@ -593,7 +593,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         Provider::Bitbucket => cbkt::native::ensure_destination_repo(
                             &mut io,
                             repo,
-                            &dest,
+                            &bitbucket_creation_dest(&dest, repo, placement.derive.as_ref()),
                             write,
                             allow_create,
                         )?,
@@ -1133,6 +1133,22 @@ fn stops_the_run(message: &str) -> bool {
         || message.contains("interrupted")
 }
 
+/// The destination a Bitbucket repository is created from: a public primary goes to the derive policy's public project, a
+/// private one keeps the owner's. A project never holds both kinds.
+fn bitbucket_creation_dest(
+    dest: &cfrg::native::Destination,
+    repo: &Repository,
+    derive: Option<&cfrg::native::derive::Derive>,
+) -> cfrg::native::Destination {
+    let mut dest = dest.clone();
+    if !repo.private {
+        if let Some(namespace) = derive.and_then(|d| d.bitbucket_public_namespace.as_ref()) {
+            dest.namespace = namespace.clone();
+        }
+    }
+    dest
+}
+
 /// Runs `operation` on an archived Forgejo repository with the archive lifted, and puts the archive back afterwards, also when the
 /// operation fails. A repository that cannot be unarchived is an error naming it; so is one that cannot be archived again.
 fn with_archive_lifted<T>(
@@ -1333,6 +1349,27 @@ mod tests {
         assert!(!same_host(&on_host, "https://bitbucket.org/team/new.git"));
         assert!(!same_host(&json!({"remote_name":"m"}), url));
     }
+    #[test]
+    fn a_public_bitbucket_copy_is_created_in_the_public_project_and_a_private_one_in_the_owners() {
+        let document = |private: bool, derive: &str| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"derive":{derive},"repositories":[{{"path":"o/r","source_id":1,"private":{private},"default_branch":"main","content":"native-git","hold":null,"destinations":[{{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"path":"o/r","namespace":"CORE","repository_id":null,"mirror_user":"{{u}}","password_env":"B","use_ssh":false,"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}}]}}]}}"#
+            )
+        };
+        let with = r#"{"bitbucket_public_namespace":"PUB","owners":{}}"#;
+        for (private, derive, wanted) in [
+            (false, with, "PUB"),
+            (true, with, "CORE"),
+            (false, r#"{"owners":{}}"#, "CORE"),
+        ] {
+            let placement = Placement::from_document(document(private, derive).as_bytes()).unwrap();
+            let repo = &placement.repositories[0];
+            let made =
+                bitbucket_creation_dest(&repo.destinations[0], repo, placement.derive.as_ref());
+            assert_eq!(made.namespace, wanted, "private={private}");
+        }
+    }
+
     #[test]
     fn an_operation_on_an_archived_repository_runs_with_the_archive_lifted_and_restores_it_even_on_failure(
     ) {

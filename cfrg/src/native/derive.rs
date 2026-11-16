@@ -47,6 +47,11 @@ pub struct Derive {
     /// only, so the copy carries pointers and no hold is needed. Takes precedence over `bitbucket_lfs_hold`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bitbucket_lfs_ssh: bool,
+    /// The Bitbucket project a PUBLIC copy is created in. A project never holds public and private repositories (owner,
+    /// 2026-11-16: Bitbucket must not expose what is not public everywhere else), so private copies go to the owner's
+    /// project and public ones to this one (`PUB`). Absent: every copy is created in the owner's project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitbucket_public_namespace: Option<String>,
     /// Providers a `.github` (profile) repository is copied to. Absent: every derived provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_providers: Option<Vec<Provider>>,

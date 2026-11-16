@@ -59,6 +59,9 @@ changes the licence and some defaults.
 - `cfrg native`: creating a push mirror for an ARCHIVED Forgejo primary (HTTP 423) lifts the archive for that one call and puts
   it back, also when the creation fails.
 
+- `derive.bitbucket_public_namespace`: the Bitbucket project a PUBLIC copy is created in (a project never holds public and
+  private repositories); private copies keep the owner's project.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.
