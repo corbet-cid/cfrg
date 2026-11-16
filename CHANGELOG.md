@@ -4,7 +4,7 @@ All notable changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/); while it is below 1.0 a minor version may change behaviour.
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-11-16
 
 The first public release. The workspace carried the number `0.1.0` internally while it was private; no `0.1.0` was ever
 published, so the first public version is `0.2.0`, a minor step because it adds the relay, the receiver and take-in and
