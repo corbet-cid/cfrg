@@ -49,6 +49,9 @@ changes the licence and some defaults.
 - `cfrg gate`: `budgets.new_repos_per_day_by_org` gives single organisations their own daily creation cap (a ramp for a
   fresh GitHub App installation); an organisation without an entry keeps `new_repos_per_day_org`.
 
+- `cfrg-serve`: while it runs with a relay database, it tries the open release intents again every 15 minutes (the logic of
+  `release-resume`), so a release whose tag reached a copy late (exit 75, `pending_tag`) no longer waits for the daily run.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

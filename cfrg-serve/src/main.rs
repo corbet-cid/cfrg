@@ -70,6 +70,9 @@ async fn run(args: &[String]) -> cfrg_serve::config::Result<u8> {
     }
 }
 
+/// How often the receiver tries its open release intents again (the daily run does it too).
+const RESUME_EVERY: std::time::Duration = std::time::Duration::from_secs(900);
+
 async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u8> {
     let config = Config::load(&PathBuf::from(config_path))?;
     let creds = Credentials::load(&PathBuf::from(secrets));
@@ -101,6 +104,20 @@ async fn serve(config_path: &str, secrets: &str) -> cfrg_serve::config::Result<u
     bridge.run_workers(workers);
     if let Some(journal) = journal {
         bridge.attach_journal(journal);
+    }
+    // A release whose tag is not on a copy yet (exit 75: the copy's push mirror has not run) must not wait for the daily run:
+    // the open intents are tried again every RESUME_EVERY while the receiver runs, one sync each, and an intent that finds its
+    // tag is cleared. Without a relay database there is nothing to resume.
+    if relay_on {
+        let (config_path, secrets) = (config_path.to_owned(), secrets.to_owned());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RESUME_EVERY).await;
+                if let Err(error) = release_resume(&config_path, &secrets).await {
+                    eprintln!("release-resume: {error}");
+                }
+            }
+        });
     }
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut ports = serde_json::Map::new();
