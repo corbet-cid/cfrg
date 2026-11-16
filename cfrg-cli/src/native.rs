@@ -590,13 +590,36 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             write,
                             allow_create,
                         )?,
-                        Provider::Bitbucket => cbkt::native::ensure_destination_repo(
-                            &mut io,
-                            repo,
-                            &bitbucket_creation_dest(&dest, repo, placement.derive.as_ref()),
-                            write,
-                            allow_create,
-                        )?,
+                        Provider::Bitbucket => {
+                            let bb =
+                                bitbucket_creation_dest(&dest, repo, placement.derive.as_ref());
+                            let found = cbkt::native::ensure_destination_repo(
+                                &mut io, repo, &bb, write, false,
+                            )?;
+                            let action = bitbucket_place(
+                                &mut io,
+                                &bb,
+                                repo,
+                                found.as_ref(),
+                                write && allow_create,
+                            )?;
+                            if action != "in-place" {
+                                eprintln!(
+                                    "{}",
+                                    json!({"event": "bitbucket-project", "destination": bb.path, "project": bb.namespace, "action": action})
+                                );
+                            }
+                            match found {
+                                Some(value) => Some(value),
+                                None => cbkt::native::ensure_destination_repo(
+                                    &mut io,
+                                    repo,
+                                    &bb,
+                                    write,
+                                    allow_create,
+                                )?,
+                            }
+                        }
                         Provider::Github => cghb::native::ensure_destination_repo(
                             &mut io,
                             repo,
@@ -1141,12 +1164,98 @@ fn bitbucket_creation_dest(
     derive: Option<&cfrg::native::derive::Derive>,
 ) -> cfrg::native::Destination {
     let mut dest = dest.clone();
-    if !repo.private {
-        if let Some(namespace) = derive.and_then(|d| d.bitbucket_public_namespace.as_ref()) {
-            dest.namespace = namespace.clone();
+    let wanted = derive.and_then(|d| {
+        if repo.private {
+            d.bitbucket_private_namespace.as_ref()
+        } else {
+            d.bitbucket_public_namespace.as_ref()
         }
+    });
+    if let Some(namespace) = wanted {
+        dest.namespace = namespace.clone();
     }
     dest
+}
+
+/// Makes sure the Bitbucket project `dest.namespace` exists in the workspace (created on demand, private exactly when the
+/// repository is) and, for a copy that already exists, that it sits in it. Going PUBLIC moves the copy first (a public
+/// project may hold a private repository); going PRIVATE moves it only once the copy itself is private (a private project
+/// refuses a public repository), so the visibility change comes first and the move follows on the next pass.
+/// Returns what it did, for the report.
+fn bitbucket_place(
+    io: &mut dyn Transport,
+    dest: &cfrg::native::Destination,
+    repo: &Repository,
+    existing: Option<&Value>,
+    write: bool,
+) -> Result<&'static str> {
+    let workspace = dest.path.split('/').next().ok_or("Missing workspace")?;
+    let request =
+        |method: &'static str, path: String, body: Option<Value>| cfrg::native::http::Request {
+            endpoint: dest.endpoint.clone(),
+            auth: cfrg::native::http::Auth::Bearer,
+            method,
+            path,
+            body,
+            scope: format!("{}/workspace/{workspace}", dest.endpoint.origin),
+            creation: false,
+        };
+    if let Some(value) = existing {
+        let current = value["project"]["key"].as_str().unwrap_or_default();
+        if current == dest.namespace {
+            return Ok("in-place");
+        }
+        if repo.private && value["is_private"] != json!(true) {
+            return Ok("held-until-private");
+        }
+        if !write {
+            return Ok("move-planned");
+        }
+    } else if !write {
+        return Ok("project-planned");
+    }
+    let key = &dest.namespace;
+    let seen = io.send(request(
+        "GET",
+        format!("/2.0/workspaces/{workspace}/projects/{key}"),
+        None,
+    ))?;
+    if seen.status == 404 {
+        let made = io.send(request(
+            "POST",
+            format!("/2.0/workspaces/{workspace}/projects"),
+            Some(json!({"name": key, "key": key, "is_private": repo.private})),
+        ))?;
+        if !matches!(made.status, 200 | 201) {
+            return Err(format!(
+                "Bitbucket project {key} in {workspace}: HTTP {}",
+                made.status
+            )
+            .into());
+        }
+    } else if seen.status != 200 {
+        return Err(format!(
+            "Bitbucket project {key} in {workspace}: HTTP {}",
+            seen.status
+        )
+        .into());
+    }
+    if existing.is_some() {
+        let moved = io.send(request(
+            "PUT",
+            format!("/2.0/repositories/{}", dest.path),
+            Some(json!({"project": {"key": key}})),
+        ))?;
+        if moved.status != 200 {
+            return Err(format!(
+                "moving {} to project {key}: HTTP {}",
+                dest.path, moved.status
+            )
+            .into());
+        }
+        return Ok("moved");
+    }
+    Ok("project-ready")
 }
 
 /// Runs `operation` on an archived Forgejo repository with the archive lifted, and puts the archive back afterwards, also when the
@@ -1350,16 +1459,124 @@ mod tests {
         assert!(!same_host(&json!({"remote_name":"m"}), url));
     }
     #[test]
+    fn a_bitbucket_copy_is_placed_in_the_project_of_its_visibility_in_the_safe_order() {
+        struct Seq(Vec<(&'static str, u16)>, Vec<String>);
+        impl Transport for Seq {
+            fn send(
+                &mut self,
+                r: cfrg::native::http::Request,
+            ) -> Result<cfrg::native::http::Response> {
+                self.1.push(format!("{} {}", r.method, r.path));
+                let (m, status) = self.0.remove(0);
+                assert_eq!(m, r.method);
+                Ok(cfrg::native::http::Response {
+                    status,
+                    body: Value::Null,
+                })
+            }
+        }
+        let doc = |private: bool| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"derive":{{"bitbucket_public_namespace":"PUB","bitbucket_private_namespace":"PRV","owners":{{}}}},"repositories":[{{"path":"o/r","source_id":1,"private":{private},"default_branch":"main","content":"native-git","hold":null,"destinations":[{{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"path":"o/r","namespace":"CORE","repository_id":null,"mirror_user":"{{u}}","password_env":"B","use_ssh":false,"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}}]}}]}}"#
+            )
+        };
+        let place = |private: bool, io: &mut Seq, existing: Option<Value>, write: bool| {
+            let placement = Placement::from_document(doc(private).as_bytes()).unwrap();
+            let repo = &placement.repositories[0];
+            let dest =
+                bitbucket_creation_dest(&repo.destinations[0], repo, placement.derive.as_ref());
+            bitbucket_place(io, &dest, repo, existing.as_ref(), write).unwrap()
+        };
+        // already in the right project: no call at all
+        let mut io = Seq(vec![], vec![]);
+        assert_eq!(
+            place(
+                false,
+                &mut io,
+                Some(json!({"project":{"key":"PUB"},"is_private":false})),
+                true
+            ),
+            "in-place"
+        );
+        assert!(io.1.is_empty());
+        // a copy that is still private, whose primary became public: moved to PUB first (project exists)
+        let mut io = Seq(vec![("GET", 200), ("PUT", 200)], vec![]);
+        assert_eq!(
+            place(
+                false,
+                &mut io,
+                Some(json!({"project":{"key":"PRV"},"is_private":true})),
+                true
+            ),
+            "moved"
+        );
+        assert_eq!(
+            io.1,
+            [
+                "GET /2.0/workspaces/o/projects/PUB",
+                "PUT /2.0/repositories/o/r"
+            ]
+        );
+        // the primary became private but the copy is still public: held, no call (the visibility change comes first)
+        let mut io = Seq(vec![], vec![]);
+        assert_eq!(
+            place(
+                true,
+                &mut io,
+                Some(json!({"project":{"key":"PUB"},"is_private":false})),
+                true
+            ),
+            "held-until-private"
+        );
+        assert!(io.1.is_empty());
+        // the copy is private now: moved into PRV
+        let mut io = Seq(vec![("GET", 200), ("PUT", 200)], vec![]);
+        assert_eq!(
+            place(
+                true,
+                &mut io,
+                Some(json!({"project":{"key":"PUB"},"is_private":true})),
+                true
+            ),
+            "moved"
+        );
+        // a new copy in a workspace without the project: the project is created first, private exactly when the repo is
+        let mut io = Seq(vec![("GET", 404), ("POST", 201)], vec![]);
+        assert_eq!(place(true, &mut io, None, true), "project-ready");
+        assert_eq!(
+            io.1,
+            [
+                "GET /2.0/workspaces/o/projects/PRV",
+                "POST /2.0/workspaces/o/projects"
+            ]
+        );
+        // plan only: nothing is written
+        let mut io = Seq(vec![], vec![]);
+        assert_eq!(
+            place(
+                false,
+                &mut io,
+                Some(json!({"project":{"key":"PRV"},"is_private":true})),
+                false
+            ),
+            "move-planned"
+        );
+        assert!(io.1.is_empty());
+    }
+
+    #[test]
     fn a_public_bitbucket_copy_is_created_in_the_public_project_and_a_private_one_in_the_owners() {
         let document = |private: bool, derive: &str| {
             format!(
                 r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"derive":{derive},"repositories":[{{"path":"o/r","source_id":1,"private":{private},"default_branch":"main","content":"native-git","hold":null,"destinations":[{{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"path":"o/r","namespace":"CORE","repository_id":null,"mirror_user":"{{u}}","password_env":"B","use_ssh":false,"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}}]}}]}}"#
             )
         };
-        let with = r#"{"bitbucket_public_namespace":"PUB","owners":{}}"#;
+        let with = r#"{"bitbucket_public_namespace":"PUB","bitbucket_private_namespace":"PRV","owners":{}}"#;
+        let public_only = r#"{"bitbucket_public_namespace":"PUB","owners":{}}"#;
         for (private, derive, wanted) in [
             (false, with, "PUB"),
-            (true, with, "CORE"),
+            (true, with, "PRV"),
+            (true, public_only, "CORE"),
             (false, r#"{"owners":{}}"#, "CORE"),
         ] {
             let placement = Placement::from_document(document(private, derive).as_bytes()).unwrap();

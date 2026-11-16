@@ -342,3 +342,18 @@ API contracts: [Forgejo source](https://codeberg.org/forgejo/forgejo/src/branch/
 [GitHub repository rules](https://docs.github.com/en/rest/repos/rules),
 [GitLab deploy keys](https://docs.gitlab.com/api/deploy_keys/),
 [Bitbucket branch restrictions](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-branch-restrictions/).
+
+## Bitbucket layout: workspace, PUB and PRV
+
+A Bitbucket copy lives in the workspace named like the forge organisation, with the primary's visibility (R42). Bitbucket
+adds a middle layer, the project, and a private project refuses a public repository, so cfrg derives the project from the
+primary's visibility and nothing else: public goes to the project `PUB`, private to `PRV` (`derive.bitbucket_public_namespace`,
+`derive.bitbucket_private_namespace`; a declared destination's own `namespace` is only the fallback when they are absent).
+cfrg creates the project on demand, private exactly when the repository is. Repository URLs never depend on the project.
+
+When the primary's visibility changes, `settings` changes the copy's visibility and `native` moves the copy between the
+projects in the order Bitbucket allows: going public, the copy is moved to `PUB` first (a public project may hold a private
+repository), then made public; going private, the copy is made private first and moved to `PRV` on the next pass (a held move
+is reported as `held-until-private` in the `bitbucket-project` event). Workspaces follow the three cases of the owner's rule:
+all repositories public, the workspace is public; all private, private; mixed, public (Bitbucket keeps the private
+repositories private inside a public workspace).

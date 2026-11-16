@@ -52,6 +52,11 @@ pub struct Derive {
     /// project and public ones to this one (`PUB`). Absent: every copy is created in the owner's project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitbucket_public_namespace: Option<String>,
+    /// The Bitbucket project a PRIVATE copy lives in (`PRV`). Together with `bitbucket_public_namespace` the project is a pure
+    /// function of the primary's visibility (workspace = forge organisation, PUB/PRV by visibility); a declared destination's
+    /// own `namespace` is then only the fallback when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitbucket_private_namespace: Option<String>,
     /// Providers a `.github` (profile) repository is copied to. Absent: every derived provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_providers: Option<Vec<Provider>>,
