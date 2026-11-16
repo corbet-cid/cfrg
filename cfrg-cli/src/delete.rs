@@ -122,6 +122,7 @@ pub fn delete_repo(
     };
     let api = api_base(api)?;
     let now = now();
+    let _lock = gate::StateLock::acquire(&config.state_dir)?;
     let ledger = Ledger::new(&config.state_dir);
     let entries = ledger.load(now)?;
     let world = gate::World {

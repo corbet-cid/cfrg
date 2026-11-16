@@ -112,6 +112,7 @@ pub fn run(options: Options) -> Result<()> {
     match options.action {
         Action::Status => println!("{}", status(&config)?),
         Action::Enqueue { repositories } => {
+            let _lock = gate::StateLock::acquire(&config.state_dir)?;
             let mut queue = gate::load_queue(&config.state_dir)?;
             for name in &repositories {
                 gate::split(name)?;
@@ -558,6 +559,7 @@ fn create(
         ));
     }
     let api = api_base(api)?;
+    let _lock = gate::StateLock::acquire(&config.state_dir)?;
     let now = now();
     let ledger = Ledger::new(&config.state_dir);
     let entries = ledger.load(now)?;
@@ -933,6 +935,7 @@ fn dispatch(
     }
     let inputs = dispatch_inputs(inputs)?;
     let api = api_base(api)?;
+    let _lock = gate::StateLock::acquire(&config.state_dir)?;
     let now = now();
     let ledger = Ledger::new(&config.state_dir);
     let entries = ledger.load(now)?;
@@ -1027,6 +1030,7 @@ fn flush(
     create_missing: bool,
 ) -> Result<()> {
     let api = api_base(api)?;
+    let _lock = gate::StateLock::acquire(&config.state_dir)?;
     let ledger = Ledger::new(&config.state_dir);
     let mut entries = ledger.load(now())?;
     let mut queue = gate::load_queue(&config.state_dir)?;

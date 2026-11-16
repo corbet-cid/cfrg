@@ -1106,7 +1106,16 @@ fn create_owned(
         }
         value
     };
-    let value = api.create(io, dest, url, &password)?;
+    let value = match api.create(io, dest, url, &password) {
+        // Forgejo answers HTTP 423 (Locked) to every write on an ARCHIVED repository, push mirrors included: the archive is
+        // lifted for the one creation and put back (also when the creation fails), like `delete_mirror` does.
+        Err(error) if error.to_string().contains("HTTP 423") => {
+            with_archive_lifted(io, api.endpoint, &api.repository.path, |io| {
+                api.create(io, dest, url, &password)
+            })?
+        }
+        other => other?,
+    };
     if !cfgj::native::matches(&value, dest, url) {
         return Err("Created mirror does not match placement; inspect before retry".into());
     }
@@ -1122,6 +1131,42 @@ fn stops_the_run(message: &str) -> bool {
     message.contains("stopped without retry")
         || message.contains("Uncertain prior write")
         || message.contains("interrupted")
+}
+
+/// Runs `operation` on an archived Forgejo repository with the archive lifted, and puts the archive back afterwards, also when the
+/// operation fails. A repository that cannot be unarchived is an error naming it; so is one that cannot be archived again.
+fn with_archive_lifted<T>(
+    io: &mut dyn Transport,
+    endpoint: &cfrg::native::Endpoint,
+    path: &str,
+    operation: impl FnOnce(&mut dyn Transport) -> Result<T>,
+) -> Result<T> {
+    let archive = |io: &mut dyn Transport, archived: bool| -> Result<u16> {
+        Ok(io
+            .send(cfrg::native::http::Request {
+                endpoint: endpoint.clone(),
+                auth: cfrg::native::http::Auth::Token,
+                method: "PATCH",
+                path: format!("/api/v1/repos/{path}"),
+                body: Some(json!({"archived": archived})),
+                scope: format!("{}/api", endpoint.origin),
+                creation: false,
+            })?
+            .status)
+    };
+    let status = archive(io, false)?;
+    if status != 200 {
+        return Err(format!("{path} is archived; unarchiving answered HTTP {status}").into());
+    }
+    let result = operation(io);
+    let restored = archive(io, true)?;
+    if restored != 200 {
+        return Err(format!(
+            "{path} could not be archived again (HTTP {restored}); archive it by hand"
+        )
+        .into());
+    }
+    result
 }
 
 enum Deleted {
@@ -1288,6 +1333,56 @@ mod tests {
         assert!(!same_host(&on_host, "https://bitbucket.org/team/new.git"));
         assert!(!same_host(&json!({"remote_name":"m"}), url));
     }
+    #[test]
+    fn an_operation_on_an_archived_repository_runs_with_the_archive_lifted_and_restores_it_even_on_failure(
+    ) {
+        struct Seq(Vec<(&'static str, u16)>, Vec<String>);
+        impl Transport for Seq {
+            fn send(
+                &mut self,
+                r: cfrg::native::http::Request,
+            ) -> Result<cfrg::native::http::Response> {
+                self.1.push(format!(
+                    "{} {} {}",
+                    r.method,
+                    r.path,
+                    r.body.map(|b| b.to_string()).unwrap_or_default()
+                ));
+                let (m, status) = self.0.remove(0);
+                assert_eq!(m, r.method);
+                Ok(cfrg::native::http::Response {
+                    status,
+                    body: Value::Null,
+                })
+            }
+        }
+        let endpoint = cfrg::native::Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "T".into(),
+        };
+        // success: unarchive, the operation, archive again
+        let mut io = Seq(vec![("PATCH", 200), ("PATCH", 200)], vec![]);
+        let ran = with_archive_lifted(&mut io, &endpoint, "o/r", |_| Ok(7)).unwrap();
+        assert_eq!(ran, 7);
+        assert!(
+            io.1[0].contains(r#"{"archived":false}"#) && io.1[1].contains(r#"{"archived":true}"#)
+        );
+        // the operation fails: the archive is still put back and the failure is returned
+        let mut io = Seq(vec![("PATCH", 200), ("PATCH", 200)], vec![]);
+        let failed: Result<()> =
+            with_archive_lifted(&mut io, &endpoint, "o/r", |_| Err("boom".into()));
+        assert_eq!(failed.unwrap_err().to_string(), "boom");
+        assert_eq!(io.1.len(), 2);
+        // unarchiving refused: the operation never runs
+        let mut io = Seq(vec![("PATCH", 403)], vec![]);
+        let mut ran = false;
+        let refused = with_archive_lifted(&mut io, &endpoint, "o/r", |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(refused.is_err() && !ran);
+    }
+
     #[test]
     fn a_locked_deletion_on_an_archived_repository_unarchives_deletes_and_archives_again() {
         struct Seq(Vec<(&'static str, u16)>, Vec<String>);

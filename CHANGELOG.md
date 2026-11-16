@@ -52,6 +52,13 @@ changes the licence and some defaults.
 - `cfrg native --operation members --apply`: writes the planned GitHub grants (triage only, paced, `--max-writes` per run, never lowering a role),
   with the token in `CFRG_GITHUB_MEMBERS_TOKEN`.
 
+- `cfrg gate`: every command that decides on the ledger or the queue (flush, create, dispatch, delete, enqueue) now holds an
+  exclusive lock on the state directory while it loads and uses them. Before, the receiver's hook and a hand call could decide
+  on the same stale snapshot and together exceed a budget (66 pushes against 60 a day, 18 against 12 an hour).
+
+- `cfrg native`: creating a push mirror for an ARCHIVED Forgejo primary (HTTP 423) lifts the archive for that one call and puts
+  it back, also when the creation fails.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

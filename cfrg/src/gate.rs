@@ -427,6 +427,39 @@ pub struct Ledger {
     path: PathBuf,
 }
 
+/// The exclusive lock of the gate's state directory. EVERY command that decides on the ledger, the queue or both (flush, create,
+/// dispatch, enqueue) holds it from before it loads them until it is done, so two processes (the receiver's hook and a hand
+/// call, or two hooks) can never decide on the same stale snapshot and both stay "within" a budget that together they exceed
+/// (2026-11-16: 66 pushes against a day budget of 60 and 18 against an hourly 12). A second caller waits for the first.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: fs::File,
+}
+
+impl StateLock {
+    /// Blocks until the lock is held.
+    pub fn acquire(state_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(state_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state_dir.join("gate.lock"))?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
+
+    /// Whether the lock is held by someone right now (a test seam; never blocks).
+    pub fn is_held(state_dir: &Path) -> Result<bool> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state_dir.join("gate.lock"))?;
+        Ok(matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)))
+    }
+}
+
 impl Ledger {
     pub fn new(state_dir: &Path) -> Self {
         Self {
@@ -816,6 +849,63 @@ mod tests {
             .map(|i| push(NOW - DAY - 10 - i, &format!("o{i}"), "r", Lane::Build))
             .collect();
         assert_eq!(verdict(&old, Lane::Build, "x", "r", Kind::Push), Ok(()));
+    }
+
+    #[test]
+    fn a_ledger_at_its_hourly_and_daily_limit_refuses_every_further_push() {
+        let push = |ts: u64, repo: &str| Entry {
+            ts,
+            kind: Kind::Push,
+            org: format!("org{}", ts % 7),
+            repo: repo.into(),
+            lane: Lane::Bulk,
+        };
+        let budgets = Budgets {
+            pushes_per_hour: 12,
+            pushes_per_day: 60,
+            build_reserve_per_hour: 0,
+            build_reserve_per_day: 0,
+            ..Budgets::default()
+        };
+        // 12 pushes in the last hour: the 13th is refused whoever asks, even for an organisation that pushed nothing
+        let hour: Vec<Entry> = (0..12)
+            .map(|i| push(NOW - 100 - i, &format!("r{i}")))
+            .collect();
+        let at = |ledger: &[Entry]| {
+            decide(
+                &budgets,
+                &world(ledger),
+                Lane::Bulk,
+                "fresh",
+                "new",
+                Kind::Push,
+            )
+        };
+        assert_eq!(at(&hour), Err(Deny::OverallHourly));
+        // 60 pushes spread over the day (none in the last hour): the day is spent
+        let day: Vec<Entry> = (0..60)
+            .map(|i| push(NOW - 4000 - i * 60, &format!("r{i}")))
+            .collect();
+        assert_eq!(at(&day), Err(Deny::OverallDaily));
+        // 11 and 59 are still within the limits
+        assert_eq!(at(&hour[..11]), Ok(()));
+        assert_eq!(at(&day[..59]), Ok(()));
+    }
+
+    #[test]
+    fn two_callers_of_the_state_directory_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!StateLock::is_held(dir.path()).unwrap());
+        let first = StateLock::acquire(dir.path()).unwrap();
+        assert!(StateLock::is_held(dir.path()).unwrap());
+        // a second caller waits: it only gets the lock after the first dropped it
+        let path = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || StateLock::acquire(&path).map(|_| ()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished());
+        drop(first);
+        waiter.join().unwrap().unwrap();
+        assert!(!StateLock::is_held(dir.path()).unwrap());
     }
 
     #[test]
