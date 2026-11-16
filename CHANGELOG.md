@@ -46,6 +46,9 @@ changes the licence and some defaults.
   flagged or suspended account), still end the run. `settings` reports a refused write as a `drift` row naming the fields and
   wanted values, not as an error. The `derive.exclude` patterns now also hold for the `settings` rows of every provider.
 
+- `cfrg gate`: `budgets.new_repos_per_day_by_org` gives single organisations their own daily creation cap (a ramp for a
+  fresh GitHub App installation); an organisation without an entry keeps `new_repos_per_day_org`.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

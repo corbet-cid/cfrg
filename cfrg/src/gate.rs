@@ -31,6 +31,9 @@ pub struct Budgets {
     pub org_pushes_per_hour: u64,
     pub repo_min_gap_secs: u64,
     pub new_repos_per_day_org: u64,
+    /// A lower (or higher) daily creation cap for single organisations, e.g. a ramp for organisations whose GitHub
+    /// App was installed only today. An organisation not listed keeps `new_repos_per_day_org`.
+    pub new_repos_per_day_by_org: std::collections::BTreeMap<String, u64>,
     pub new_repos_per_day: u64,
     pub actions_runs_per_day: u64,
     /// Repository deletions (`cfrg gate delete-repo`): at most this many per day, at least `delete_min_gap_secs` apart overall.
@@ -51,6 +54,7 @@ impl Default for Budgets {
             org_pushes_per_hour: 8,
             repo_min_gap_secs: 600,
             new_repos_per_day_org: 3,
+            new_repos_per_day_by_org: Default::default(),
             new_repos_per_day: 6,
             actions_runs_per_day: 30,
             deletes_per_day: 6,
@@ -278,7 +282,12 @@ pub fn decide(
     }
     match kind {
         Kind::Create => {
-            if count(world, DAY, Kind::Create, Some(org)) >= budgets.new_repos_per_day_org {
+            let org_cap = budgets
+                .new_repos_per_day_by_org
+                .get(org)
+                .copied()
+                .unwrap_or(budgets.new_repos_per_day_org);
+            if count(world, DAY, Kind::Create, Some(org)) >= org_cap {
                 return Err(Deny::NewReposOrgDaily);
             }
             if count(world, DAY, Kind::Create, None) >= budgets.new_repos_per_day {
@@ -807,6 +816,35 @@ mod tests {
             .map(|i| push(NOW - DAY - 10 - i, &format!("o{i}"), "r", Lane::Build))
             .collect();
         assert_eq!(verdict(&old, Lane::Build, "x", "r", Kind::Push), Ok(()));
+    }
+
+    #[test]
+    fn an_organisation_can_have_its_own_creation_cap() {
+        let create = |ts, org: &str, repo: &str| Entry {
+            ts,
+            kind: Kind::Create,
+            org: org.into(),
+            repo: repo.into(),
+            lane: Lane::Bulk,
+        };
+        let mut budgets = Budgets::default();
+        budgets.new_repos_per_day_by_org.insert("ramp".into(), 1);
+        budgets.new_repos_per_day_by_org.insert("wide".into(), 5);
+        let ledger: Vec<Entry> = vec![create(NOW - 1000, "ramp", "a")];
+        let ask = |ledger: &[Entry], org: &str| {
+            decide(&budgets, &world(ledger), Lane::Bulk, org, "n", Kind::Create)
+        };
+        assert_eq!(ask(&ledger, "ramp"), Err(Deny::NewReposOrgDaily));
+        // the default cap (3) still applies to an organisation without an entry
+        let three: Vec<Entry> = (0..3)
+            .map(|i| create(NOW - 1000 - i, "o", &format!("r{i}")))
+            .collect();
+        assert_eq!(ask(&three, "o"), Err(Deny::NewReposOrgDaily));
+        // a higher entry lets the organisation go past the default
+        let four: Vec<Entry> = (0..4)
+            .map(|i| create(NOW - 1000 - i, "wide", &format!("r{i}")))
+            .collect();
+        assert_eq!(ask(&four, "wide"), Ok(()));
     }
 
     #[test]
