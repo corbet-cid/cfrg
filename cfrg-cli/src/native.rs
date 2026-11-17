@@ -9,7 +9,7 @@ mod wiki;
 use cfrg::{
     native::{
         http::{Http, Pacing, Transport},
-        owned_by, Content, Destination, Naming, Placement, Provider, Repository,
+        owned_by, Destination, Naming, Placement, Provider, Repository,
     },
     Result,
 };
@@ -325,13 +325,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 }
                 continue;
             }
-            let source_held = declared.hold.is_some()
-                || declared.content != Content::NativeGit
-                || declared
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|p| p.starts_with('.'));
+            let source_held = !placement.mirrorable(declared);
             if source_held {
                 report.push(json!({"source":declared.path, "state":"exception", "reason":declared.hold.as_deref().unwrap_or("content/profile exception")}));
                 incomplete = true;

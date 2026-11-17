@@ -68,6 +68,9 @@ changes the licence and some defaults.
 - `native members --apply`: an invitation the person has not accepted yet is reported as `invitation-pending` and not sent again
   (the repository's invitations are read once per run); before, every run re-sent the pending ones and spent its write budget on them.
 
+- `native` mirrors LFS repositories that the placement's `external_content` declares `pointers-only` for every forge they are copied to,
+  when all their destinations are SSH push mirrors (`Placement::mirrorable`); undeclared LFS repositories stay exceptions.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

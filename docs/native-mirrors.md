@@ -357,3 +357,13 @@ repository), then made public; going private, the copy is made private first and
 is reported as `held-until-private` in the `bitbucket-project` event). Workspaces follow the three cases of the owner's rule:
 all repositories public, the workspace is public; all private, private; mixed, public (Bitbucket keeps the private
 repositories private inside a public workspace).
+
+## LFS repositories
+
+A repository whose default branch uses Git LFS (`content: lfs`) is mirrored by `native` like a native-git one when, and only when, the
+placement's `external_content` declares `pointers-only` for every forge it is copied to (R4, R64: the payloads stay on the primary)
+and every one of its destinations is an SSH push mirror (history only: the copy can carry the pointer files and nothing else). Create,
+mirror, protection, visibility and the Bitbucket PUB/PRV placement then come from the normal flow. A repository that is not declared,
+that has a destination which is not an SSH push mirror, that carries a hold, or that is a profile repository (`.github`) stays an
+`exception`: no copy is made.
+

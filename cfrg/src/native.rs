@@ -38,6 +38,46 @@ pub struct Placement {
     /// `derive`). `repositories` then keeps only real exceptions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive: Option<derive::Derive>,
+    /// Lowercase `owner/repo` to `provider` to `pointers-only`: the repositories (LFS) whose copy on that forge is declared to carry
+    /// the pointer files only (R4, R64: the payloads stay on the primary). The same declaration the content replication reads
+    /// (infra lib/placement.json `external_content`). Without it an LFS repository is an exception that native makes no copy of.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external_content: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl Placement {
+    /// Whether native may mirror this repository's copies: native-git always; an LFS repository only when EVERY one of its
+    /// destinations is an SSH push mirror (history only, so the copy can only carry pointers) and is declared `pointers-only` for its
+    /// forge. A profile repository, a hold, or a hidden-name repository stays an exception.
+    pub fn mirrorable(&self, repo: &Repository) -> bool {
+        if repo.hold.is_some()
+            || repo
+                .path
+                .rsplit('/')
+                .next()
+                .is_some_and(|p| p.starts_with('.'))
+        {
+            return false;
+        }
+        match repo.content {
+            Content::NativeGit => true,
+            Content::Profile => false,
+            Content::Lfs => {
+                let declared = self.external_content.get(&repo.path.to_ascii_lowercase());
+                !repo.destinations.is_empty()
+                    && repo.destinations.iter().all(|d| {
+                        let forge = match d.provider {
+                            Provider::Gitlab => "gitlab",
+                            Provider::Bitbucket => "bitbucket",
+                            Provider::Github => "github",
+                        };
+                        d.use_ssh
+                            && declared.and_then(|m| m.get(forge)).map(String::as_str)
+                                == Some("pointers-only")
+                    })
+            }
+        }
+    }
 }
 
 /// One contributed project: its own repository and the other places the same project is found (our copies, a second home).
@@ -894,5 +934,40 @@ mod tests {
             None,
             &mirror("g", "ssh://gitlab.example/elsewhere.git")
         ));
+    }
+
+    #[test]
+    fn an_lfs_repository_is_mirrorable_only_when_every_destination_is_an_ssh_mirror_declared_pointers_only(
+    ) {
+        let doc = |content: &str,
+                   hold: &str,
+                   gitlab_ssh: bool,
+                   bitbucket_ssh: bool,
+                   declared: &str| {
+            format!(
+                r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"external_content":{declared},"repositories":[{{"path":"o/r","source_id":1,"private":false,"default_branch":"main","content":"{content}","hold":{hold},"destinations":[
+                {{"provider":"gitlab","endpoint":{{"origin":"https://gitlab.com","token_env":"G"}},"path":"o/r","namespace":"1","repository_id":null,"mirror_user":"1","password_env":"G","use_ssh":{gitlab_ssh},"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}},
+                {{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"B"}},"path":"o/r","namespace":"PUB","repository_id":null,"mirror_user":"u","password_env":"B","use_ssh":{bitbucket_ssh},"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}}]}}]}}"#
+            )
+        };
+        let both = r#"{"o/r":{"gitlab":"pointers-only","bitbucket":"pointers-only"}}"#;
+        let only_gitlab = r#"{"o/r":{"gitlab":"pointers-only"}}"#;
+        let mirrorable = |document: String| {
+            let placement = Placement::from_document(document.as_bytes()).unwrap();
+            placement.mirrorable(&placement.repositories[0])
+        };
+        // native-git: always
+        assert!(mirrorable(doc("native-git", "null", false, false, "{}")));
+        // LFS declared pointers-only on every forge it is copied to, both SSH push mirrors: mirrored like native-git
+        assert!(mirrorable(doc("lfs", "null", true, true, both)));
+        // LFS that is NOT declared stays an exception
+        assert!(!mirrorable(doc("lfs", "null", true, true, "{}")));
+        // declared for one forge only, but a destination on the other: still an exception
+        assert!(!mirrorable(doc("lfs", "null", true, true, only_gitlab)));
+        // a destination that is not an SSH push mirror (it would push LFS objects): exception
+        assert!(!mirrorable(doc("lfs", "null", true, false, both)));
+        // a hold, or a profile repository, stays an exception whatever is declared
+        assert!(!mirrorable(doc("lfs", "\"held\"", true, true, both)));
+        assert!(!mirrorable(doc("profile", "null", true, true, both)));
     }
 }
