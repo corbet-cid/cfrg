@@ -65,6 +65,9 @@ changes the licence and some defaults.
 - `derive.bitbucket_private_namespace` and the PUB/PRV layout: a Bitbucket copy's project follows the primary's visibility,
   is created on demand, and a visibility change moves the copy between the projects in the safe order (`docs/native-mirrors.md`).
 
+- `native members --apply`: an invitation the person has not accepted yet is reported as `invitation-pending` and not sent again
+  (the repository's invitations are read once per run); before, every run re-sent the pending ones and spent its write budget on them.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

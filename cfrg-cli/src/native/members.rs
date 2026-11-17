@@ -215,6 +215,7 @@ fn apply_github(
 ) -> Result<Vec<Value>> {
     let mut rows = Vec::new();
     let mut written = 0usize;
+    let mut pending: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for grant in grants.iter().filter(|g| g.provider == "github") {
         let row = |state: &str| json!({"copy": grant.copy, "handle": grant.handle, "role": grant.native_role, "state": state});
         if grant.role != copy_access::CopyRole::Triage && grant.role != copy_access::CopyRole::Read
@@ -251,6 +252,34 @@ fn apply_github(
                 rows.push(row("unexpected-read"));
                 continue;
             }
+        }
+        // An invitation the person has not accepted yet is no collaborator, so the permission read says "none": without this
+        // look every run would invite again and spend its write budget on the same pending invitations.
+        if !pending.contains_key(&grant.copy) {
+            let invitations = io.send(github_request(
+                "GET",
+                format!("/repos/{}/invitations?per_page=100", grant.copy),
+                None,
+            ));
+            let logins: Vec<String> = match invitations {
+                Ok(response) if response.status == 200 => response
+                    .body
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|i| {
+                                i["invitee"]["login"].as_str().map(str::to_ascii_lowercase)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            pending.insert(grant.copy.clone(), logins);
+        }
+        if pending[&grant.copy].contains(&grant.handle.to_ascii_lowercase()) {
+            rows.push(row("invitation-pending"));
+            continue;
         }
         if written >= max {
             rows.push(row("write-budget-spent"));
@@ -322,6 +351,7 @@ mod tests {
                     200,
                     json!({"permission": "read", "role_name": "read"}),
                 ),
+                ("GET", 200, json!([])),
                 ("PUT", 201, Value::Null),
                 (
                     "GET",
@@ -330,6 +360,7 @@ mod tests {
                 ),
                 ("GET", 404, Value::Null),
                 ("GET", 200, json!({"permission": "none"})),
+                ("GET", 200, json!([])),
             ],
             vec![],
         );
@@ -341,7 +372,34 @@ mod tests {
             ["invited", "already", "copy-absent", "write-budget-spent"]
         );
         assert_eq!(io.1.iter().filter(|c| c.starts_with("PUT")).count(), 1);
-        assert!(io.1[1].starts_with("PUT /repos/o/a/collaborators/h"));
+        assert!(io.1[2].starts_with("PUT /repos/o/a/collaborators/h"));
+    }
+
+    #[test]
+    fn a_pending_invitation_is_not_invited_again() {
+        let grants = vec![grant("o/a", "Pending-Person"), grant("o/a", "fresh")];
+        let mut io = Seq(
+            vec![
+                ("GET", 200, json!({"permission": "none"})),
+                (
+                    "GET",
+                    200,
+                    json!([{"invitee": {"login": "pending-person"}}]),
+                ),
+                ("GET", 200, json!({"permission": "none"})),
+                ("PUT", 201, Value::Null),
+            ],
+            vec![],
+        );
+        let rows = apply_github(&mut io, &grants, 5).unwrap();
+        let states: Vec<_> = rows.iter().map(|r| r["state"].as_str().unwrap()).collect();
+        assert_eq!(states, ["invitation-pending", "invited"]);
+        // the invitations of a repository are read once for all its grants
+        assert_eq!(
+            io.1.iter().filter(|c| c.contains("/invitations")).count(),
+            1
+        );
+        assert_eq!(io.1.iter().filter(|c| c.starts_with("PUT")).count(), 1);
     }
 
     #[test]
