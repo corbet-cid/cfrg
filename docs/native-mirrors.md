@@ -360,10 +360,11 @@ repositories private inside a public workspace).
 
 ## LFS repositories
 
-A repository whose default branch uses Git LFS (`content: lfs`) is mirrored by `native` like a native-git one when, and only when, the
-placement's `external_content` declares `pointers-only` for every forge it is copied to (R4, R64: the payloads stay on the primary)
-and every one of its destinations is an SSH push mirror (history only: the copy can carry the pointer files and nothing else). Create,
-mirror, protection, visibility and the Bitbucket PUB/PRV placement then come from the normal flow. A repository that is not declared,
-that has a destination which is not an SSH push mirror, that carries a hold, or that is a profile repository (`.github`) stays an
-`exception`: no copy is made.
+A repository whose default branch uses Git LFS (`content: lfs`) is mirrored by `native` per destination: a destination is mirrored like a
+native-git one when it is an SSH push mirror (history only) and the placement's `external_content` declares `pointers-only` for its forge
+(R4, R64: the payloads stay on the primary). Create, mirror, protection, visibility and the Bitbucket PUB/PRV placement then come from the
+normal flow. A destination of an LFS repository that does not meet both conditions carries real LFS content (the content replication's)
+and is left alone; a repository with no mirrorable destination, with a hold, or a profile repository (`.github`) stays an `exception`.
 
+A GitLab copy declared pointers-only gets Git LFS switched OFF (project setting `lfs_enabled=false`), on creation and when an existing
+copy has drifted: with LFS on, GitLab rejects a push whose pointers name objects the project does not hold ("LFS objects are missing").

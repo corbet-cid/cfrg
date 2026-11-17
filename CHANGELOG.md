@@ -71,6 +71,9 @@ changes the licence and some defaults.
 - `native` mirrors LFS repositories that the placement's `external_content` declares `pointers-only` for every forge they are copied to,
   when all their destinations are SSH push mirrors (`Placement::mirrorable`); undeclared LFS repositories stay exceptions.
 
+- `native`: the pointers-only/SSH test for LFS repositories is per destination (`Placement::destination_mirrorable`); a pointers-only
+  GitLab copy has `lfs_enabled` switched off on create and corrected when it drifted.
+
 ### Not provided
 - Prebuilt release binaries. Build from the flake or from source ([deployment](docs/deployment.md)).
 - Writing member roles to copies: `cfrg native --operation members --apply` is refused; only the plan exists.

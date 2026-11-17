@@ -401,6 +401,11 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                 }) {
                     continue;
                 }
+                // An LFS repository's destination that is not itself a pointers-only SSH mirror carries real content (the content
+                // replication's): native leaves it alone.
+                if !placement.destination_mirrorable(repo, declared_dest) {
+                    continue;
+                }
                 let outcome: Result<()> = (|| -> Result<()> {
                     // Where this destination must live now, and every name it may
                     // still be known under (the file's last record, the live name).
@@ -622,6 +627,17 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             allow_create,
                         )?,
                     };
+                    // A GitLab copy that carries pointers only must have LFS switched OFF: with LFS on, GitLab rejects every push whose
+                    // pointers name objects the project does not hold ("LFS objects are missing"). Derived from external_content, and
+                    // corrected on an existing copy too.
+                    if write
+                        && dest.provider == Provider::Gitlab
+                        && placement.pointers_only_on(repo, Provider::Gitlab)
+                    {
+                        if let Some(project) = &target {
+                            gitlab_lfs_off(&mut io, &dest, project)?;
+                        }
+                    }
                     if dest.use_ssh && target.is_some() && mirror.is_none() && write {
                         let value = create_owned(&api, &mut io, &dest, &url)?;
                         mirrors.push(value.clone());
@@ -1171,6 +1187,41 @@ fn bitbucket_creation_dest(
     dest
 }
 
+/// Switches Git LFS off on a pointers-only GitLab copy when the project (as GitLab answered it) has it on.
+fn gitlab_lfs_off(
+    io: &mut dyn Transport,
+    dest: &cfrg::native::Destination,
+    project: &Value,
+) -> Result<()> {
+    if project["lfs_enabled"] != json!(true) {
+        return Ok(());
+    }
+    let id = project["id"]
+        .as_u64()
+        .ok_or("GitLab project without an id")?;
+    let done = io.send(cfrg::native::http::Request {
+        endpoint: dest.endpoint.clone(),
+        auth: cfrg::native::http::Auth::PrivateToken,
+        method: "PUT",
+        path: format!("/api/v4/projects/{id}"),
+        body: Some(json!({"lfs_enabled": false})),
+        scope: format!("{}/api", dest.endpoint.origin),
+        creation: false,
+    })?;
+    if done.status != 200 {
+        return Err(format!(
+            "GitLab refused to switch LFS off on {} (HTTP {})",
+            dest.path, done.status
+        )
+        .into());
+    }
+    eprintln!(
+        "{}",
+        json!({"event": "gitlab-lfs-off", "destination": dest.path})
+    );
+    Ok(())
+}
+
 /// Makes sure the Bitbucket project `dest.namespace` exists in the workspace (created on demand, private exactly when the
 /// repository is) and, for a copy that already exists, that it sits in it. Going PUBLIC moves the copy first (a public
 /// project may hold a private repository); going PRIVATE moves it only once the copy itself is private (a private project
@@ -1556,6 +1607,44 @@ mod tests {
             "move-planned"
         );
         assert!(io.1.is_empty());
+    }
+
+    #[test]
+    fn a_pointers_only_gitlab_copy_with_lfs_on_gets_it_switched_off_and_one_without_is_left_alone()
+    {
+        struct Seq(Vec<(&'static str, u16)>, Vec<String>);
+        impl Transport for Seq {
+            fn send(
+                &mut self,
+                r: cfrg::native::http::Request,
+            ) -> Result<cfrg::native::http::Response> {
+                self.1.push(format!(
+                    "{} {} {}",
+                    r.method,
+                    r.path,
+                    r.body.map(|b| b.to_string()).unwrap_or_default()
+                ));
+                let (m, status) = self.0.remove(0);
+                assert_eq!(m, r.method);
+                Ok(cfrg::native::http::Response {
+                    status,
+                    body: Value::Null,
+                })
+            }
+        }
+        let placement = Placement::from_document(
+            br#"{"schema":1,"source":{"origin":"https://forge.example","token_env":"T"},"repositories":[{"path":"o/r","source_id":1,"private":false,"default_branch":"main","content":"lfs","hold":null,"destinations":[{"provider":"gitlab","endpoint":{"origin":"https://gitlab.com","token_env":"G"},"path":"o/r","namespace":"1","repository_id":null,"mirror_user":"1","password_env":"G","use_ssh":true,"interval_seconds":3600,"branch_filter":"","hold":null,"absent":false,"remote_name":null}]}]}"#,
+        )
+        .unwrap();
+        let dest = &placement.repositories[0].destinations[0];
+        let mut io = Seq(vec![("PUT", 200)], vec![]);
+        gitlab_lfs_off(&mut io, dest, &json!({"id": 7, "lfs_enabled": true})).unwrap();
+        assert_eq!(io.1, [r#"PUT /api/v4/projects/7 {"lfs_enabled":false}"#]);
+        let mut io = Seq(vec![], vec![]);
+        gitlab_lfs_off(&mut io, dest, &json!({"id": 7, "lfs_enabled": false})).unwrap();
+        assert!(io.1.is_empty());
+        let mut io = Seq(vec![("PUT", 403)], vec![]);
+        assert!(gitlab_lfs_off(&mut io, dest, &json!({"id": 7, "lfs_enabled": true})).is_err());
     }
 
     #[test]

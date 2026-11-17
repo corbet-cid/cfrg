@@ -46,9 +46,9 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// Whether native may mirror this repository's copies: native-git always; an LFS repository only when EVERY one of its
-    /// destinations is an SSH push mirror (history only, so the copy can only carry pointers) and is declared `pointers-only` for its
-    /// forge. A profile repository, a hold, or a hidden-name repository stays an exception.
+    /// Whether native may mirror at least one destination of this repository. native-git: all; an LFS repository: the destinations that are
+    /// themselves an SSH push mirror (history only, so the copy can only carry pointers) declared `pointers-only` for their forge. A
+    /// profile repository, a hold, or a hidden-name repository stays an exception.
     pub fn mirrorable(&self, repo: &Repository) -> bool {
         if repo.hold.is_some()
             || repo
@@ -62,21 +62,36 @@ impl Placement {
         match repo.content {
             Content::NativeGit => true,
             Content::Profile => false,
-            Content::Lfs => {
-                let declared = self.external_content.get(&repo.path.to_ascii_lowercase());
-                !repo.destinations.is_empty()
-                    && repo.destinations.iter().all(|d| {
-                        let forge = match d.provider {
-                            Provider::Gitlab => "gitlab",
-                            Provider::Bitbucket => "bitbucket",
-                            Provider::Github => "github",
-                        };
-                        d.use_ssh
-                            && declared.and_then(|m| m.get(forge)).map(String::as_str)
-                                == Some("pointers-only")
-                    })
-            }
+            Content::Lfs => repo
+                .destinations
+                .iter()
+                .any(|d| self.destination_mirrorable(repo, d)),
         }
+    }
+
+    /// Whether native may mirror this destination of the repository: always for native-git; for LFS only when the destination is an
+    /// SSH push mirror and `external_content` declares `pointers-only` for its forge. A destination of an LFS repository that fails the
+    /// test (full LFS content, carried by the content replication) is left alone, whatever the other destinations are.
+    pub fn destination_mirrorable(&self, repo: &Repository, dest: &Destination) -> bool {
+        match repo.content {
+            Content::NativeGit => true,
+            Content::Profile => false,
+            Content::Lfs => dest.use_ssh && self.pointers_only_on(repo, dest.provider),
+        }
+    }
+
+    /// Whether `external_content` declares this repository's copy on the forge `pointers-only`.
+    pub fn pointers_only_on(&self, repo: &Repository, provider: Provider) -> bool {
+        let forge = match provider {
+            Provider::Gitlab => "gitlab",
+            Provider::Bitbucket => "bitbucket",
+            Provider::Github => "github",
+        };
+        self.external_content
+            .get(&repo.path.to_ascii_lowercase())
+            .and_then(|m| m.get(forge))
+            .map(String::as_str)
+            == Some("pointers-only")
     }
 }
 
@@ -962,10 +977,16 @@ mod tests {
         assert!(mirrorable(doc("lfs", "null", true, true, both)));
         // LFS that is NOT declared stays an exception
         assert!(!mirrorable(doc("lfs", "null", true, true, "{}")));
-        // declared for one forge only, but a destination on the other: still an exception
-        assert!(!mirrorable(doc("lfs", "null", true, true, only_gitlab)));
-        // a destination that is not an SSH push mirror (it would push LFS objects): exception
-        assert!(!mirrorable(doc("lfs", "null", true, false, both)));
+        // declared for one forge only: that destination is mirrored, the other (real LFS content) is left to the content replication
+        let one = Placement::from_document(doc("lfs", "null", true, true, only_gitlab).as_bytes())
+            .unwrap();
+        let repo = &one.repositories[0];
+        assert!(one.mirrorable(repo));
+        assert!(one.destination_mirrorable(repo, &repo.destinations[0]));
+        assert!(!one.destination_mirrorable(repo, &repo.destinations[1]));
+        // a destination that is not an SSH push mirror (it would push LFS objects) is never mirrored; none left: an exception
+        assert!(mirrorable(doc("lfs", "null", true, false, both)));
+        assert!(!mirrorable(doc("lfs", "null", false, false, both)));
         // a hold, or a profile repository, stays an exception whatever is declared
         assert!(!mirrorable(doc("lfs", "\"held\"", true, true, both)));
         assert!(!mirrorable(doc("profile", "null", true, true, both)));
