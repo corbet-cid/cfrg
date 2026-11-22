@@ -109,6 +109,22 @@ pub fn run(options: &Options) -> Result<()> {
         }
         None => Vec::new(),
     };
+    // GitHub organisations the gate's catalogue expects `flagged`: GitHub refuses App installations there.
+    let flagged_orgs: Vec<String> = match &options.github_gate_catalog {
+        Some(path) => {
+            let catalog: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            catalog["orgs"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(_, v)| v["expected"] == "flagged")
+                        .map(|(k, _)| k.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     // Fail closed: a GitHub write needs the write gate's kill switch and pause directory.
     if write
         && options
@@ -218,6 +234,10 @@ pub fn run(options: &Options) -> Result<()> {
                 continue;
             }
             let org = path.split('/').next().unwrap_or_default().to_string();
+            if provider == Provider::Github && flagged_orgs.contains(&org) {
+                rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"skipped", "reason":"flagged-org-no-app-installation"}));
+                continue;
+            }
             let count = counts.entry((name.into(), org.clone())).or_default();
             if let Some(why) = stopped.get(name) {
                 rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"provider-stopped", "reason":why}));
