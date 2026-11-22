@@ -229,6 +229,10 @@ impl Drop for Http {
 
 /// Pauses before the retries of a read that Forgejo answered with a 5xx: bounded, growing.
 const READ_RETRIES: [u64; 3] = [5, 20, 60];
+/// A throttled read (429) is retried at most this many times, and only when the provider's Retry-After is at most
+/// this many seconds; a longer window stays the recorded hold it always was.
+const THROTTLE_RETRIES: u32 = 2;
+const THROTTLE_MAX_WAIT: u64 = 120;
 
 /// Run `attempt`; a failure for which `transient` holds is run again after each pause of
 /// `pauses` (through `sleep`), so a flaky server costs time and never the whole run.
@@ -264,12 +268,36 @@ impl Transport for Http {
             return self.send_once(request);
         }
         let pauses = READ_RETRIES;
-        retried(
-            &pauses,
-            &mut |seconds| std::thread::sleep(Duration::from_secs(seconds)),
-            |error| error.to_string().starts_with("Native API HTTP 5"),
-            || self.send_once(request.clone()),
-        )
+        let mut throttled = 0;
+        loop {
+            let result = retried(
+                &pauses,
+                &mut |seconds| std::thread::sleep(Duration::from_secs(seconds)),
+                |error| error.to_string().starts_with("Native API HTTP 5"),
+                || self.send_once(request.clone()),
+            );
+            // A throttled read (429) is retried once the provider's own Retry-After has passed, when that is
+            // short: the window is already recorded, so the retry waits for exactly the time the provider asked for.
+            let Err(error) = &result else { return result };
+            if throttled >= THROTTLE_RETRIES || !error.to_string().starts_with("Native API HTTP 429") {
+                return result;
+            }
+            let wait = match (self.state.windows.get(&request.scope), now()) {
+                (Some(window), Ok(at)) => window.retry_at.map(|until| until.saturating_sub(at)),
+                _ => None,
+            };
+            match wait {
+                Some(seconds) if seconds <= THROTTLE_MAX_WAIT => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event":"native-retry","status":429,"after_seconds":seconds + 1})
+                    );
+                    std::thread::sleep(Duration::from_secs(seconds + 1));
+                    throttled += 1;
+                }
+                _ => return result,
+            }
+        }
     }
 
     fn resolve(&mut self, scope: &str) -> Result<()> {
