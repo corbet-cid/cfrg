@@ -61,6 +61,16 @@ pub fn run(options: &Options) -> Result<()> {
         {
             continue;
         }
+        // An archived primary keeps archived, read-only copies (the settings step holds them as
+        // "archived-copy-is-read-only"): a push to one is refused (git exit 128), so its wiki waits
+        // for the primary to be unarchived. Not an error row.
+        if repo.archived {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"wiki-skip","repository":repo.path,"reason":"archived-copy-is-read-only"})
+            );
+            continue;
+        }
         let Some(declared) = placement
             .repositories
             .iter()
