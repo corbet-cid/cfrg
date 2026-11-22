@@ -279,7 +279,9 @@ impl Transport for Http {
             // A throttled read (429) is retried once the provider's own Retry-After has passed, when that is
             // short: the window is already recorded, so the retry waits for exactly the time the provider asked for.
             let Err(error) = &result else { return result };
-            if throttled >= THROTTLE_RETRIES || !error.to_string().starts_with("Native API HTTP 429") {
+            if throttled >= THROTTLE_RETRIES
+                || !error.to_string().starts_with("Native API HTTP 429")
+            {
                 return result;
             }
             let wait = match (self.state.windows.get(&request.scope), now()) {
