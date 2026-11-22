@@ -190,6 +190,12 @@ pub fn plan(options: &Options, exe: &Path) -> Vec<Step> {
             "--state".into(),
             options.state.join("native.json").display().to_string(),
         ]);
+        if options.gate_catalog.is_file() {
+            args.extend([
+                "--github-gate-catalog".into(),
+                options.gate_catalog.display().to_string(),
+            ]);
+        }
         if dry {
             args.extend(["--operation".into(), "plan".into()]);
         } else {

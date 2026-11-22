@@ -109,22 +109,8 @@ pub fn run(options: &Options) -> Result<()> {
         }
         None => Vec::new(),
     };
-    // GitHub organisations the gate's catalogue expects `flagged`: GitHub refuses App installations there.
-    let flagged_orgs: Vec<String> = match &options.github_gate_catalog {
-        Some(path) => {
-            let catalog: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            catalog["orgs"]
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .filter(|(_, v)| v["expected"] == "flagged")
-                        .map(|(k, _)| k.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
-        None => Vec::new(),
-    };
+    // GitHub organisations the gate expects `flagged`: GitHub refuses App installations there.
+    let flagged_orgs = super::flagged_orgs(options.github_gate_catalog.as_deref());
     // Fail closed: a GitHub write needs the write gate's kill switch and pause directory.
     if write
         && options

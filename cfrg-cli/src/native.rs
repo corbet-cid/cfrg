@@ -780,12 +780,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     if stops_the_run(&message) {
                         return Err(error);
                     }
-                    if message.contains(cghb::relay::REPOSITORY_ABSENT) {
-                        report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"pending", "reason":"copy-not-created-yet"}));
-                    } else {
-                        incomplete = true;
-                        report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"error", "error":message}));
-                    }
+                    let destination = repo.destination_path(declared_dest);
+                    let flagged = declared_dest.provider == Provider::Github
+                        && is_flagged_org(options.github_gate_catalog.as_deref(), &destination);
+                    let (row, failed) = failure_row(&message, flagged, &repo.path, &destination);
+                    incomplete |= failed;
+                    report.push(row);
                 }
             }
             if options.provider.is_none() {
@@ -2100,5 +2100,94 @@ mod tests {
             "the next repository was still handled"
         );
         assert!(!io.0.actions["me/a"]);
+    }
+}
+
+/// GitHub organisations the gate expects `flagged` (GitHub refuses App installations there). They are read from `orgs.json`
+/// beside the gate catalogue (`{"orgs":{"<org>":{"expected":"flagged"}}}`), else from an `orgs` object inside the catalogue.
+pub(crate) fn flagged_orgs(catalog: Option<&std::path::Path>) -> Vec<String> {
+    let Some(catalog) = catalog else {
+        return Vec::new();
+    };
+    let read = |path: &std::path::Path| -> Option<Value> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    };
+    let orgs = catalog
+        .parent()
+        .and_then(|dir| read(&dir.join("orgs.json")))
+        .map(|v| v["orgs"].clone())
+        .filter(|v| v.is_object())
+        .or_else(|| {
+            read(catalog)
+                .map(|v| v["orgs"].clone())
+                .filter(|v| v.is_object())
+        });
+    orgs.and_then(|o| {
+        o.as_object().map(|m| {
+            m.iter()
+                .filter(|(_, v)| v["expected"] == "flagged")
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// The report row for a destination that failed with `message`, and whether it counts as a failure: an absent copy is
+/// pending, a copy in a flagged GitHub organisation is skipped, anything else is an error.
+fn failure_row(message: &str, flagged: bool, source: &str, destination: &str) -> (Value, bool) {
+    if message.contains(cghb::relay::REPOSITORY_ABSENT) {
+        (
+            json!({"source":source, "destination":destination, "state":"pending", "reason":"copy-not-created-yet"}),
+            false,
+        )
+    } else if flagged {
+        (
+            json!({"source":source, "destination":destination, "state":"skipped", "reason":"flagged-org-no-app-installation"}),
+            false,
+        )
+    } else {
+        (
+            json!({"source":source, "destination":destination, "state":"error", "error":message}),
+            true,
+        )
+    }
+}
+
+/// Whether the owner (first path segment) of `path` is a flagged GitHub organisation.
+pub(crate) fn is_flagged_org(catalog: Option<&std::path::Path>, path: &str) -> bool {
+    let owner = path.split('/').next().unwrap_or_default();
+    flagged_orgs(catalog).iter().any(|o| o == owner)
+}
+
+#[cfg(test)]
+mod flagged_tests {
+    use super::*;
+
+    #[test]
+    fn flagged_orgs_come_from_orgs_json_beside_the_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = dir.path().join("gate-config.json");
+        std::fs::write(&catalog, r#"{"repos":{}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("orgs.json"),
+            r#"{"orgs":{"cmtymt":{"expected":"flagged"},"corbet-libre":{"expected":"normal"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(flagged_orgs(Some(&catalog)), vec!["cmtymt".to_string()]);
+        assert!(is_flagged_org(Some(&catalog), "cmtymt/cmeet"));
+        assert!(!is_flagged_org(Some(&catalog), "corbet-libre/cfgj"));
+        assert!(!is_flagged_org(None, "cmtymt/cmeet"));
+    }
+
+    #[test]
+    fn a_flagged_org_is_skipped_and_an_unflagged_404_stays_an_error() {
+        let (row, failed) = failure_row("Not Found (404)", true, "a/b", "cmtymt/b");
+        assert_eq!(row["state"], "skipped");
+        assert_eq!(row["reason"], "flagged-org-no-app-installation");
+        assert!(!failed);
+        let (row, failed) = failure_row("Not Found (404)", false, "a/b", "corbet-libre/b");
+        assert_eq!(row["state"], "error");
+        assert!(failed);
     }
 }
