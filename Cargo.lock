@@ -428,7 +428,7 @@ dependencies = [
 [[package]]
 name = "cghb"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=b89dff96a25f86b1de2c240d2a7b0239c4e4fac6#b89dff96a25f86b1de2c240d2a7b0239c4e4fac6"
+source = "git+https://git.corbet.ch/corbet-libre/cghb?rev=e4acb5f5f0d4c636483b1db9d67813ac8a594ad3#e4acb5f5f0d4c636483b1db9d67813ac8a594ad3"
 dependencies = [
  "cfrg",
  "cqlt",
@@ -2677,7 +2677,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

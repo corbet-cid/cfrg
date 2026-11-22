@@ -780,8 +780,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     if stops_the_run(&message) {
                         return Err(error);
                     }
-                    incomplete = true;
-                    report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"error", "error":message}));
+                    if message.contains(cghb::relay::REPOSITORY_ABSENT) {
+                        report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"pending", "reason":"copy-not-created-yet"}));
+                    } else {
+                        incomplete = true;
+                        report.push(json!({"source":repo.path, "destination":repo.destination_path(declared_dest), "state":"error", "error":message}));
+                    }
                 }
             }
             if options.provider.is_none() {

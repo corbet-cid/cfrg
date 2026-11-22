@@ -24,7 +24,7 @@ clmr = { path = "clmr" }
 cfgj = { git = "https://git.corbet.ch/corbet-libre/cfgj", rev = "044d3d9fb939f9d44086e05c75b08fca86c7732b" }
 cglb = { git = "https://git.corbet.ch/corbet-libre/cglb", rev = "8693ec9f251a5393ef593e1f14de558be74aae42" }
 cbkt = { git = "https://git.corbet.ch/corbet-libre/cbkt", rev = "7d18d7c5303a86723b8acd3c644f91969c341291" }
-cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "b89dff96a25f86b1de2c240d2a7b0239c4e4fac6" }
+cghb = { git = "https://git.corbet.ch/corbet-libre/cghb", rev = "e4acb5f5f0d4c636483b1db9d67813ac8a594ad3" }
 cfrg-relay = { path = "cfrg-relay" }
 
 [workspace.lints.rust]

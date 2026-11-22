@@ -423,6 +423,12 @@ pub fn run(options: &Options) -> Result<()> {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    // The GitHub copy does not exist yet (the gate creates it under its own budgets) while the App is
+                    // installed on its owner: pending, not an error. A missing installation stays an error.
+                    if message.contains(cghb::relay::REPOSITORY_ABSENT) {
+                        rows.push(json!({"source":primary.path, "provider":name, "destination":path, "state":"pending", "reason":"copy-not-created-yet"}));
+                        continue;
+                    }
                     counts.entry((name.into(), org)).or_default().errors += 1;
                     incomplete = true;
                     // A refusal by the forge (auth, rate, plan, server) stops that forge for

@@ -136,6 +136,12 @@ pub fn run(options: &Options) -> Result<()> {
             }
             Err(error) => {
                 let message = error.to_string();
+                if message.contains(cghb::relay::REPOSITORY_ABSENT) {
+                    rows.push(
+                        json!({"provider":name, "destination":path, "state":"pending", "reason":"copy-not-created-yet"}),
+                    );
+                    continue;
+                }
                 *tally.entry("errors").or_default() += 1;
                 if message.contains("stopped without retry") || message.contains("hold for") {
                     stopped.insert(name.to_string(), message.clone());

@@ -20,7 +20,7 @@
             lockFile = ./Cargo.lock;
             outputHashes."cqlt-0.1.0" = "sha256-CNoV6S+339tZGgSCU57kDc1F8r7T0RWc7Ee9nrHkf34=";
             outputHashes."cglb-0.1.0" = "sha256-x5LDSo21BSsh/NbNzFkpn2IeXX4oglkHjXcPQrpTRno=";
-            outputHashes."cghb-0.1.0" = "sha256-hJ8V41lvqBVbvhIMqbFAyjzKYY1la7jwXXLe/trLL6k=";
+            outputHashes."cghb-0.1.0" = "sha256-VmHOMom0KrnaAkfOOXXP9AGvTzYweB5/gz7gsxs1C2g=";
             outputHashes."cfgj-0.1.0" = "sha256-AP7zM++9wRllDIhq/eMTizeRAKgkpRqe1rGpqu6wajk=";
             outputHashes."cbkt-0.1.0" = "sha256-5TxMXsZh1ZZesRKqpzEPKVYFLtt2Iv/gS3giCaHJou4=";
           };
