@@ -651,13 +651,10 @@ impl Plan {
         for name in &self.prune {
             hasher.update(format!("-{name} {}\n", object(destination, name)));
         }
-        format!(
-            "{}",
-            (hasher.finalize())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+        (hasher.finalize())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     }
 }
 

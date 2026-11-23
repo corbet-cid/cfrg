@@ -54,13 +54,10 @@ impl Request {
             return Err(failure("CI approval requires exact head/base, maintainer, isolated namespace, archive and image digests"));
         }
         crate::validate_command(&sandbox.command)?;
-        let hash = format!(
-            "{}",
-            (Sha256::digest(serde_json::to_vec(sandbox)?))
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        let hash = (Sha256::digest(serde_json::to_vec(sandbox)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         Ok(format!(
             "ccid-ci-approve head={} base={} sandbox={hash}",
             self.head, self.base
@@ -138,13 +135,10 @@ pub(super) fn plan(
         return Err(failure("Contribution changed during approval validation"));
     }
     let sandbox = &request.sandbox;
-    let id = format!(
-        "{}",
-        (Sha256::digest(format!("{}:{approval}", config.key(iid))))
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
+    let id = (Sha256::digest(format!("{}:{approval}", config.key(iid))))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let shell="set -eu\nprintf '%s  /input/source.tar\\n' \"$SOURCE_SHA256\" | sha256sum -c -\nmkdir /work/source\ntar -xf /input/source.tar -C /work/source\ncd /work/source\nexec \"$@\"";
     Ok(json!({"apiVersion":"batch/v1","kind":"Job",
     "metadata":{"name":format!("ccid-{}",&id[..32]),"namespace":sandbox.namespace,"annotations":{"ccid/head":request.head,"ccid/base":request.base,"ccid/review":request.review.to_string(),"ccid/approval":approval}},
