@@ -21,12 +21,31 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    time::{Duration, Instant},
 };
+
+/// A GitHub installation token lives one hour; the run itself lasts hours (the daily takes 2 to 4 h), so a token minted at the start
+/// is dead long before the end (HTTP 401 stops the whole provider). It is re-minted after this age.
+const MINTED_MAX_AGE: Duration = Duration::from_secs(45 * 60);
+
+#[derive(Clone)]
+struct Minted {
+    token: String,
+    /// The repository (`name`) the token was minted for: an `/orgs/<owner>/...` request has none, so a stale token is renewed with it.
+    repo: String,
+    at: Instant,
+}
+
+impl Minted {
+    fn fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < MINTED_MAX_AGE
+    }
+}
 
 pub struct Creds {
     dir: Option<PathBuf>,
-    /// Installation tokens by lowercase owner, kept for the run.
-    minted: Rc<RefCell<BTreeMap<String, String>>>,
+    /// Installation tokens by lowercase owner, renewed when older than [`MINTED_MAX_AGE`].
+    minted: Rc<RefCell<BTreeMap<String, Minted>>>,
 }
 
 fn file_for(env: &str) -> Option<&'static str> {
@@ -127,28 +146,37 @@ impl Creds {
     }
 
     fn installation(&self, id: &str, key: &str, path: &str) -> Result<String> {
-        let Some((owner, name)) = repo_of(path) else {
-            // `/orgs/<owner>/...` carries no repository: it reuses the token already minted for the owner.
-            let first = path.trim_start_matches('/');
-            let first = ["orgs/", "users/"]
-                .iter()
-                .find_map(|p| first.strip_prefix(p))
-                .unwrap_or(first);
-            let owner = first
-                .split(['/', '?'])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            return self
-                .minted
-                .borrow()
-                .get(&owner)
-                .cloned()
-                .ok_or_else(|| "a GitHub App token needs a repository of the owner first".into());
+        let (owner, name) = match repo_of(path) {
+            Some((owner, name)) => (owner.to_ascii_lowercase(), name),
+            None => {
+                // `/orgs/<owner>/...` carries no repository: it reuses (and, when stale, renews with the repository it was minted for)
+                // the token already minted for the owner.
+                let first = path.trim_start_matches('/');
+                let first = ["orgs/", "users/"]
+                    .iter()
+                    .find_map(|p| first.strip_prefix(p))
+                    .unwrap_or(first);
+                let owner = first
+                    .split(['/', '?'])
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let known = self.minted.borrow().get(&owner).cloned();
+                match known {
+                    Some(m) if m.fresh(Instant::now()) => return Ok(m.token),
+                    Some(m) => (owner, m.repo),
+                    None => {
+                        return Err(
+                            "a GitHub App token needs a repository of the owner first".into()
+                        )
+                    }
+                }
+            }
         };
-        let owner = owner.to_ascii_lowercase();
-        if let Some(t) = self.minted.borrow().get(&owner) {
-            return Ok(t.clone());
+        if let Some(m) = self.minted.borrow().get(&owner) {
+            if m.fresh(Instant::now()) {
+                return Ok(m.token.clone());
+            }
         }
         let rt = cfrg_relay::live::runtime()?;
         let driver = app_driver(&rt, id, key)?;
@@ -158,7 +186,14 @@ impl Creds {
             .block_on(driver.installation_token(&repo))
             .map_err(|e| format!("GitHub App token for {owner}: {e}"))?;
         let token = token.expose().to_owned();
-        self.minted.borrow_mut().insert(owner, token.clone());
+        self.minted.borrow_mut().insert(
+            owner,
+            Minted {
+                token: token.clone(),
+                repo: name,
+                at: Instant::now(),
+            },
+        );
         Ok(token)
     }
 
@@ -211,6 +246,25 @@ fn app_driver(
         cghb::relay::GithubRelay::new(&creds, "https://api.github.com")
             .map_err(|e| e.to_string())?,
     )
+}
+
+#[cfg(test)]
+mod minted_tests {
+    use super::*;
+
+    #[test]
+    fn a_minted_token_is_renewed_after_its_max_age() {
+        let at = Instant::now();
+        let m = Minted {
+            token: "t".into(),
+            repo: "r".into(),
+            at,
+        };
+        assert!(m.fresh(at));
+        assert!(m.fresh(at + MINTED_MAX_AGE - Duration::from_secs(1)));
+        assert!(!m.fresh(at + MINTED_MAX_AGE));
+        assert!(MINTED_MAX_AGE < Duration::from_secs(3600));
+    }
 }
 
 #[cfg(test)]
