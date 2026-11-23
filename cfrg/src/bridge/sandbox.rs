@@ -148,7 +148,13 @@ pub(super) fn dispatch(
 ) -> Result<Value> {
     let ns = plan["metadata"]["namespace"].as_str().unwrap();
     let name = plan["metadata"]["name"].as_str().unwrap();
-    let key = format!("dispatch-{:x}", Sha256::digest(serde_json::to_vec(plan)?));
+    let key = format!(
+        "dispatch-{}",
+        (Sha256::digest(serde_json::to_vec(plan)?))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     let existing = kube.get(ns, "job", Some(name))?;
     if !existing.is_null() {
         if existing["metadata"]["annotations"] != plan["metadata"]["annotations"] {

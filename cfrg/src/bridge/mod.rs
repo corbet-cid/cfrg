@@ -99,8 +99,11 @@ impl Config {
     fn key(&self, iid: u64) -> String {
         // Bind state, marker and branch to the complete trusted mapping.
         format!(
-            "{:x}",
-            Sha256::digest(format!("{}:{iid}", serde_json::to_string(self).unwrap()))
+            "{}",
+            (Sha256::digest(format!("{}:{iid}", serde_json::to_string(self).unwrap())))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         )
     }
 

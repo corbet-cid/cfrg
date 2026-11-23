@@ -221,7 +221,13 @@ struct Curl<'a> {
 impl Transport for Curl<'_> {
     fn request(&mut self, spec: &RequestSpec) -> Result<(u16, Value)> {
         // Persist the next request BEFORE contact, including across process crashes.
-        let key = format!("pace-{:x}", Sha256::digest(&spec.origin));
+        let key = format!(
+            "pace-{}",
+            (Sha256::digest(&spec.origin))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         let next: u64 = self.journal.load(&key)?.unwrap_or_default();
         let delay = next.saturating_sub(now()?);
         if delay > 30 {
@@ -334,13 +340,16 @@ fn report(
     let mut complete = true;
     for target in &config.targets {
         let key = format!(
-            "status-{:x}",
-            Sha256::digest(format!(
+            "status-{}",
+            (Sha256::digest(format!(
                 "{}:{}:{}",
                 serde_json::to_string(target)?,
                 options.commit,
                 options.name
-            ))
+            )))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
         );
         let outcome = (|| -> Result<&str> {
             if let Some(previous) = journal.load::<Posted>(&key)? {

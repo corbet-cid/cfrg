@@ -54,7 +54,13 @@ impl Request {
             return Err(failure("CI approval requires exact head/base, maintainer, isolated namespace, archive and image digests"));
         }
         crate::validate_command(&sandbox.command)?;
-        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(sandbox)?));
+        let hash = format!(
+            "{}",
+            (Sha256::digest(serde_json::to_vec(sandbox)?))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         Ok(format!(
             "ccid-ci-approve head={} base={} sandbox={hash}",
             self.head, self.base
@@ -133,8 +139,11 @@ pub(super) fn plan(
     }
     let sandbox = &request.sandbox;
     let id = format!(
-        "{:x}",
-        Sha256::digest(format!("{}:{approval}", config.key(iid)))
+        "{}",
+        (Sha256::digest(format!("{}:{approval}", config.key(iid))))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     );
     let shell="set -eu\nprintf '%s  /input/source.tar\\n' \"$SOURCE_SHA256\" | sha256sum -c -\nmkdir /work/source\ntar -xf /input/source.tar -C /work/source\ncd /work/source\nexec \"$@\"";
     Ok(json!({"apiVersion":"batch/v1","kind":"Job",
