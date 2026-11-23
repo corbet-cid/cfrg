@@ -21,18 +21,6 @@
       ],
       "archive_inputs": true
     },
-    "portable-paths": {
-      "job": "portable-paths",
-      "scheduler": "forgejo",
-      "checks": [
-        "portable-paths"
-      ],
-      "workflow": "portable-paths",
-      "command": [
-        "ccid:run-declared-checks"
-      ],
-      "runs_on": "linux"
-    },
     "verify": {
       "job": "verify",
       "scheduler": "forgejo",
@@ -46,6 +34,7 @@
         ".ci/run-job.sh"
       ],
       "runs_on": "linux",
+      "fold_portable_paths": "report",
       "archive_inputs": true
     }
   }
