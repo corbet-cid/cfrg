@@ -430,9 +430,11 @@ pub fn resolve(
             content,
             hold: None,
             destinations,
+            org_map: Default::default(),
         });
     }
     placement.repositories.extend(rows);
+    placement.attach_org_map();
     outcome.holds = holds
         .into_iter()
         .map(|((owner, provider), (reason, repositories))| Hold {

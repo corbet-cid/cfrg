@@ -4,6 +4,15 @@ All notable changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/); while it is below 1.0 a minor version may change behaviour.
 
+## [Unreleased]
+
+### Added
+- Adapter capability `transfer`: a namespace change of a destination is moved by `plan` (`transfer-planned`) and
+  `reconcile --apply` (`transferred`) instead of being reported `rename-blocked`. GitLab uses the project transfer, GitHub the
+  repository transfer behind the write gate, Bitbucket creates the repository in the target workspace, mirrors it, compares every
+  ref and deletes the old copy only on an exact match ([native mirrors](docs/native-mirrors.md)).
+- The placement's `org_map`: the namespace a Forgejo organisation has on each provider.
+
 ## [0.2.0] - 2026-11-16
 
 The first public release. The workspace carried the number `0.1.0` internally while it was private; no `0.1.0` was ever

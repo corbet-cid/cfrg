@@ -232,6 +232,7 @@ pub fn reconcile(
             content: Content::NativeGit,
             hold: None,
             destinations: Vec::new(),
+            org_map: Default::default(),
         };
         let api = Mirrors {
             endpoint: source,

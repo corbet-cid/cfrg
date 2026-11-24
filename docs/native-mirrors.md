@@ -32,6 +32,34 @@ is owned when its address is a declared destination of the repository (or carrie
 `--operation adopt` is the read-only adoption listing: every push mirror as `owned` or
 `foreign`, with counts per forge. It writes nothing and refuses `--apply`.
 
+## Transfers: one action per move
+
+A move between namespaces needs one action, either the Forgejo transfer (the pass finds it through the `source_id` and reports
+`source-renamed`) or one change of the placement's `org_map`. Everything else is done by `plan` / `reconcile --apply`.
+
+`org_map` maps the lowercase Forgejo organisation to the namespace it has on each provider (GitLab group, nested allowed;
+Bitbucket workspace; GitHub owner). A destination that is not pinned lives at `<mapped namespace>/<repository>`; a provider
+without an entry keeps the organisation's own name. The Bitbucket project of a new repository is the destination's `namespace`.
+
+```json
+"org_map": {"corbet-web": {"bitbucket": "corbet-archv", "gitlab": "corbet-archv", "github": "corbet-archv"}}
+```
+
+Adapter capability `transfer`. A transfer changes the namespace only; a changed name as well is reported `transfer-blocked`
+(transfer first, then rename). The states: `transfer-planned` (`plan`; lists the steps; nothing written), `transferred`
+(`reconcile --apply`), `transfer-pending` (a step was taken and the next pass continues), `transfer-blocked` (reported, never
+forced), and `transfer-needed` in `--operation names`.
+
+| Provider | Transfer |
+|---|---|
+| GitLab | `PUT /projects/:id/transfer` to the target group; the id stays and the old path redirects. The target group must exist; a taken path blocks. |
+| GitHub | `POST /repos/:owner/:repo/transfer` to the target owner, paced as a creation. Fails closed: needs `--github-kill-switch` and `--github-paused-dir`; the kill switch, a paused source or target organisation and a flagged organisation each block. Read back by id; a transfer not yet visible is `transfer-pending`. GitHub is a last resort: see the pacing policy before any real run. |
+| Bitbucket | No public cross-workspace transfer exists (the UI only, and the target must accept). One step per pass: (1) create the repository in the target workspace and project, with the description `cfrg-transfer-from:<old uuid>`; (2) the mirror fills it (`transfer-pending`, with the new uuid); (3) compare EVERY branch and tag of both (names and hashes, in both directions); (4) only when they match exactly, delete the old repository. A repository at the wanted name that lacks the marker is never adopted or deleted. |
+
+After a Bitbucket move the destination has a new uuid: the report carries it as `new_repository_id` (and `detail.repository_id`
+when `transferred`), and the placement's `repository_id` must be updated to it (the placement render does that from the report).
+Tests are mocked (`cfrg/src/native/transfer/tests.rs`): no network.
+
 ## Renames: destinations follow the primary
 
 The name of a destination is the primary's current `<org>/<repo>`, unless the
@@ -53,8 +81,8 @@ still points at an earlier name as `rename-pending`.
 | Operation | What a rename of the primary does |
 |---|---|
 | `status` | reads Forgejo only; `rename-pending` when a mirror points at an earlier name of the destination |
-| `plan` | looks the destination up by its immutable id (`repository_id`) and reports `rename-planned`, `rename-blocked` (name taken, other namespace) or nothing |
-| `reconcile --apply` | renames the destination through its adapter, replaces the owned Forgejo mirror that points at the old name, removes the old SSH deploy key |
+| `plan` | looks the destination up by its immutable id (`repository_id`) and reports `rename-planned`, `rename-blocked` (name taken), `transfer-planned` (other namespace, with the steps) or nothing |
+| `reconcile --apply` | renames the destination through its adapter, replaces the owned Forgejo mirror that points at the old name, removes the old SSH deploy key; a namespace change is a transfer (below) |
 | `rename --apply` | the same, and only for destinations whose name is out of date; never creates a destination |
 
 Adapter capability `rename` (`cfrg switch --capabilities`): GitLab native (the
@@ -62,8 +90,7 @@ project path, and the display name when it carried the same text; the old path
 redirects), Bitbucket native (the repository name, the slug follows; the old slug
 answers 404, so the repository is addressed by UUID), Forgejo as a destination
 and GitHub reported only (its repositories are renamed in GitHub). A rename is refused and reported, never forced, when the
-wanted name is taken by another repository or when the namespace differs (a
-transfer is not implemented). The recorded `remote_name` of a replaced mirror
+wanted name is taken by another repository. A namespace change is not a rename: see Transfers. The recorded `remote_name` of a replaced mirror
 changes: the report prints the new one, and the declared placement keeps it
 (`remote_name` is an explicit ownership claim; the address derives the rest).
 

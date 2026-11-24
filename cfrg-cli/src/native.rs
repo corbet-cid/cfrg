@@ -9,7 +9,9 @@ mod wiki;
 use cfrg::{
     native::{
         http::{Http, Pacing, Transport},
-        owned_by, Destination, Naming, Placement, Provider, Repository,
+        owned_by, plan_move,
+        transfer::{self, Transfer},
+        Destination, Move, Naming, Placement, Provider, Repository,
     },
     Result,
 };
@@ -527,10 +529,47 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             incomplete = true;
                             return Ok(());
                         }
-                        Naming::Blocked { from, reason } => {
+                        Naming::Blocked { from, reason }
+                            if plan_move(&from, &dest.path) != Move::Transfer =>
+                        {
                             report.push(json!({"source":repo.path, "destination":dest.path, "state":"rename-blocked", "from":from, "reason":reason}));
                             incomplete = true;
                             return Ok(());
+                        }
+                        // The namespace differs: the destination is moved by its provider's means (capability `transfer`).
+                        Naming::Blocked { from, .. } => {
+                            let outcome =
+                                transfer_one(&mut io, options, &dest, repo, &from, write)?;
+                            match outcome {
+                                Transfer::Planned { from, steps } => {
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-planned", "from":from, "steps":steps}));
+                                    incomplete = true;
+                                    return Ok(());
+                                }
+                                Transfer::Pending {
+                                    from,
+                                    detail,
+                                    new_repository_id,
+                                } => {
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "from":from, "detail":detail, "new_repository_id":new_repository_id}));
+                                    incomplete = true;
+                                    return Ok(());
+                                }
+                                Transfer::Blocked { from, reason } => {
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":reason}));
+                                    incomplete = true;
+                                    return Ok(());
+                                }
+                                Transfer::Done { from, detail } => {
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transferred", "from":from, "detail":detail}));
+                                    // The rest of this pass addresses the destination by its identity at the new path
+                                    // (Bitbucket's new repository has a new uuid).
+                                    if let Some(id) = detail["repository_id"].as_str() {
+                                        dest.repository_id = Some(id.to_string());
+                                    }
+                                    Some(from)
+                                }
+                            }
                         }
                     };
                     if let Some(from) = &was {
@@ -959,6 +998,9 @@ fn audit_names(
             Naming::Current => row("current", json!({})),
             Naming::Planned { from } => row("rename-planned", json!({"from":from})),
             Naming::Renamed { from } => row("renamed", json!({"from":from})),
+            Naming::Blocked { from, .. } if plan_move(&from, &dest.path) == Move::Transfer => {
+                row("transfer-needed", json!({"from":from, "wanted":dest.path}))
+            }
             Naming::Blocked { from, reason } => {
                 row("rename-blocked", json!({"from":from, "reason":reason}))
             }
@@ -970,6 +1012,73 @@ fn audit_names(
 /// The Forgejo mirror of a destination under any of its `known` names, and the owner claim
 /// the placement itself declares (`remote_name`). Ownership is derived (design 3.7): a push
 /// mirror whose address is one of the destination's names is ours; nothing is recorded.
+/// One step of moving `dest` from `from` into its new namespace, through the adapter of its provider. GitHub honours the
+/// write gate's files and flagged organisations; a GitHub transfer without them is refused (fail closed), as `settings` does.
+fn transfer_one(
+    io: &mut dyn Transport,
+    options: &Options,
+    dest: &Destination,
+    repo: &Repository,
+    from: &str,
+    write: bool,
+) -> Result<Transfer> {
+    match dest.provider {
+        Provider::Gitlab => transfer::gitlab(io, dest, from, write),
+        Provider::Github => {
+            let new_owner = dest.path.split('/').next().unwrap_or_default();
+            let old_owner = from.split('/').next().unwrap_or_default();
+            let refusal = if write
+                && (options.github_kill_switch.is_none() || options.github_paused_dir.is_none())
+            {
+                Some("the write gate's files were not given (--github-kill-switch, --github-paused-dir)")
+            } else if options
+                .github_kill_switch
+                .as_ref()
+                .is_some_and(|p| p.exists())
+            {
+                Some("gate-kill-switch")
+            } else if [old_owner, new_owner].iter().any(|org| {
+                options
+                    .github_paused_dir
+                    .as_ref()
+                    .is_some_and(|dir| dir.join(org).exists())
+            }) {
+                Some("gate-paused")
+            } else if [from, dest.path.as_str()]
+                .iter()
+                .any(|path| is_flagged_org(options.github_gate_catalog.as_deref(), path))
+            {
+                Some("flagged-organisation")
+            } else {
+                None
+            };
+            transfer::github(
+                io,
+                dest,
+                from,
+                write,
+                &transfer::Gate {
+                    refusal: refusal.map(String::from),
+                },
+            )
+        }
+        Provider::Bitbucket => transfer::bitbucket(
+            io,
+            dest,
+            &transfer::BitbucketMove {
+                from,
+                old_uuid: dest
+                    .repository_id
+                    .as_deref()
+                    .ok_or("Bitbucket move needs the old repository_id")?,
+                project_key: &dest.namespace,
+                private: repo.private,
+            },
+            write,
+        ),
+    }
+}
+
 fn locate(
     dest: &Destination,
     mirrors: &[Value],
@@ -1460,6 +1569,107 @@ mod tests {
             twin,
         ];
         assert!(mirror_named(&twins, &dest, &both).is_err());
+    }
+
+    struct Silent(Vec<String>);
+    impl Transport for Silent {
+        fn send(
+            &mut self,
+            request: cfrg::native::http::Request,
+        ) -> Result<cfrg::native::http::Response> {
+            self.0.push(format!("{} {}", request.method, request.path));
+            Err("no network in tests".into())
+        }
+    }
+
+    fn transfer_options(kill: Option<PathBuf>, paused: Option<PathBuf>) -> Options {
+        Options {
+            placement: PathBuf::new(),
+            state: PathBuf::new(),
+            repository: None,
+            provider: None,
+            existing_only: true,
+            operation: Operation::Reconcile,
+            apply: true,
+            max_writes: None,
+            github_kill_switch: kill,
+            github_paused_dir: paused,
+            github_gate_catalog: None,
+            identities: None,
+            copies_from: None,
+            operator: None,
+            wiki_key: None,
+            wiki_known_hosts: None,
+            wiki_key_id: None,
+            credentials_dir: None,
+            wiki_max_pushes: 20,
+            wiki_push_gap_secs: 2,
+        }
+    }
+
+    fn github_destination() -> (Destination, Repository) {
+        let json = r#"{"provider":"github","endpoint":{"origin":"https://api.github.com","token_env":"T"},"path":"new-org/app","namespace":"new-org","repository_id":"5","mirror_user":"9","password_env":"T","interval_seconds":3600}"#;
+        let repo: Repository = serde_json::from_str(&format!(
+            r#"{{"path":"new-org/app","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[{json}]}}"#
+        ))
+        .unwrap();
+        (repo.destinations[0].clone(), repo)
+    }
+
+    #[test]
+    fn a_github_transfer_without_the_gates_files_makes_no_request() {
+        let (dest, repo) = github_destination();
+        let mut io = Silent(Vec::new());
+        let outcome = transfer_one(
+            &mut io,
+            &transfer_options(None, None),
+            &dest,
+            &repo,
+            "old-org/app",
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("write gate")),
+            "{outcome:?}"
+        );
+        assert!(
+            io.0.is_empty(),
+            "no request while the gate is not held: {:?}",
+            io.0
+        );
+    }
+
+    #[test]
+    fn a_github_transfer_waits_for_a_kill_switch_and_a_paused_organisation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, repo) = github_destination();
+        let kill = dir.path().join("kill");
+        let paused = dir.path().join("paused");
+        std::fs::create_dir(&paused).unwrap();
+        std::fs::write(&kill, "").unwrap();
+        let mut io = Silent(Vec::new());
+        let options = transfer_options(Some(kill.clone()), Some(paused.clone()));
+        let outcome = transfer_one(&mut io, &options, &dest, &repo, "old-org/app", true).unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("gate-kill-switch"))
+        );
+        std::fs::remove_file(&kill).unwrap();
+        std::fs::write(paused.join("old-org"), "").unwrap();
+        let outcome = transfer_one(&mut io, &options, &dest, &repo, "old-org/app", true).unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("gate-paused"))
+        );
+        assert!(io.0.is_empty());
+    }
+
+    #[test]
+    fn the_name_audit_calls_a_namespace_change_a_transfer() {
+        assert_eq!(plan_move("old/app", "new/app"), Move::Transfer);
+        assert_eq!(
+            plan_move("old/app", "old/other"),
+            Move::Rename { leaf: "other" }
+        );
     }
 
     #[test]

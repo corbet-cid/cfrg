@@ -7,6 +7,7 @@ pub mod derive;
 pub mod http;
 pub mod links;
 pub mod settings;
+pub mod transfer;
 pub mod wiki;
 pub mod wiki_sync;
 
@@ -43,7 +44,16 @@ pub struct Placement {
     /// (infra lib/placement.json `external_content`). Without it an LFS repository is an exception that native makes no copy of.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub external_content: BTreeMap<String, BTreeMap<String, String>>,
+    /// Lowercase Forgejo organisation to provider to the namespace that organisation has there (GitLab group, Bitbucket
+    /// workspace, GitHub owner). The one place a move between namespaces is declared: change the Forgejo organisation of a
+    /// repository, or change this map, and every destination that is not pinned follows (a transfer, see `transfer`).
+    /// A provider without an entry keeps the organisation's own name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub org_map: OrgMap,
 }
+
+/// Forgejo organisation (lowercase) to provider to the namespace on that provider.
+pub type OrgMap = BTreeMap<String, BTreeMap<Provider, String>>;
 
 impl Placement {
     /// Whether native may mirror at least one destination of this repository. native-git: all; an LFS repository: the destinations that are
@@ -153,6 +163,9 @@ pub struct Repository {
     /// Positive content/identity exceptions stay declared, never silently skipped.
     pub hold: Option<String>,
     pub destinations: Vec<Destination>,
+    /// The placement's `org_map`, attached on loading; not part of the file format.
+    #[serde(skip)]
+    pub org_map: std::sync::Arc<OrgMap>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -256,7 +269,22 @@ impl Repository {
         if dest.pinned() {
             dest.path.clone()
         } else {
-            self.path.clone()
+            self.mapped_path(dest.provider)
+        }
+    }
+
+    /// The primary's path with its organisation replaced by what `org_map` says for `provider`.
+    pub fn mapped_path(&self, provider: Provider) -> String {
+        let Some((org, rest)) = self.path.split_once('/') else {
+            return self.path.clone();
+        };
+        match self
+            .org_map
+            .get(&org.to_ascii_lowercase())
+            .and_then(|targets| targets.get(&provider))
+        {
+            Some(namespace) => format!("{namespace}/{rest}"),
+            None => self.path.clone(),
         }
     }
 }
@@ -325,14 +353,25 @@ impl Placement {
     /// the primary's live name on top of this (a rename the file has not caught
     /// up with yet).
     fn follow_primaries(&mut self) {
+        self.attach_org_map();
         for repo in &mut self.repositories {
-            let current = repo.path.clone();
             for dest in &mut repo.destinations {
                 dest.recorded_path = dest.path.clone();
-                if !dest.pinned() {
-                    dest.path = current.clone();
+            }
+            for index in 0..repo.destinations.len() {
+                if !repo.destinations[index].pinned() {
+                    repo.destinations[index].path =
+                        repo.mapped_path(repo.destinations[index].provider);
                 }
             }
+        }
+    }
+
+    /// Hand every repository the `org_map` (also after `derive` added repositories).
+    pub fn attach_org_map(&mut self) {
+        let map = std::sync::Arc::new(self.org_map.clone());
+        for repo in &mut self.repositories {
+            repo.org_map = map.clone();
         }
     }
 
@@ -375,6 +414,15 @@ impl Placement {
         }
         if let Some(derive) = &self.derive {
             derive.validate()?;
+        }
+        for (org, targets) in &self.org_map {
+            if org.is_empty() || org != &org.to_ascii_lowercase() || org.contains('/') {
+                return Err(failure("org_map keys are lowercase organisation names"));
+            }
+            for (provider, namespace) in targets {
+                // A GitLab group may be nested; a Bitbucket workspace or a GitHub owner is one component.
+                path(&format!("{namespace}/x"), *provider == Provider::Gitlab)?;
+            }
         }
         // The declaration of contributed projects, and that none of them has a mirror destination (R11).
         crate::contributed::Contributed::from_placement(self, &[])?;
@@ -867,6 +915,52 @@ mod tests {
         let repo = declared_repo(&declared);
         assert_eq!(repo.destinations[0].mirror_user, "x-token-auth");
         assert_eq!(repo.destinations[0].restriction_user(), "{uuid}");
+    }
+
+    fn mapped_document(map: &str) -> String {
+        format!(
+            r#"{{"schema":1,"source":{{"origin":"https://forge.example","token_env":"T"}},"org_map":{map},"repositories":[{{"path":"web/site","source_id":5,"private":false,"default_branch":"main","content":"native-git","hold":null,"destinations":[
+                {{"provider":"gitlab","endpoint":{{"origin":"https://gitlab.example","token_env":"T"}},"namespace":"2","repository_id":"7","mirror_user":"9","password_env":"T","interval_seconds":3600,"hold":null,"remote_name":null}},
+                {{"provider":"bitbucket","endpoint":{{"origin":"https://api.bitbucket.org","token_env":"T"}},"namespace":"CORE","repository_id":"{{u}}","mirror_user":"9","password_env":"T","interval_seconds":3600,"hold":null,"remote_name":null}}
+            ]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn the_org_map_decides_the_namespace_per_provider() {
+        let doc = mapped_document(r#"{"web":{"gitlab":"web-group/sub","bitbucket":"archv"}}"#);
+        let placement = Placement::from_document(doc.as_bytes()).unwrap();
+        placement.validate().unwrap();
+        let repo = &placement.repositories[0];
+        assert_eq!(repo.destinations[0].path, "web-group/sub/site");
+        assert_eq!(repo.destinations[1].path, "archv/site");
+        assert_eq!(
+            repo.destination_path(&repo.destinations[0]),
+            "web-group/sub/site"
+        );
+        // The primary moves to another organisation: the destination's namespace follows from the map.
+        let mut live = repo.clone();
+        live.path = "other/site".into();
+        assert_eq!(live.destination_path(&live.destinations[1]), "other/site");
+        assert_eq!(
+            plan_move("web-group/sub/site", "other/site"),
+            Move::Transfer
+        );
+        // No entry for an organisation: the destinations keep its own name.
+        let plain = Placement::from_document(mapped_document("{}").as_bytes()).unwrap();
+        assert_eq!(plain.repositories[0].destinations[0].path, "web/site");
+    }
+
+    #[test]
+    fn a_bad_org_map_is_refused() {
+        for map in [
+            r#"{"Web":{"gitlab":"g"}}"#,
+            r#"{"web":{"bitbucket":"a/b"}}"#,
+            r#"{"web":{"github":""}}"#,
+        ] {
+            let placement = Placement::from_document(mapped_document(map).as_bytes()).unwrap();
+            assert!(placement.validate().is_err(), "{map}");
+        }
     }
 
     fn declared_repo(destinations: &str) -> Repository {
