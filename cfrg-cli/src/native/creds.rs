@@ -352,6 +352,7 @@ mod tests {
     }
 
     /// A throwaway key made for this test.
+    // push-guard: allow throwaway test-only key for the GitHub App client test, never a credential
     const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDANkf7nr8u3CoA
 ta2unUZe3C0SDjUwZ8FnP2Vv23YOe8jjecqsUSJC5o9Ibcm0izM/SOR94BF+TQ7I
