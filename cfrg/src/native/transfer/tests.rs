@@ -439,3 +439,15 @@ fn a_destination_with_another_name_than_the_old_one_is_not_moved_and_renamed_at_
     ));
     assert!(io.seen.is_empty());
 }
+
+#[test]
+fn the_corbet_ch_dry_run_plan() {
+    let mut io = Fake::new().on("GET", NEW, 404, json!({}));
+    let outcome = bitbucket(&mut io, &bb(), &mv(), false).unwrap();
+    let Transfer::Planned { from, steps } = outcome else {
+        panic!()
+    };
+    let row = json!({"source": "corbet-web/corbet.ch", "destination": "corbet-archv/corbet.ch", "state": "transfer-planned", "from": from, "steps": steps});
+    println!("{}", serde_json::to_string_pretty(&row).unwrap());
+    assert_eq!(row["steps"].as_array().unwrap().len(), 4);
+}
