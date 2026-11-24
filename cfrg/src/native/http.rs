@@ -144,6 +144,9 @@ pub struct Http {
     secrets: Option<SecretFn>,
     /// Consecutive permission refusals (HTTP 403 without a rate limit) per scope; any answer below 400 resets it.
     refusals: std::collections::BTreeMap<String, u32>,
+    /// The curl executable and the pause function: fixed in production, swapped by tests only.
+    curl: String,
+    sleep: fn(u64),
 }
 
 /// Marks a 403 that refuses one request (a permission the credential does not hold, e.g. a GitHub App with
@@ -208,6 +211,8 @@ impl Http {
                 pacing: Pacing::default(),
                 secrets: None,
                 refusals: Default::default(),
+                curl: "curl".into(),
+                sleep: |seconds| std::thread::sleep(Duration::from_secs(seconds)),
             }),
             Err(e) => {
                 fs::remove_file(&lock_path)?;
@@ -260,8 +265,41 @@ impl Drop for Http {
     }
 }
 
-/// Pauses before the retries of a read that Forgejo answered with a 5xx: bounded, growing.
-const READ_RETRIES: [u64; 3] = [5, 20, 60];
+/// A read is tried at most this many times (one try plus the retries) when the failure is transient.
+const READ_ATTEMPTS: u32 = 5;
+/// The pause before retry `n` (0-based) doubles from 2 s and never exceeds this many seconds, jitter included.
+const READ_PAUSE_CAP: u64 = 30;
+
+/// Exponential pause before retry `retry` with up to half again of jitter, capped at `READ_PAUSE_CAP`.
+fn backoff(retry: u32, jitter: u64) -> u64 {
+    let base = (2u64 << retry.min(10)).min(READ_PAUSE_CAP);
+    (base + jitter % (base / 2 + 1)).min(READ_PAUSE_CAP)
+}
+
+fn jitter_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+}
+
+/// curl exit codes of a transport that failed before or during an answer: unresolved proxy/host (5, 6), refused
+/// (7), partial file (18), timeout (28), TLS connect (35), empty reply (52), send/recv failure and reset (55, 56).
+const TRANSIENT_CURL_EXITS: [u32; 9] = [5, 6, 7, 18, 28, 35, 52, 55, 56];
+
+/// Why a failed read is worth another try, if it is: a 5xx, or a transport failure of curl. Everything else
+/// (4xx, a malformed answer, a refused credential) is final.
+fn transient_reason(error: &dyn std::error::Error) -> Option<String> {
+    let text = error.to_string();
+    if let Some(rest) = text.strip_prefix("Native API HTTP 5") {
+        return Some(format!("http-5{}", &rest[..rest.len().min(2)]));
+    }
+    let code = text.strip_prefix("curl failed: exit status: ")?;
+    let code: u32 = code.split_whitespace().next()?.parse().ok()?;
+    TRANSIENT_CURL_EXITS
+        .contains(&code)
+        .then(|| format!("curl-exit-{code}"))
+}
 /// A throttled read (429) is retried at most this many times, and only when the provider's Retry-After is at most
 /// this many seconds; a longer window stays the recorded hold it always was.
 const THROTTLE_RETRIES: u32 = 2;
@@ -272,21 +310,24 @@ const THROTTLE_MAX_WAIT: u64 = 120;
 fn retried<T>(
     pauses: &[u64],
     sleep: &mut dyn FnMut(u64),
-    transient: impl Fn(&dyn std::error::Error) -> bool,
+    transient: impl Fn(&dyn std::error::Error) -> Option<String>,
     mut attempt: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     let mut pauses = pauses.iter();
+    let mut tries = 0u32;
     loop {
+        tries += 1;
         match attempt() {
-            Err(error) if transient(error.as_ref()) => match pauses.next() {
-                Some(seconds) => {
+            Err(error) => match (transient(error.as_ref()), pauses.next()) {
+                (Some(reason), Some(seconds)) => {
+                    // Reason and counts only: never a URL, header or token.
                     eprintln!(
                         "{}",
-                        serde_json::json!({"event":"native-retry","after_seconds":seconds})
+                        serde_json::json!({"event":"native-retry","attempt":tries,"reason":reason,"after_seconds":seconds})
                     );
                     sleep(*seconds);
                 }
-                None => return Err(error),
+                _ => return Err(error),
             },
             other => return other,
         }
@@ -300,13 +341,17 @@ impl Transport for Http {
         if request.method != "GET" {
             return self.send_once(request);
         }
-        let pauses = READ_RETRIES;
+        let seed = jitter_seed();
+        let pauses: Vec<u64> = (0..READ_ATTEMPTS - 1)
+            .map(|n| backoff(n, seed.rotate_left(n * 7)))
+            .collect();
+        let sleep = self.sleep;
         let mut throttled = 0;
         loop {
             let result = retried(
                 &pauses,
-                &mut |seconds| std::thread::sleep(Duration::from_secs(seconds)),
-                |error| error.to_string().starts_with("Native API HTTP 5"),
+                &mut |seconds| sleep(seconds),
+                transient_reason,
                 || self.send_once(request.clone()),
             );
             // A throttled read (429) is retried once the provider's own Retry-After has passed, when that is
@@ -466,7 +511,7 @@ impl Http {
             Auth::Bearer => "Authorization: Bearer {{CFRG_NATIVE_TOKEN}}",
         };
         let mut args: Vec<String> = [
-            "curl",
+            self.curl.as_str(),
             "--disable",
             "--silent",
             "--globoff",
@@ -768,7 +813,7 @@ mod tests {
 
     #[test]
     fn a_transient_server_error_is_retried_with_growing_pauses_and_then_gives_up() {
-        let transient = |e: &dyn std::error::Error| e.to_string().starts_with("Native API HTTP 5");
+        let transient = transient_reason;
         let mut slept = Vec::new();
         let mut calls = 0;
         let ok = retried(&[5, 20, 60], &mut |s| slept.push(s), transient, || {
@@ -800,5 +845,134 @@ mod tests {
             Err(failure("Native API HTTP 403; stopped"))
         });
         assert!(refused.is_err() && calls == 1);
+    }
+
+    #[test]
+    fn the_pauses_double_with_jitter_and_stay_under_the_cap() {
+        assert_eq!(backoff(0, 0), 2);
+        assert_eq!(backoff(1, 0), 4);
+        assert_eq!(backoff(3, 0), 16);
+        for retry in 0..20 {
+            for jitter in [0, 1, 7, u64::MAX] {
+                assert!(backoff(retry, jitter) <= READ_PAUSE_CAP);
+            }
+        }
+        assert!(backoff(2, 3) >= 8);
+    }
+
+    #[test]
+    fn only_server_errors_and_transport_failures_are_transient() {
+        let reason = |text: &str| transient_reason(failure(text).as_ref());
+        assert_eq!(
+            reason("Native API HTTP 503; stopped").as_deref(),
+            Some("http-503")
+        );
+        assert_eq!(
+            reason("curl failed: exit status: 56").as_deref(),
+            Some("curl-exit-56")
+        );
+        assert!(reason("curl failed: exit status: 35").is_some());
+        assert!(reason("curl failed: exit status: 7").is_some());
+        assert!(reason("curl failed: exit status: 28").is_some());
+        for fatal in [
+            "Native API HTTP 401; stopped",
+            "Native API HTTP 404; no retry",
+            "Native API HTTP 429; stopped",
+            "curl failed: exit status: 60",
+            "curl failed: exit status: 63",
+            "Malformed native API success response",
+            "Unknown HTTP outcome",
+        ] {
+            assert!(reason(fatal).is_none(), "{fatal}");
+        }
+    }
+
+    /// A curl stand-in: the first `resets` calls exit 56 (connection reset); later calls answer `status`.
+    /// Every call appends a line to `calls`.
+    #[cfg(unix)]
+    fn fake_http(dir: &Path, resets: u32, status: u16) -> Http {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let script = dir.join("curl");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho x >> '{calls}'\nn=$(wc -l < '{calls}')\n\
+                 if [ \"$n\" -le {resets} ]; then exit 56; fi\n\
+                 while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2;; --dump-header) hdr=$2;; esac; shift; done\n\
+                 echo '{{}}' > \"$out\"; : > \"$hdr\"; printf {status}\n",
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut http = Http::open(&dir.join("state.json"), true)
+            .unwrap()
+            .with_secrets(Box::new(|_, _| Ok("test-token".into())));
+        http.curl = script.display().to_string();
+        http.sleep = |_| {};
+        http
+    }
+
+    fn request(method: &'static str) -> Request {
+        Request {
+            endpoint: Endpoint {
+                origin: "https://forge.invalid".into(),
+                token_env: "UNSET_NATIVE_TEST_TOKEN".into(),
+            },
+            auth: Auth::Token,
+            method,
+            path: "/api/v1/x".into(),
+            body: None,
+            scope: "read".into(),
+            creation: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn call_count(dir: &Path) -> usize {
+        fs::read_to_string(dir.join("calls"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_survives_resets_and_gives_up_after_five_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut http = fake_http(dir.path(), 3, 200);
+        let response = http.send(request("GET")).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(call_count(dir.path()), 4);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut http = fake_http(dir.path(), 100, 200);
+        assert!(http.send(request("GET")).is_err());
+        assert_eq!(call_count(dir.path()), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_error_on_a_read_is_fatal_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut http = fake_http(dir.path(), 0, 404);
+        assert_eq!(http.send(request("GET")).unwrap().status, 404);
+        assert_eq!(call_count(dir.path()), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut http = fake_http(dir.path(), 0, 401);
+        assert!(http.send(request("GET")).is_err());
+        assert_eq!(call_count(dir.path()), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_is_never_retried() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut http = fake_http(dir.path(), 100, 200);
+            assert!(http.send(request(method)).is_err());
+            assert_eq!(call_count(dir.path()), 1, "{method}");
+        }
     }
 }
