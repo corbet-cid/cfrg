@@ -92,12 +92,14 @@ A move is applied only for organisations listed in `org_map`. Tests are mocked (
 - **First real move, corbet.ch (Bitbucket `corbet-web/corbet.ch` to `corbet-archv/corbet.ch`).** The row has
   `repository_id: null`, so `naming` answers `Current` and no transfer is ever reached. Procedure: (1) read-only
   `GET https://api.bitbucket.org/2.0/repositories/corbet-web/corbet.ch` (the bitbucket token, `curl --fail`, no write) and take its
-  `uuid` (with braces); (2) edit the Bitbucket destination of the row: `"repository_id": "<that uuid>"`, `"path": "corbet-web/corbet.ch"`
-  (the recorded last name; it tells cfrg the old workspace), `"namespace"` the project key for the new workspace; (3) add
-  `"org_map": {"corbet-archv": {"bitbucket": "corbet-archv"}}` to the placement; (4) run read-only first:
-  `cfrg native --placement <placement.json> --state <state.json> --credentials-dir <dir> --operation plan --repository corbet-archv/corbet.ch --provider bitbucket`
-  and expect one `transfer-planned` row with four steps and no write; (5) only then, after the review, `--operation reconcile --apply`.
-  The Cloudflare Pages project `corbet-ch` is not touched.
+  `uuid` (with braces); (2) edit the row: the declared repository `path` to the live Forgejo name (`corbet-archv/corbet.ch`; a stale
+  declared path makes `--repository` fail on Forgejo's 301), and the Bitbucket destination's `"repository_id": "<that uuid>"`;
+  keep the destination's recorded `path` `corbet-web/corbet.ch` (it tells cfrg the old workspace); (3) add
+  `"org_map": {"corbet-archv": {"bitbucket": "corbet-archv"}}` inside `native`; (4) run read-only first:
+  `cfrg native --placement <native view> --state <state.json> --credentials-dir <dir with forgejo-token and bitbucket-token> --operation plan --repository corbet-archv/corbet.ch --provider bitbucket`
+  and expect one `transfer-planned` row with four steps and only GET requests; (5) only then, after the review,
+  `--operation reconcile --apply`. The new repository goes into the project the derive policy names for a private repository
+  (`PRV` in the Corbet placement), not into the destination's `namespace`. The Cloudflare Pages project `corbet-ch` is not touched.
 
 ## Renames: destinations follow the primary
 
