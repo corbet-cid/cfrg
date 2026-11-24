@@ -461,6 +461,18 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             }
                         }
                     }
+                    // A Bitbucket move in flight has two owned mirrors: only the transfer steps (plan, reconcile) may look at them.
+                    if dest.provider == Provider::Bitbucket
+                        && !may_transfer
+                        && dest
+                            .repository_id
+                            .as_deref()
+                            .is_some_and(|id| move_in_flight(&io, id))
+                    {
+                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "detail":"a Bitbucket move is in flight; only plan and reconcile continue it"}));
+                        incomplete = true;
+                        return Ok(());
+                    }
                     let mut known = names(&dest.path, &declared_dest.recorded_path, None);
                     let (mut mirror, owner) = locate(&dest, &mirrors, &known)?;
                     // An owned mirror whose address is none of this destination's
@@ -1096,6 +1108,7 @@ fn transfer_one(
             let id = dest.repository_id.clone().unwrap_or_default();
             let requested = io.state.github_transfers.contains_key(&id);
             let due = io.state.next_github_transfer;
+            let mut flagged_error: Option<String> = None;
             let refusal = if write
                 && (options.github_kill_switch.is_none()
                     || options.github_paused_dir.is_none()
@@ -1115,6 +1128,19 @@ fn transfer_one(
                     .is_some_and(|dir| dir.join(org).exists())
             }) {
                 Some("gate-paused".into())
+            } else if write
+                && match flagged_orgs_strict(options.github_gate_catalog.as_deref()) {
+                    Err(error) => {
+                        flagged_error =
+                            Some(format!("the flagged organisations cannot be read: {error}"));
+                        true
+                    }
+                    Ok(flagged) => [old_owner, new_owner]
+                        .iter()
+                        .any(|owner| flagged.iter().any(|f| f.eq_ignore_ascii_case(owner))),
+                }
+            {
+                Some(flagged_error.unwrap_or_else(|| "flagged-organisation".into()))
             } else if [from, dest.path.as_str()]
                 .iter()
                 .any(|path| is_flagged_org(options.github_gate_catalog.as_deref(), path))
@@ -1138,6 +1164,12 @@ fn transfer_one(
         }
         Provider::Bitbucket => Err("a Bitbucket move runs through bitbucket_move".into()),
     }
+}
+
+/// A Bitbucket move recorded for `old_uuid` and not yet complete.
+fn move_in_flight(io: &dyn Transport, old_uuid: &str) -> bool {
+    io.recorded("bitbucket-transfer", old_uuid).is_some()
+        && io.recorded("bitbucket-transfer-done", old_uuid).is_none()
 }
 
 enum MoveStep {
@@ -1218,7 +1250,7 @@ fn bitbucket_move(
             detail,
             new_repository_id,
         } => {
-            if write {
+            if write && allow_create {
                 if let Some(new_uuid) = &new_repository_id {
                     io.note("bitbucket-transfer", old_uuid, new_uuid)?;
                     // The second owned mirror, to the new repository, with the destination protection of the new one.
@@ -1257,6 +1289,7 @@ fn bitbucket_move(
                 .ok_or("The finished move names no new repository uuid")?
                 .to_string();
             io.note("bitbucket-transfer", old_uuid, &new_uuid)?;
+            io.note("bitbucket-transfer-done", old_uuid, "1")?;
             // The old repository is gone: its mirror goes too (the one that still points at the old name).
             let old_url = destination_url(
                 dest,
@@ -2148,6 +2181,114 @@ mod tests {
     }
 
     #[test]
+    fn a_move_in_flight_is_known_until_it_is_done() {
+        let mut world = World {
+            mirrors: vec![],
+            counter: 0,
+            old_alive: true,
+            new_alive: false,
+            old_refs: vec![],
+            new_refs: vec![],
+            writes: vec![],
+            notes: BTreeMap::new(),
+            restrictions: vec![],
+        };
+        assert!(!move_in_flight(&world, "{old}"));
+        world.note("bitbucket-transfer", "{old}", "{new}").unwrap();
+        assert!(move_in_flight(&world, "{old}"));
+        world.note("bitbucket-transfer-done", "{old}", "1").unwrap();
+        assert!(!move_in_flight(&world, "{old}"));
+    }
+
+    #[test]
+    fn existing_only_creates_neither_the_target_nor_the_second_mirror() {
+        let (repo, dest) = corbet_ch();
+        let source = cfrg::native::Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "F".into(),
+        };
+        let api = cfgj::native::Mirrors {
+            endpoint: &source,
+            repository: &repo,
+        };
+        // The target exists already (a pending move); creation is not allowed in this operation.
+        let mut world = World {
+            mirrors: vec![],
+            counter: 0,
+            old_alive: true,
+            new_alive: true,
+            old_refs: vec![("main".into(), "a1".into())],
+            new_refs: vec![],
+            writes: vec![],
+            notes: BTreeMap::new(),
+            restrictions: vec![],
+        };
+        let mut report = Vec::new();
+        bitbucket_move(
+            &mut world,
+            &api,
+            &repo,
+            &dest,
+            &dest,
+            "{old}",
+            "corbet-web",
+            &mut vec![],
+            true,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report[0]["state"], "transfer-pending");
+        assert!(
+            world.mirrors.is_empty() && world.writes.is_empty(),
+            "{:?}",
+            world.writes
+        );
+    }
+
+    #[test]
+    fn a_write_needs_a_readable_flagged_list_and_compares_owners_without_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = dir.path().join("gate-config.json");
+        // No catalogue, an unreadable one, and a malformed orgs.json each refuse.
+        assert!(flagged_orgs_strict(None).is_err());
+        assert!(flagged_orgs_strict(Some(&catalog)).is_err());
+        std::fs::write(&catalog, r#"{"repos":{}}"#).unwrap();
+        assert!(flagged_orgs_strict(Some(&catalog)).is_err());
+        std::fs::write(dir.path().join("orgs.json"), "{not json").unwrap();
+        assert!(flagged_orgs_strict(Some(&catalog)).is_err());
+        std::fs::write(
+            dir.path().join("orgs.json"),
+            r#"{"orgs":{"Flagged-Org":{"expected":"flagged"},"fine":{"expected":"ok"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            flagged_orgs_strict(Some(&catalog)).unwrap(),
+            ["Flagged-Org"]
+        );
+        assert!(is_flagged_org(Some(&catalog), "FLAGGED-org/app"));
+        // The transfer itself refuses on the unreadable list and on a mixed-case owner.
+        let mut io = http(dir.path());
+        let kill = dir.path().join("kill");
+        let paused = dir.path().join("paused");
+        std::fs::create_dir(&paused).unwrap();
+        let options = transfer_options(Some(kill), Some(paused), Some(catalog.clone()));
+        let mut dest = github_destination();
+        dest.path = "FLAGGED-ORG/app".into();
+        let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("flagged-organisation")),
+            "{outcome:?}"
+        );
+        std::fs::write(dir.path().join("orgs.json"), "{not json").unwrap();
+        let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("cannot be read")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn the_name_audit_calls_a_namespace_change_a_transfer() {
         assert_eq!(plan_move("old/app", "new/app"), Move::Transfer);
         assert_eq!(
@@ -2851,7 +2992,35 @@ fn failure_row(message: &str, flagged: bool, source: &str, destination: &str) ->
 /// Whether the owner (first path segment) of `path` is a flagged GitHub organisation.
 pub(crate) fn is_flagged_org(catalog: Option<&std::path::Path>, path: &str) -> bool {
     let owner = path.split('/').next().unwrap_or_default();
-    flagged_orgs(catalog).iter().any(|o| o == owner)
+    // GitHub organisation names are case-insensitive.
+    flagged_orgs(catalog)
+        .iter()
+        .any(|o| o.eq_ignore_ascii_case(owner))
+}
+
+/// The flagged organisations, or an error when they cannot be read: a WRITE must not go ahead on a missing or malformed list
+/// (`flagged_orgs` reads a missing one as empty, which is right for reports and wrong for a gate).
+pub(crate) fn flagged_orgs_strict(catalog: Option<&std::path::Path>) -> Result<Vec<String>> {
+    let catalog = catalog.ok_or("the gate catalogue was not given")?;
+    let read = |path: &std::path::Path| -> Result<Value> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    };
+    let beside = catalog
+        .parent()
+        .map(|dir| dir.join("orgs.json"))
+        .filter(|p| p.exists());
+    let document = match beside {
+        Some(path) => read(&path)?,
+        None => read(catalog)?,
+    };
+    let orgs = document["orgs"]
+        .as_object()
+        .ok_or("the gate catalogue names no `orgs` object")?;
+    Ok(orgs
+        .iter()
+        .filter(|(_, v)| v["expected"] == "flagged")
+        .map(|(k, _)| k.clone())
+        .collect())
 }
 
 #[cfg(test)]

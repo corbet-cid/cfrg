@@ -75,6 +75,30 @@ Before the first apply on production, run `--operation names` read-only: every `
 A move is applied only for organisations listed in `org_map`. Tests are mocked (`cfrg/src/native/transfer/tests.rs` and the
 `bitbucket_move` tests in `cfrg-cli/src/native.rs`): no network.
 
+- **The flagged list is strict on a write.** A GitHub transfer under `reconcile --apply` is refused when the gate catalogue
+  or `orgs.json` beside it cannot be read and parsed, and organisation names are compared without case.
+- **A move in flight** (Bitbucket, recorded in the state, not yet complete) is reported `transfer-pending` by `status`,
+  `rename` and `sync-now`, which would otherwise see two owned mirrors; `plan` and `reconcile` continue it. `--existing-only`
+  and `rename` create neither the new repository nor its second mirror.
+- **A GitHub 5xx on the transfer POST** leaves the request recorded in the state (`github_transfers`, by repository id) so it is
+  never sent twice. After reading the repository by id on GitHub, a human decides: if it did not move, delete that key from the
+  state file's `github_transfers` (the next due time `next_github_transfer` still applies) and run again; if it moved, the next
+  pass reads it back and clears the record itself.
+- **Infra follow-up for the Bitbucket uuid (after `transferred`).** The placement's `repository_id` of that destination must
+  become the new uuid (`detail.repository_id` of the `transferred` row, also `bitbucket_transfers` in the state), and its
+  recorded `path` the new `<workspace>/<repo>`. Until then every pass reports `transferred` again without writing. The infra
+  placement render (`forge-bridge-placement-render.sh`) / the id recorder (`placement-record-ids.py`) must read the `transferred`
+  rows of the daily `reconcile` report and write exactly those two fields; neither knows `transferred` today.
+- **First real move, corbet.ch (Bitbucket `corbet-web/corbet.ch` to `corbet-archv/corbet.ch`).** The row has
+  `repository_id: null`, so `naming` answers `Current` and no transfer is ever reached. Procedure: (1) read-only
+  `GET https://api.bitbucket.org/2.0/repositories/corbet-web/corbet.ch` (the bitbucket token, `curl --fail`, no write) and take its
+  `uuid` (with braces); (2) edit the Bitbucket destination of the row: `"repository_id": "<that uuid>"`, `"path": "corbet-web/corbet.ch"`
+  (the recorded last name; it tells cfrg the old workspace), `"namespace"` the project key for the new workspace; (3) add
+  `"org_map": {"corbet-archv": {"bitbucket": "corbet-archv"}}` to the placement; (4) run read-only first:
+  `cfrg native --placement <placement.json> --state <state.json> --credentials-dir <dir> --operation plan --repository corbet-archv/corbet.ch --provider bitbucket`
+  and expect one `transfer-planned` row with four steps and no write; (5) only then, after the review, `--operation reconcile --apply`.
+  The Cloudflare Pages project `corbet-ch` is not touched.
+
 ## Renames: destinations follow the primary
 
 The name of a destination is the primary's current `<org>/<repo>`, unless the

@@ -110,6 +110,9 @@ pub struct State {
     /// repository can be rewritten by `settings`; this record cannot.
     #[serde(default)]
     pub bitbucket_transfers: BTreeMap<String, String>,
+    /// Old uuids whose Bitbucket move is complete (the old repository is deleted).
+    #[serde(default)]
+    pub bitbucket_transfers_done: std::collections::BTreeSet<String>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Window {
@@ -354,6 +357,9 @@ impl Transport for Http {
                     .bitbucket_transfers
                     .insert(key.to_string(), value.to_string());
             }
+            "bitbucket-transfer-done" => {
+                self.state.bitbucket_transfers_done.insert(key.to_string());
+            }
             _ => return Err(failure("Unknown state note")),
         }
         self.save()
@@ -367,6 +373,11 @@ impl Transport for Http {
                 .get(key)
                 .map(|at| at.to_string()),
             "bitbucket-transfer" => self.state.bitbucket_transfers.get(key).cloned(),
+            "bitbucket-transfer-done" => self
+                .state
+                .bitbucket_transfers_done
+                .contains(key)
+                .then(|| "1".to_string()),
             "bitbucket-transfer-by-new" => self
                 .state
                 .bitbucket_transfers
