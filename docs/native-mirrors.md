@@ -52,8 +52,9 @@ A GitHub entry also changes the owner that every GitHub destination of that orga
 the validation of the whole placement fails (it is exact-case and global, so one colliding entry stops the run before anything
 is written: fail closed).
 
-Adapter capability `transfer`. A transfer changes the namespace only; a changed name as well is reported `transfer-blocked`
-(transfer first, then rename). **Transfers write only under `reconcile --apply`.** `plan` never writes, and `rename --apply`
+Adapter capability `transfer`. A move may change the name as well (a Forgejo rename plus transfer): GitHub does both in one
+request (`new_owner` with `new_name`); GitLab transfers under the old name and `transfer-pending` says the rename follows, which the
+next pass does; Bitbucket creates the new repository under the new name at once. **Transfers write only under `reconcile --apply`.** `plan` never writes, and `rename --apply`
 (the serve lane's `source-renamed` reaction) never transfers and never creates: it reports `transfer-needed`. States:
 `transfer-planned` (with the steps), `transferred`, `transfer-pending` (a step was taken; the next pass continues),
 `transfer-blocked` (reported, never forced), and `transfer-needed` (also in `--operation names`). Every transfer row also carries `provider` and `old_repository_id` (the destination's identity before the move), so a placement update matches the right destination. A provider's refusal reaches

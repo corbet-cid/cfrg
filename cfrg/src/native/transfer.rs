@@ -116,12 +116,9 @@ pub fn gitlab(
             "GitLab transfer asked for a move inside one namespace",
         ));
     }
-    if !same(live_leaf, wanted_leaf) {
-        return blocked(
-            from,
-            "the namespace and the name both differ; transfer first, then rename",
-        );
-    }
+    // The namespace moves first, under the name the project has; a different wanted name is the rename of the next pass.
+    let landing = format!("{wanted_ns}/{live_leaf}");
+    let renames = !same(live_leaf, wanted_leaf);
     let group = gitlab_call(
         io,
         dest,
@@ -144,7 +141,7 @@ pub fn gitlab(
         io,
         dest,
         "GET",
-        format!("/projects/{}", encode(&dest.path)),
+        format!("/projects/{}", encode(&landing)),
         None,
     )?;
     match taken.status {
@@ -166,9 +163,18 @@ pub fn gitlab(
     if !apply {
         return Ok(Transfer::Planned {
             from: from.to_string(),
-            steps: vec![format!(
-                "PUT /projects/{id}/transfer namespace={group_id} ({wanted_ns}); the id stays and {from} redirects"
-            )],
+            steps: {
+                let mut steps = vec![format!(
+                    "PUT /projects/{id}/transfer namespace={group_id} ({wanted_ns}); the id stays and {from} redirects"
+                )];
+                if renames {
+                    steps.push(format!(
+                        "then (next pass) rename {landing} to {}",
+                        dest.path
+                    ));
+                }
+                steps
+            },
         });
     }
     let response = match writing(gitlab_call(
@@ -184,9 +190,19 @@ pub fn gitlab(
     match response.status {
         200 if response.body["path_with_namespace"]
             .as_str()
-            .is_some_and(|p| same(p, &dest.path)) =>
+            .is_some_and(|p| same(p, &landing)) =>
         {
             io.resolve(&format!("{}/api", dest.endpoint.origin))?;
+            if renames {
+                return Ok(Transfer::Pending {
+                    from: from.to_string(),
+                    detail: format!(
+                        "transferred to {landing}; the rename to {} follows in the next pass",
+                        dest.path
+                    ),
+                    new_repository_id: None,
+                });
+            }
             Ok(Transfer::Done {
                 from: from.to_string(),
                 detail: json!({"repository_id": id.to_string()}),
@@ -264,12 +280,8 @@ pub fn github(
     if same(live_owner, wanted_owner) {
         return Err(failure("GitHub transfer asked for a move inside one owner"));
     }
-    if !same(live_leaf, wanted_leaf) {
-        return blocked(
-            from,
-            "the owner and the name both differ; GitHub names are changed in GitHub",
-        );
-    }
+    // GitHub moves and renames in ONE request (`new_owner` with `new_name`): one write, whatever the name does.
+    let new_name = (!same(live_leaf, wanted_leaf)).then_some(wanted_leaf);
     if let Some(reason) = &gate.refusal {
         return blocked(from, format!("the GitHub write gate holds: {reason}"));
     }
@@ -342,7 +354,8 @@ pub fn github(
         return Ok(Transfer::Planned {
             from: from.to_string(),
             steps: vec![format!(
-                "POST /repos/{from}/transfer new_owner={wanted_owner} through the write gate (one per run, at least three minutes apart)"
+                "POST /repos/{from}/transfer new_owner={wanted_owner}{} through the write gate (one per run, at least three minutes apart)",
+                new_name.map(|n| format!(" new_name={n}")).unwrap_or_default()
             )],
         });
     }
@@ -356,7 +369,10 @@ pub fn github(
         dest,
         "POST",
         &format!("/repos/{from}/transfer"),
-        Some(json!({"new_owner": wanted_owner})),
+        Some(match new_name {
+            Some(name) => json!({"new_owner": wanted_owner, "new_name": name}),
+            None => json!({"new_owner": wanted_owner}),
+        }),
         true,
     ))? {
         Ok(response) => response,
@@ -569,15 +585,10 @@ pub fn bitbucket(
             )))
         }
     };
-    let (live_ws, live_slug) = split(&from)?;
+    // A new repository is created at the wanted workspace AND name, so a different name needs no rename afterwards.
+    let (live_ws, _) = split(&from)?;
     if same(live_ws, wanted_ws) {
         return Err(failure("Bitbucket move asked inside one workspace"));
-    }
-    if !same(live_slug, wanted_slug) {
-        return blocked(
-            &from,
-            "the workspace and the name both differ; move first, then rename",
-        );
     }
     if mv.project_key.is_empty() {
         return blocked(

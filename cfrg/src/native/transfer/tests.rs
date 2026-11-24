@@ -187,12 +187,7 @@ fn gitlab_name_taken_or_different_leaf_is_blocked_before_any_write() {
         gitlab(&mut io, &gl(), "old-group/app", true).unwrap(),
         Transfer::Blocked { .. }
     ));
-    let mut io = Fake::new();
-    assert!(matches!(
-        gitlab(&mut io, &gl(), "old-group/other", true).unwrap(),
-        Transfer::Blocked { .. }
-    ));
-    assert!(io.seen.is_empty() && io.writes().is_empty());
+    assert!(io.writes().is_empty());
 }
 
 #[test]
@@ -615,20 +610,87 @@ fn compare_names_what_differs() {
 }
 
 #[test]
-fn a_destination_with_another_name_than_the_old_one_is_not_moved_and_renamed_at_once() {
+fn bitbucket_a_different_name_is_created_under_the_new_name_in_the_one_move() {
+    let renamed = "/2.0/repositories/corbet-archv/renamed";
     let mut io = Fake::new()
-        .on(
-            "GET",
-            NEW.replace("corbet.ch", "renamed").as_str(),
-            404,
-            json!({}),
-        )
-        .on("GET", OLD, 200, old_repo());
+        .on("GET", renamed, 404, json!({}))
+        .on("GET", renamed, 200, marked())
+        .on("GET", OLD, 200, old_repo())
+        .on("POST", renamed, 200, json!({"uuid": "{new}"}));
     let mut other = bb();
     other.path = "corbet-archv/renamed".into();
-    assert!(matches!(
-        bitbucket(&mut io, &other, &mv(true, None), true).unwrap(),
-        Transfer::Blocked { .. }
-    ));
-    assert!(io.writes().is_empty());
+    let outcome = bitbucket(&mut io, &other, &mv(true, None), true).unwrap();
+    assert!(matches!(outcome, Transfer::Pending { .. }), "{outcome:?}");
+    assert_eq!(io.writes(), [format!("POST {renamed}")]);
+}
+
+#[test]
+fn gitlab_a_different_name_moves_the_namespace_first_and_renames_next_pass() {
+    // The transfer lands under the old name; the rename is the next pass's.
+    let mut io = Fake::new()
+        .on("GET", "/api/v4/groups/new-group", 200, json!({"id": 7}))
+        .on("GET", "/api/v4/projects/new-group%2Fold", 404, json!({}))
+        .on(
+            "PUT",
+            "/api/v4/projects/42/transfer",
+            200,
+            json!({"path_with_namespace": "new-group/old"}),
+        );
+    let mut renamed = gl();
+    renamed.path = "new-group/new".into();
+    let plan = gitlab(
+        &mut Fake::new()
+            .on("GET", "/api/v4/groups/new-group", 200, json!({"id": 7}))
+            .on("GET", "/api/v4/projects/new-group%2Fold", 404, json!({})),
+        &renamed,
+        "old-group/old",
+        false,
+    )
+    .unwrap();
+    let Transfer::Planned { steps, .. } = plan else {
+        panic!("{plan:?}")
+    };
+    assert_eq!(steps.len(), 2);
+    assert!(
+        steps[1].contains("rename new-group/old to new-group/new"),
+        "{steps:?}"
+    );
+    let outcome = gitlab(&mut io, &renamed, "old-group/old", true).unwrap();
+    assert!(
+        matches!(&outcome, Transfer::Pending { detail, .. } if detail.contains("rename to new-group/new")),
+        "{outcome:?}"
+    );
+    assert_eq!(io.writes(), ["PUT /api/v4/projects/42/transfer"]);
+}
+
+#[test]
+fn github_a_different_name_goes_in_the_same_request() {
+    let mut renamed = gh();
+    renamed.path = "new-org/new".into();
+    let mut io = Fake::new()
+        .on("GET", "/orgs/new-org", 200, json!({}))
+        .on("GET", "/repos/new-org/new", 404, json!({}))
+        .on("POST", "/repos/old-org/old/transfer", 202, json!({}))
+        .on(
+            "GET",
+            "/repositories/5",
+            200,
+            json!({"full_name": "new-org/new"}),
+        );
+    let outcome = github(
+        &mut io,
+        &renamed,
+        "old-org/old",
+        true,
+        &Gate::default(),
+        false,
+    )
+    .unwrap();
+    assert!(matches!(outcome, Transfer::Done { .. }), "{outcome:?}");
+    let post = io.seen.iter().find(|(m, ..)| m == "POST").unwrap();
+    assert_eq!(
+        post.2,
+        Some(json!({"new_owner": "new-org", "new_name": "new"}))
+    );
+    assert_eq!(io.writes().len(), 1);
 }
