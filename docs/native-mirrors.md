@@ -39,26 +39,41 @@ A move between namespaces needs one action, either the Forgejo transfer (the pas
 
 `org_map` maps the lowercase Forgejo organisation to the namespace it has on each provider (GitLab group, nested allowed;
 Bitbucket workspace; GitHub owner). A destination that is not pinned lives at `<mapped namespace>/<repository>`; a provider
-without an entry keeps the organisation's own name. The Bitbucket project of a new repository is the destination's `namespace`.
+without an entry keeps the organisation's own name. It is also the opt-in: **only a repository whose organisation has an entry
+for that provider is moved automatically.** Any other namespace change is reported `transfer-needed` and nothing moves implicitly.
+(To move into an organisation that needs no renaming, give it an identity entry.) The Bitbucket project of a new repository
+is the creation destination's `namespace` (the public/private project rule of `bitbucket_creation_dest` applies).
 
 ```json
 "org_map": {"corbet-web": {"bitbucket": "corbet-archv", "gitlab": "corbet-archv", "github": "corbet-archv"}}
 ```
 
+A GitHub entry also changes the owner that every GitHub destination of that organisation must name as `namespace`; otherwise
+the validation of the whole placement fails (it is exact-case and global, so one colliding entry stops the run before anything
+is written: fail closed).
+
 Adapter capability `transfer`. A transfer changes the namespace only; a changed name as well is reported `transfer-blocked`
-(transfer first, then rename). The states: `transfer-planned` (`plan`; lists the steps; nothing written), `transferred`
-(`reconcile --apply`), `transfer-pending` (a step was taken and the next pass continues), `transfer-blocked` (reported, never
-forced), and `transfer-needed` in `--operation names`.
+(transfer first, then rename). **Transfers write only under `reconcile --apply`.** `plan` never writes, and `rename --apply`
+(the serve lane's `source-renamed` reaction) never transfers and never creates: it reports `transfer-needed`. States:
+`transfer-planned` (with the steps), `transferred`, `transfer-pending` (a step was taken; the next pass continues),
+`transfer-blocked` (reported, never forced), and `transfer-needed` (also in `--operation names`). A provider's refusal reaches
+the report as its HTTP status only: the transport never parses error bodies.
 
 | Provider | Transfer |
 |---|---|
 | GitLab | `PUT /projects/:id/transfer` to the target group; the id stays and the old path redirects. The target group must exist; a taken path blocks. |
-| GitHub | `POST /repos/:owner/:repo/transfer` to the target owner, paced as a creation. Fails closed: needs `--github-kill-switch` and `--github-paused-dir`; the kill switch, a paused source or target organisation and a flagged organisation each block. Read back by id; a transfer not yet visible is `transfer-pending`. GitHub is a last resort: see the pacing policy before any real run. |
-| Bitbucket | No public cross-workspace transfer exists (the UI only, and the target must accept). One step per pass: (1) create the repository in the target workspace and project, with the description `cfrg-transfer-from:<old uuid>`; (2) the mirror fills it (`transfer-pending`, with the new uuid); (3) compare EVERY branch and tag of both (names and hashes, in both directions); (4) only when they match exactly, delete the old repository. A repository at the wanted name that lacks the marker is never adopted or deleted. |
+| GitHub | `POST /repos/:owner/:repo/transfer` to the target owner. Fails closed: a write needs `--github-kill-switch`, `--github-paused-dir` AND `--github-gate-catalog`; the kill switch, a paused source or target organisation and a flagged organisation each block. ONE transfer per run, whatever it ends in, and at least three minutes apart: the next due time is kept in the state file (`next_github_transfer`) and a transfer not yet due is `transfer-blocked: paced` (never slept on). The request is recorded in the state before it is sent and read back by id afterwards; a transfer requested earlier and not yet visible is `transfer-pending` and is never requested again. GitHub is a last resort: see the pacing policy before any real run. |
+| Bitbucket | No public cross-workspace transfer exists. One step per pass: (1) create the repository in the target workspace and project, with the description `cfrg-transfer-from:<old uuid>`, record old uuid to new uuid in the state, switch its pipelines off, add its branch restrictions and a SECOND owned mirror to it (the old mirror keeps running, so both stay comparable); (2) `transfer-pending` until the mirror has pushed; (3) compare EVERY branch and tag of both (names and hashes, both directions); (4) only when they match exactly and the old repository has refs, delete the old repository (addressed by its uuid, identity re-read right before the delete, read back after it), drop the old mirror and continue the pass under the new uuid. A repository at the wanted name that is neither marked nor the recorded one is never adopted or deleted. |
 
-After a Bitbucket move the destination has a new uuid: the report carries it as `new_repository_id` (and `detail.repository_id`
-when `transferred`), and the placement's `repository_id` must be updated to it (the placement render does that from the report).
-Tests are mocked (`cfrg/src/native/transfer/tests.rs`): no network.
+After a Bitbucket move the destination has a new uuid. Until the placement's `repository_id` is updated, every pass finds the old
+uuid answering 404, sees the recorded successor at the new path and reports `transferred` again without writing; it does not fail.
+The new uuid is in the report (`new_repository_id`, `detail.repository_id`) and in the state (`bitbucket_transfers`).
+
+### Rollout notes
+
+Before the first apply on production, run `--operation names` read-only: every `transfer-needed` row must be an intended move.
+A move is applied only for organisations listed in `org_map`. Tests are mocked (`cfrg/src/native/transfer/tests.rs` and the
+`bitbucket_move` tests in `cfrg-cli/src/native.rs`): no network.
 
 ## Renames: destinations follow the primary
 

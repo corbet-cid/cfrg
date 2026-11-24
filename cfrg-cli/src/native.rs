@@ -272,6 +272,8 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
         return Err("The placement declares no copy".into());
     }
     let mut tally: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // GitHub transfers: ONE per run, whatever it ends in (the pacing policy); the next one waits in the state file.
+    let mut github_transfer_spent = false;
     let result = (|| -> Result<()> {
         // Contributed projects (operating model R10, R11) have no mirror, and their copies on our forge run no CI of
         // ours: the Actions unit stays off, or the upstream's own workflows would run on our runners. First, so that
@@ -414,6 +416,51 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                     let mut dest = declared_dest.clone();
                     dest.path = repo.destination_path(declared_dest);
                     let url = destination_url(&dest, &dest.path);
+                    // A namespace change the placement declares (`org_map`) is a transfer. Bitbucket's is a sequence of passes that
+                    // keeps the old mirror beside a second one, so the ordinary mirror logic below must not see it until it is done.
+                    let may_transfer =
+                        matches!(options.operation, Operation::Plan | Operation::Reconcile);
+                    let create_ok =
+                        !options.existing_only && options.operation != Operation::Rename;
+                    if dest.provider == Provider::Bitbucket
+                        && may_transfer
+                        && repo.transfer_declared(Provider::Bitbucket)
+                        && !dest.absent
+                        && dest.hold.is_none()
+                        && !source_held
+                        && dest
+                            .repository_id
+                            .as_deref()
+                            .is_none_or(|id| io.recorded("bitbucket-transfer-by-new", id).is_none())
+                    {
+                        if let (Some(old_uuid), Some(old_ws)) = (
+                            dest.repository_id.clone(),
+                            old_workspace(&dest, &declared_dest.recorded_path, &mirrors),
+                        ) {
+                            let bb =
+                                bitbucket_creation_dest(&dest, repo, placement.derive.as_ref());
+                            let moving = options.apply && options.operation == Operation::Reconcile;
+                            match bitbucket_move(
+                                &mut io,
+                                &api,
+                                repo,
+                                &dest,
+                                &bb,
+                                &old_uuid,
+                                &old_ws,
+                                &mut mirrors,
+                                moving,
+                                create_ok,
+                                &mut report,
+                            )? {
+                                MoveStep::Stop => {
+                                    incomplete = true;
+                                    return Ok(());
+                                }
+                                MoveStep::Continue(new_uuid) => dest.repository_id = Some(new_uuid),
+                            }
+                        }
+                    }
                     let mut known = names(&dest.path, &declared_dest.recorded_path, None);
                     let (mut mirror, owner) = locate(&dest, &mirrors, &known)?;
                     // An owned mirror whose address is none of this destination's
@@ -536,10 +583,33 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             incomplete = true;
                             return Ok(());
                         }
-                        // The namespace differs: the destination is moved by its provider's means (capability `transfer`).
+                        // The namespace differs: the destination is moved by its provider's means (capability `transfer`),
+                        // and only when the placement declares the move (`org_map`), under `plan` (read-only) or `reconcile`.
                         Naming::Blocked { from, .. } => {
-                            let outcome =
-                                transfer_one(&mut io, options, &dest, repo, &from, write)?;
+                            let moving = options.apply && options.operation == Operation::Reconcile;
+                            let needed = |why: &str| json!({"source":repo.path, "destination":dest.path, "state":"transfer-needed", "from":from, "reason":why});
+                            if !repo.transfer_declared(dest.provider) {
+                                report.push(needed("the placement's org_map declares no namespace for this organisation on this provider; nothing moves implicitly"));
+                                incomplete = true;
+                                return Ok(());
+                            }
+                            if !matches!(options.operation, Operation::Plan | Operation::Reconcile)
+                                || dest.provider == Provider::Bitbucket
+                            {
+                                report
+                                    .push(needed("a transfer runs under plan and reconcile only"));
+                                incomplete = true;
+                                return Ok(());
+                            }
+                            if dest.provider == Provider::Github && moving {
+                                if github_transfer_spent {
+                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":"one GitHub transfer per run"}));
+                                    incomplete = true;
+                                    return Ok(());
+                                }
+                                github_transfer_spent = true;
+                            }
+                            let outcome = transfer_one(&mut io, options, &dest, &from, moving)?;
                             match outcome {
                                 Transfer::Planned { from, steps } => {
                                     report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-planned", "from":from, "steps":steps}));
@@ -562,11 +632,6 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                                 }
                                 Transfer::Done { from, detail } => {
                                     report.push(json!({"source":repo.path, "destination":dest.path, "state":"transferred", "from":from, "detail":detail}));
-                                    // The rest of this pass addresses the destination by its identity at the new path
-                                    // (Bitbucket's new repository has a new uuid).
-                                    if let Some(id) = detail["repository_id"].as_str() {
-                                        dest.repository_id = Some(id.to_string());
-                                    }
                                     Some(from)
                                 }
                             }
@@ -1012,13 +1077,14 @@ fn audit_names(
 /// The Forgejo mirror of a destination under any of its `known` names, and the owner claim
 /// the placement itself declares (`remote_name`). Ownership is derived (design 3.7): a push
 /// mirror whose address is one of the destination's names is ours; nothing is recorded.
-/// One step of moving `dest` from `from` into its new namespace, through the adapter of its provider. GitHub honours the
-/// write gate's files and flagged organisations; a GitHub transfer without them is refused (fail closed), as `settings` does.
+/// One step of moving a GitLab or GitHub `dest` from `from` into its new namespace. `write` is true only under
+/// `reconcile --apply`. GitHub fails closed: a write needs the write gate's kill switch, pause directory AND the gate catalogue
+/// (the flagged organisations), is paced three minutes apart through the state file (reported, never slept on), and a transfer
+/// requested earlier is read back, never requested again.
 fn transfer_one(
-    io: &mut dyn Transport,
+    io: &mut Http,
     options: &Options,
     dest: &Destination,
-    repo: &Repository,
     from: &str,
     write: bool,
 ) -> Result<Transfer> {
@@ -1027,28 +1093,37 @@ fn transfer_one(
         Provider::Github => {
             let new_owner = dest.path.split('/').next().unwrap_or_default();
             let old_owner = from.split('/').next().unwrap_or_default();
+            let id = dest.repository_id.clone().unwrap_or_default();
+            let requested = io.state.github_transfers.contains_key(&id);
+            let due = io.state.next_github_transfer;
             let refusal = if write
-                && (options.github_kill_switch.is_none() || options.github_paused_dir.is_none())
+                && (options.github_kill_switch.is_none()
+                    || options.github_paused_dir.is_none()
+                    || options.github_gate_catalog.is_none())
             {
-                Some("the write gate's files were not given (--github-kill-switch, --github-paused-dir)")
+                Some("the write gate's files were not given (--github-kill-switch, --github-paused-dir, --github-gate-catalog)".to_string())
             } else if options
                 .github_kill_switch
                 .as_ref()
                 .is_some_and(|p| p.exists())
             {
-                Some("gate-kill-switch")
+                Some("gate-kill-switch".into())
             } else if [old_owner, new_owner].iter().any(|org| {
                 options
                     .github_paused_dir
                     .as_ref()
                     .is_some_and(|dir| dir.join(org).exists())
             }) {
-                Some("gate-paused")
+                Some("gate-paused".into())
             } else if [from, dest.path.as_str()]
                 .iter()
                 .any(|path| is_flagged_org(options.github_gate_catalog.as_deref(), path))
             {
-                Some("flagged-organisation")
+                Some("flagged-organisation".into())
+            } else if write && !requested && cfrg::native::http::now()? < due {
+                Some(format!(
+                    "paced: the next GitHub transfer is due at {due} (unix time)"
+                ))
             } else {
                 None
             };
@@ -1057,25 +1132,162 @@ fn transfer_one(
                 dest,
                 from,
                 write,
-                &transfer::Gate {
-                    refusal: refusal.map(String::from),
-                },
+                &transfer::Gate { refusal },
+                requested,
             )
         }
-        Provider::Bitbucket => transfer::bitbucket(
-            io,
-            dest,
-            &transfer::BitbucketMove {
-                from,
-                old_uuid: dest
-                    .repository_id
-                    .as_deref()
-                    .ok_or("Bitbucket move needs the old repository_id")?,
-                project_key: &dest.namespace,
-                private: repo.private,
-            },
-            write,
-        ),
+        Provider::Bitbucket => Err("a Bitbucket move runs through bitbucket_move".into()),
+    }
+}
+
+enum MoveStep {
+    /// The destination is not finished moving; the rest of the pass leaves it alone.
+    Stop,
+    /// The move is complete: the rest of the pass addresses the repository under this new uuid.
+    Continue(String),
+}
+
+/// The workspace a Bitbucket destination moved away from: the last recorded name's, else the one of the owned mirror's address.
+fn old_workspace(dest: &Destination, recorded: &str, mirrors: &[Value]) -> Option<String> {
+    let new_ws = dest.path.split('/').next()?;
+    let from_record = recorded.split('/').next().filter(|ws| !ws.is_empty());
+    let from_mirror = dest.remote_name.as_ref().and_then(|name| {
+        let mirror = mirrors.iter().find(|m| m["remote_name"] == *name)?;
+        let address = mirror["remote_address"].as_str()?;
+        let (_, rest) = address.split_once("://")?;
+        rest.split('/').nth(1).map(str::to_string)
+    });
+    from_record
+        .map(str::to_string)
+        .into_iter()
+        .chain(from_mirror)
+        .find(|ws| !ws.eq_ignore_ascii_case(new_ws))
+}
+
+/// One pass of a Bitbucket move (see `transfer::bitbucket`). While the new repository fills, a SECOND owned mirror pushes to it
+/// and the old mirror keeps running, so the two stay comparable; the old mirror is dropped only once the old repository is deleted.
+#[allow(clippy::too_many_arguments)]
+fn bitbucket_move(
+    io: &mut dyn Transport,
+    api: &cfgj::native::Mirrors<'_>,
+    repo: &Repository,
+    dest: &Destination,
+    bb: &Destination,
+    old_uuid: &str,
+    old_ws: &str,
+    mirrors: &mut Vec<Value>,
+    write: bool,
+    allow_create: bool,
+    report: &mut Vec<Value>,
+) -> Result<MoveStep> {
+    let row = |state: &str, extra: Value| {
+        let mut row = json!({"source":repo.path, "destination":dest.path, "state":state});
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            row[key] = value.clone();
+        }
+        row
+    };
+    let known_new = io.recorded("bitbucket-transfer", old_uuid);
+    let outcome = transfer::bitbucket(
+        io,
+        bb,
+        &transfer::BitbucketMove {
+            old_workspace: old_ws,
+            old_uuid,
+            project_key: &bb.namespace,
+            private: repo.private,
+            allow_create,
+            known_new: known_new.as_deref(),
+        },
+        write,
+    )?;
+    match outcome {
+        Transfer::Planned { from, steps } => {
+            report.push(row("transfer-planned", json!({"from":from, "steps":steps})));
+            Ok(MoveStep::Stop)
+        }
+        Transfer::Blocked { from, reason } => {
+            report.push(row(
+                "transfer-blocked",
+                json!({"from":from, "reason":reason}),
+            ));
+            Ok(MoveStep::Stop)
+        }
+        Transfer::Pending {
+            from,
+            detail,
+            new_repository_id,
+        } => {
+            if write {
+                if let Some(new_uuid) = &new_repository_id {
+                    io.note("bitbucket-transfer", old_uuid, new_uuid)?;
+                    // The second owned mirror, to the new repository, with the destination protection of the new one.
+                    let mut new_dest = bb.clone();
+                    new_dest.repository_id = Some(new_uuid.clone());
+                    // The new repository gets what every destination gets (pipelines off, identity verified) before any push.
+                    cbkt::native::ensure_destination_repo(io, repo, &new_dest, true, false)?;
+                    let url = destination_url(&new_dest, &new_dest.path);
+                    if !mirrors
+                        .iter()
+                        .any(|m| cfgj::native::address_matches(m, &url))
+                    {
+                        let value = create_owned(api, io, &new_dest, &url)?;
+                        if new_dest.use_ssh {
+                            cbkt::native::enroll_key(io, &new_dest, &value, true)?;
+                        }
+                        mirrors.push(value);
+                    }
+                    let user = new_dest.restriction_user().to_string();
+                    cbkt::native::restrict(io, &new_dest, true, &[user.as_str()])?;
+                }
+            }
+            report.push(row(
+                "transfer-pending",
+                json!({"from":from, "detail":detail, "new_repository_id":new_repository_id}),
+            ));
+            Ok(MoveStep::Stop)
+        }
+        Transfer::Done { from, detail } => {
+            if !write {
+                report.push(row("transfer-planned", json!({"from":from, "steps":["the move is complete; apply records the new uuid and drops the old mirror"]})));
+                return Ok(MoveStep::Stop);
+            }
+            let new_uuid = detail["repository_id"]
+                .as_str()
+                .ok_or("The finished move names no new repository uuid")?
+                .to_string();
+            io.note("bitbucket-transfer", old_uuid, &new_uuid)?;
+            // The old repository is gone: its mirror goes too (the one that still points at the old name).
+            let old_url = destination_url(
+                dest,
+                &format!(
+                    "{old_ws}/{}",
+                    dest.path.rsplit('/').next().unwrap_or_default()
+                ),
+            );
+            let new_url = destination_url(dest, &dest.path);
+            let stale: Vec<Value> = mirrors
+                .iter()
+                .filter(|m| {
+                    cfgj::native::address_matches(m, &old_url)
+                        && !cfgj::native::address_matches(m, &new_url)
+                })
+                .cloned()
+                .collect();
+            for old in stale {
+                let name = old["remote_name"]
+                    .as_str()
+                    .ok_or("Missing remote name")?
+                    .to_string();
+                api.delete(io, &name)?;
+                mirrors.retain(|m| m["remote_name"] != old["remote_name"]);
+                if dest.use_ssh {
+                    cbkt::native::forget_key(io, dest, &name)?;
+                }
+            }
+            report.push(row("transferred", json!({"from":from, "detail":detail})));
+            Ok(MoveStep::Continue(new_uuid))
+        }
     }
 }
 
@@ -1234,7 +1446,7 @@ fn all_mirrors_managed(mirrors: &[Value], managed: &[Value]) -> bool {
 
 fn create_owned(
     api: &cfgj::native::Mirrors<'_>,
-    io: &mut Http,
+    io: &mut dyn Transport,
     dest: &cfrg::native::Destination,
     url: &str,
 ) -> Result<Value> {
@@ -1571,18 +1783,15 @@ mod tests {
         assert!(mirror_named(&twins, &dest, &both).is_err());
     }
 
-    struct Silent(Vec<String>);
-    impl Transport for Silent {
-        fn send(
-            &mut self,
-            request: cfrg::native::http::Request,
-        ) -> Result<cfrg::native::http::Response> {
-            self.0.push(format!("{} {}", request.method, request.path));
-            Err("no network in tests".into())
-        }
+    fn http(dir: &std::path::Path) -> Http {
+        Http::open(&dir.join("state.json"), true).unwrap()
     }
 
-    fn transfer_options(kill: Option<PathBuf>, paused: Option<PathBuf>) -> Options {
+    fn transfer_options(
+        kill: Option<PathBuf>,
+        paused: Option<PathBuf>,
+        catalog: Option<PathBuf>,
+    ) -> Options {
         Options {
             placement: PathBuf::new(),
             state: PathBuf::new(),
@@ -1594,7 +1803,7 @@ mod tests {
             max_writes: None,
             github_kill_switch: kill,
             github_paused_dir: paused,
-            github_gate_catalog: None,
+            github_gate_catalog: catalog,
             identities: None,
             copies_from: None,
             operator: None,
@@ -1607,60 +1816,335 @@ mod tests {
         }
     }
 
-    fn github_destination() -> (Destination, Repository) {
+    fn github_destination() -> Destination {
         let json = r#"{"provider":"github","endpoint":{"origin":"https://api.github.com","token_env":"T"},"path":"new-org/app","namespace":"new-org","repository_id":"5","mirror_user":"9","password_env":"T","interval_seconds":3600}"#;
         let repo: Repository = serde_json::from_str(&format!(
             r#"{{"path":"new-org/app","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[{json}]}}"#
         ))
         .unwrap();
-        (repo.destinations[0].clone(), repo)
+        repo.destinations[0].clone()
     }
 
     #[test]
     fn a_github_transfer_without_the_gates_files_makes_no_request() {
-        let (dest, repo) = github_destination();
-        let mut io = Silent(Vec::new());
-        let outcome = transfer_one(
-            &mut io,
-            &transfer_options(None, None),
-            &dest,
-            &repo,
-            "old-org/app",
-            true,
-        )
-        .unwrap();
-        assert!(
-            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("write gate")),
-            "{outcome:?}"
-        );
-        assert!(
-            io.0.is_empty(),
-            "no request while the gate is not held: {:?}",
-            io.0
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut io = http(dir.path());
+        let dest = github_destination();
+        // The catalogue is required for a write: kill switch and pause directory alone do not open the gate.
+        let paused = dir.path().join("paused");
+        std::fs::create_dir(&paused).unwrap();
+        for options in [
+            transfer_options(None, None, None),
+            transfer_options(Some(dir.path().join("kill")), Some(paused), None),
+        ] {
+            let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
+            assert!(
+                matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("--github-gate-catalog")),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]
-    fn a_github_transfer_waits_for_a_kill_switch_and_a_paused_organisation() {
+    fn a_github_transfer_waits_for_a_kill_switch_a_paused_organisation_and_its_pacing() {
         let dir = tempfile::tempdir().unwrap();
-        let (dest, repo) = github_destination();
+        let dest = github_destination();
         let kill = dir.path().join("kill");
         let paused = dir.path().join("paused");
+        let catalog = dir.path().join("gate-config.json");
         std::fs::create_dir(&paused).unwrap();
+        std::fs::write(&catalog, r#"{"orgs":{}}"#).unwrap();
         std::fs::write(&kill, "").unwrap();
-        let mut io = Silent(Vec::new());
-        let options = transfer_options(Some(kill.clone()), Some(paused.clone()));
-        let outcome = transfer_one(&mut io, &options, &dest, &repo, "old-org/app", true).unwrap();
+        let mut io = http(dir.path());
+        let options = transfer_options(Some(kill.clone()), Some(paused.clone()), Some(catalog));
+        let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
         assert!(
             matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("gate-kill-switch"))
         );
         std::fs::remove_file(&kill).unwrap();
         std::fs::write(paused.join("old-org"), "").unwrap();
-        let outcome = transfer_one(&mut io, &options, &dest, &repo, "old-org/app", true).unwrap();
+        let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
         assert!(
             matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("gate-paused"))
         );
-        assert!(io.0.is_empty());
+        std::fs::remove_file(paused.join("old-org")).unwrap();
+        // A transfer that is not yet due is reported, never slept on.
+        io.state.next_github_transfer = cfrg::native::http::now().unwrap() + 170;
+        let outcome = transfer_one(&mut io, &options, &dest, "old-org/app", true).unwrap();
+        assert!(
+            matches!(&outcome, Transfer::Blocked { reason, .. } if reason.contains("paced")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A tiny world: Forgejo's push mirrors, and Bitbucket's old and new repositories. Everything goes through the transport trait.
+    struct World {
+        mirrors: Vec<Value>,
+        counter: u32,
+        old_alive: bool,
+        new_alive: bool,
+        old_refs: Vec<(String, String)>,
+        new_refs: Vec<(String, String)>,
+        writes: Vec<String>,
+        notes: BTreeMap<String, String>,
+        restrictions: Vec<Value>,
+    }
+
+    fn r_body(_existing: &[Value], body: &Value) -> Value {
+        body.clone()
+    }
+
+    const OLD_REPO: &str = "/2.0/repositories/corbet-web/%7Bold%7D";
+    const NEW_REPO: &str = "/2.0/repositories/corbet-archv/corbet.ch";
+
+    impl World {
+        fn refs(list: &[(String, String)]) -> Value {
+            json!({"values": list.iter().map(|(n, h)| json!({"type":"branch","name":n,"target":{"hash":h}})).collect::<Vec<_>>()})
+        }
+    }
+
+    impl Transport for World {
+        fn send(&mut self, r: cfrg::native::http::Request) -> Result<cfrg::native::http::Response> {
+            use cfrg::native::http::Response;
+            let ok = |status: u16, body: Value| Ok(Response { status, body });
+            let (method, path) = (r.method, r.path.as_str());
+            let req_body = r.body.clone().unwrap_or(Value::Null);
+            if method != "GET" {
+                self.writes.push(format!("{method} {path}"));
+            }
+            if path.contains("/push_mirrors") {
+                return match method {
+                    "GET" if path.contains("page=1") => ok(200, json!(self.mirrors.clone())),
+                    "GET" => ok(200, json!([])),
+                    "POST" => {
+                        self.counter += 1;
+                        let mut mirror = r.body.clone().unwrap();
+                        mirror["remote_name"] = json!(format!("remote_mirror_{}", self.counter));
+                        self.mirrors.push(mirror.clone());
+                        ok(200, mirror)
+                    }
+                    "DELETE" => {
+                        let name = path.rsplit('/').next().unwrap().to_string();
+                        self.mirrors.retain(|m| m["remote_name"] != name.as_str());
+                        ok(204, Value::Null)
+                    }
+                    _ => panic!("{method} {path}"),
+                };
+            }
+            if let Some(rest) = path.strip_prefix(OLD_REPO) {
+                return match (method, rest) {
+                    _ if !self.old_alive => ok(404, Value::Null),
+                    ("GET", "") => ok(
+                        200,
+                        json!({"uuid":"{old}","full_name":"corbet-web/corbet.ch"}),
+                    ),
+                    ("GET", _) => ok(200, World::refs(&self.old_refs)),
+                    ("DELETE", "") => {
+                        self.old_alive = false;
+                        ok(204, Value::Null)
+                    }
+                    _ => panic!("{method} {path}"),
+                };
+            }
+            let path = path.replace("/corbet-archv/%7Bnew%7D", "/corbet-archv/corbet.ch");
+            let path = path.as_str();
+            if let Some(rest) = path.strip_prefix(NEW_REPO) {
+                return match (method, rest) {
+                    ("GET", "") if !self.new_alive => ok(404, Value::Null),
+                    ("GET", "") => ok(
+                        200,
+                        json!({"uuid":"{new}","description":"cfrg-transfer-from:{old}","is_private":true,"scm":"git","project":{"key":"CORE"},"full_name":"corbet-archv/corbet.ch","mainbranch":{"name":"main"}}),
+                    ),
+                    ("POST", "") => {
+                        self.new_alive = true;
+                        ok(200, json!({"uuid":"{new}"}))
+                    }
+                    ("GET", r) if r.starts_with("/refs") => ok(200, World::refs(&self.new_refs)),
+                    (_, r) if r.starts_with("/pipelines_config") => {
+                        ok(200, json!({"enabled": false}))
+                    }
+                    ("GET", r) if r.starts_with("/branch-restrictions") => {
+                        ok(200, json!({"values": self.restrictions.clone()}))
+                    }
+                    ("POST", r) if r.starts_with("/branch-restrictions") => {
+                        let mut body = r_body(&self.restrictions, &req_body);
+                        body["id"] = json!(self.restrictions.len() + 1);
+                        self.restrictions.push(body.clone());
+                        ok(201, body)
+                    }
+                    // Restrictions, keys: the protection of the new repository; any shape that says "in place".
+                    ("GET", _) => ok(200, json!({"values": []})),
+                    _ => ok(200, json!({})),
+                };
+            }
+            panic!("unscripted request {method} {path}")
+        }
+        fn note(&mut self, kind: &str, key: &str, value: &str) -> Result<()> {
+            self.notes
+                .insert(format!("{kind}/{key}"), value.to_string());
+            Ok(())
+        }
+        fn recorded(&self, kind: &str, key: &str) -> Option<String> {
+            self.notes.get(&format!("{kind}/{key}")).cloned()
+        }
+        fn credential(&self, _env: &str, _path: &str) -> Option<String> {
+            Some("secret".into())
+        }
+    }
+
+    fn corbet_ch() -> (Repository, Destination) {
+        let json = r#"{"provider":"bitbucket","endpoint":{"origin":"https://api.bitbucket.org","token_env":"T"},"path":"corbet-web/corbet.ch","namespace":"CORE","repository_id":"{old}","mirror_user":"9","password_env":"T","interval_seconds":3600,"remote_name":"remote_mirror_0"}"#;
+        let mut repo: Repository = serde_json::from_str(&format!(
+            r#"{{"path":"corbet-archv/corbet.ch","source_id":5,"private":true,"default_branch":"main","content":"native-git","destinations":[{json}]}}"#
+        ))
+        .unwrap();
+        repo.destinations[0].path = "corbet-archv/corbet.ch".into();
+        let dest = repo.destinations[0].clone();
+        (repo, dest)
+    }
+
+    #[test]
+    fn the_whole_bitbucket_move_pending_to_done() {
+        let (repo, dest) = corbet_ch();
+        let source = cfrg::native::Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "F".into(),
+        };
+        let api_repo = repo.clone();
+        let api = cfgj::native::Mirrors {
+            endpoint: &source,
+            repository: &api_repo,
+        };
+        let old_mirror = json!({"remote_name":"remote_mirror_0","remote_address":"https://bitbucket.org/corbet-web/corbet.ch.git"});
+        let mut world = World {
+            mirrors: vec![old_mirror],
+            counter: 0,
+            old_alive: true,
+            new_alive: false,
+            old_refs: vec![("main".into(), "a1".into())],
+            new_refs: vec![],
+            writes: vec![],
+            notes: BTreeMap::new(),
+            restrictions: vec![],
+        };
+        let mut mirrors = world.mirrors.clone();
+        let mut report = Vec::new();
+        let bb = dest.clone();
+        let pass = |world: &mut World,
+                    mirrors: &mut Vec<Value>,
+                    write: bool,
+                    dest: &Destination,
+                    report: &mut Vec<Value>| {
+            let uuid = dest.repository_id.clone().unwrap();
+            bitbucket_move(
+                world,
+                &api,
+                &repo,
+                dest,
+                &bb,
+                &uuid,
+                "corbet-web",
+                mirrors,
+                write,
+                true,
+                report,
+            )
+            .unwrap()
+        };
+        // plan: nothing is written, the steps are shown.
+        assert!(matches!(
+            pass(&mut world, &mut mirrors, false, &dest, &mut report),
+            MoveStep::Stop
+        ));
+        assert_eq!(report.last().unwrap()["state"], "transfer-planned");
+        assert!(world.writes.is_empty());
+        // apply 1: the new repository is created and a SECOND mirror pushes to it; the old mirror stays.
+        assert!(matches!(
+            pass(&mut world, &mut mirrors, true, &dest, &mut report),
+            MoveStep::Stop
+        ));
+        assert_eq!(report.last().unwrap()["state"], "transfer-pending");
+        assert_eq!(report.last().unwrap()["new_repository_id"], "{new}");
+        assert!(world.new_alive && world.old_alive);
+        let addresses: Vec<_> = world
+            .mirrors
+            .iter()
+            .map(|m| m["remote_address"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            addresses,
+            [
+                "https://bitbucket.org/corbet-web/corbet.ch.git",
+                "https://bitbucket.org/corbet-archv/corbet.ch.git"
+            ]
+        );
+        // apply 2: the mirror has not pushed yet: still pending, the old repository stays, no second mirror is added.
+        assert!(matches!(
+            pass(&mut world, &mut mirrors, true, &dest, &mut report),
+            MoveStep::Stop
+        ));
+        assert!(report.last().unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("do not match"));
+        assert!(world.old_alive && world.mirrors.len() == 2);
+        // The mirror pushes everything.
+        world.new_refs = world.old_refs.clone();
+        // apply 3: exact match: the old repository and the old mirror go, the pass continues under the new uuid.
+        let step = pass(&mut world, &mut mirrors, true, &dest, &mut report);
+        assert!(matches!(&step, MoveStep::Continue(id) if id == "{new}"));
+        assert_eq!(report.last().unwrap()["state"], "transferred");
+        assert!(!world.old_alive);
+        assert_eq!(world.mirrors.len(), 1);
+        assert!(world.mirrors[0]["remote_address"]
+            .as_str()
+            .unwrap()
+            .contains("corbet-archv"));
+        // The placement still holds the old uuid: the next pass resumes instead of failing.
+        let step = pass(&mut world, &mut mirrors, true, &dest, &mut report);
+        assert!(matches!(&step, MoveStep::Continue(id) if id == "{new}"));
+    }
+
+    #[test]
+    fn a_rename_operation_never_creates_the_bitbucket_target() {
+        let (repo, dest) = corbet_ch();
+        let source = cfrg::native::Endpoint {
+            origin: "https://forge.example".into(),
+            token_env: "F".into(),
+        };
+        let api = cfgj::native::Mirrors {
+            endpoint: &source,
+            repository: &repo,
+        };
+        let mut world = World {
+            mirrors: vec![],
+            counter: 0,
+            old_alive: true,
+            new_alive: false,
+            old_refs: vec![("main".into(), "a1".into())],
+            new_refs: vec![],
+            writes: vec![],
+            notes: BTreeMap::new(),
+            restrictions: vec![],
+        };
+        let mut report = Vec::new();
+        let step = bitbucket_move(
+            &mut world,
+            &api,
+            &repo,
+            &dest,
+            &dest,
+            "{old}",
+            "corbet-web",
+            &mut vec![],
+            true,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        assert!(matches!(step, MoveStep::Stop));
+        assert_eq!(report[0]["state"], "transfer-blocked");
+        assert!(world.writes.is_empty());
     }
 
     #[test]

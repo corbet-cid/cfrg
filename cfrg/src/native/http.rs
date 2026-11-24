@@ -45,7 +45,26 @@ pub trait Transport {
     fn resolve(&mut self, _scope: &str) -> Result<()> {
         Ok(())
     }
+    /// Record a request that must never be repeated, or the pacing owed after it, in the durable state. Called right before
+    /// the request is sent, so a crash after it cannot repeat it. `github-transfer` sets the request and the next-transfer
+    /// time (`value` plus the three minutes the pacing policy asks); `github-transfer-clear` forgets the request.
+    fn note(&mut self, _kind: &str, _key: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+    /// What `note` recorded: `bitbucket-transfer` (old uuid to the new one), `bitbucket-transfer-by-new` (the old uuid of a new
+    /// one), `github-transfer` (a requested transfer's time).
+    fn recorded(&self, _kind: &str, _key: &str) -> Option<String> {
+        None
+    }
+    /// A credential by its environment name (the credentials directory first, the process environment as the fallback).
+    fn credential(&self, _env: &str, _path: &str) -> Option<String> {
+        None
+    }
 }
+
+/// Minimum spacing between two GitHub repository transfers (the pacing policy: at least three minutes).
+pub const GITHUB_TRANSFER_SPACING: u64 = 180;
+const _: () = assert!(GITHUB_TRANSFER_SPACING >= 180);
 
 /// Minimum spacing, in seconds, between requests. Reads never shorten the
 /// spacing owed after a write or a creation.
@@ -80,6 +99,17 @@ pub struct State {
     #[serde(default)]
     pub next_mutation: u64,
     pub next_creation: u64,
+    /// Earliest time of the next GitHub repository transfer (the pacing policy: at least three minutes apart). Kept here, not
+    /// slept on: a transfer that is not yet due is reported `transfer-blocked: paced`.
+    #[serde(default)]
+    pub next_github_transfer: u64,
+    /// GitHub repository id to the time its transfer was requested and not yet seen at the new owner: never requested twice.
+    #[serde(default)]
+    pub github_transfers: BTreeMap<String, u64>,
+    /// Bitbucket old repository uuid to the uuid of the repository created for its move. The description marker of the new
+    /// repository can be rewritten by `settings`; this record cannot.
+    #[serde(default)]
+    pub bitbucket_transfers: BTreeMap<String, String>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Window {
@@ -305,6 +335,50 @@ impl Transport for Http {
     fn resolve(&mut self, scope: &str) -> Result<()> {
         self.state.pending.remove(scope);
         self.save()
+    }
+
+    fn note(&mut self, kind: &str, key: &str, value: &str) -> Result<()> {
+        match kind {
+            "github-transfer" => {
+                let at: u64 = value
+                    .parse()
+                    .map_err(|_| failure("Invalid transfer time"))?;
+                self.state.github_transfers.insert(key.to_string(), at);
+                self.state.next_github_transfer = at + GITHUB_TRANSFER_SPACING;
+            }
+            "github-transfer-clear" => {
+                self.state.github_transfers.remove(key);
+            }
+            "bitbucket-transfer" => {
+                self.state
+                    .bitbucket_transfers
+                    .insert(key.to_string(), value.to_string());
+            }
+            _ => return Err(failure("Unknown state note")),
+        }
+        self.save()
+    }
+
+    fn recorded(&self, kind: &str, key: &str) -> Option<String> {
+        match kind {
+            "github-transfer" => self
+                .state
+                .github_transfers
+                .get(key)
+                .map(|at| at.to_string()),
+            "bitbucket-transfer" => self.state.bitbucket_transfers.get(key).cloned(),
+            "bitbucket-transfer-by-new" => self
+                .state
+                .bitbucket_transfers
+                .iter()
+                .find(|(_, new)| new.as_str() == key)
+                .map(|(old, _)| old.clone()),
+            _ => None,
+        }
+    }
+
+    fn credential(&self, env: &str, path: &str) -> Option<String> {
+        Http::credential(self, env, path)
     }
 }
 
@@ -578,6 +652,41 @@ mod tests {
         state.next_request = 107;
         assert_eq!(state.deadline(true, false), 112);
         assert_eq!(state.deadline(true, true), 160);
+    }
+    #[test]
+    fn transfer_records_survive_a_save_and_an_old_state_file_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"windows":{},"pending":{},"next_request":0,"next_creation":0}"#,
+        )
+        .unwrap();
+        let mut http = Http::open(&path, true).unwrap();
+        http.note("github-transfer", "5", "1000").unwrap();
+        http.note("bitbucket-transfer", "{old}", "{new}").unwrap();
+        assert_eq!(
+            http.state.next_github_transfer,
+            1000 + GITHUB_TRANSFER_SPACING
+        );
+        drop(http);
+        let mut http = Http::open(&path, true).unwrap();
+        assert_eq!(
+            http.recorded("github-transfer", "5").as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            http.recorded("bitbucket-transfer", "{old}").as_deref(),
+            Some("{new}")
+        );
+        assert_eq!(
+            http.recorded("bitbucket-transfer-by-new", "{new}")
+                .as_deref(),
+            Some("{old}")
+        );
+        http.note("github-transfer-clear", "5", "").unwrap();
+        assert!(http.recorded("github-transfer", "5").is_none());
+        assert!(http.note("nonsense", "k", "v").is_err());
     }
     #[test]
     fn windows_do_not_guess_missing_or_date_delays() {

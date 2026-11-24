@@ -273,6 +273,16 @@ impl Repository {
         }
     }
 
+    /// Whether the placement declares, in `org_map`, a namespace for this repository's organisation on `provider`. Only then
+    /// is a namespace change of its destination moved automatically; without it the change is reported `transfer-needed` and
+    /// nothing moves implicitly.
+    pub fn transfer_declared(&self, provider: Provider) -> bool {
+        self.path
+            .split_once('/')
+            .and_then(|(org, _)| self.org_map.get(&org.to_ascii_lowercase()))
+            .is_some_and(|targets| targets.contains_key(&provider))
+    }
+
     /// The primary's path with its organisation replaced by what `org_map` says for `provider`.
     pub fn mapped_path(&self, provider: Provider) -> String {
         let Some((org, rest)) = self.path.split_once('/') else {
@@ -946,6 +956,12 @@ mod tests {
             plan_move("web-group/sub/site", "other/site"),
             Move::Transfer
         );
+        // Only a declared organisation moves automatically.
+        assert!(repo.transfer_declared(Provider::Gitlab));
+        assert!(!repo.transfer_declared(Provider::Github));
+        let mut other = repo.clone();
+        other.path = "unlisted/site".into();
+        assert!(!other.transfer_declared(Provider::Gitlab));
         // No entry for an organisation: the destinations keep its own name.
         let plain = Placement::from_document(mapped_document("{}").as_bytes()).unwrap();
         assert_eq!(plain.repositories[0].destinations[0].path, "web/site");

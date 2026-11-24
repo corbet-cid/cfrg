@@ -15,7 +15,7 @@
 //! its mirror). Everything here talks through [`Transport`]: the tests use a recorded fake and never the network.
 use super::{
     encode,
-    http::{expect, Auth, Request, Response, Transport},
+    http::{expect, Auth, Request, Response, Transport, REFUSED_MARK},
     Destination, Provider,
 };
 use crate::{failure, Result};
@@ -38,6 +38,17 @@ pub enum Transfer {
     },
     /// Cannot proceed; reported, never forced.
     Blocked { from: String, reason: String },
+}
+
+/// A write the provider refused for this request only (the transport turns a 403 into an error carrying `REFUSED_MARK`) is a
+/// blocked move, never a failure of the run. Every other error propagates: it may stop the run.
+fn writing(result: Result<Response>) -> Result<std::result::Result<Response, String>> {
+    match result {
+        Err(error) if error.to_string().contains(REFUSED_MARK) => {
+            Ok(Err("the provider refused the request (HTTP 403)".into()))
+        }
+        other => other.map(Ok),
+    }
 }
 
 fn blocked(from: &str, reason: impl Into<String>) -> Result<Transfer> {
@@ -160,18 +171,22 @@ pub fn gitlab(
             )],
         });
     }
-    let response = gitlab_call(
+    let response = match writing(gitlab_call(
         io,
         dest,
         "PUT",
         format!("/projects/{id}/transfer"),
         Some(json!({"namespace": group_id})),
-    )?;
+    ))? {
+        Ok(response) => response,
+        Err(reason) => return blocked(from, reason),
+    };
     match response.status {
         200 if response.body["path_with_namespace"]
             .as_str()
             .is_some_and(|p| same(p, &dest.path)) =>
         {
+            io.resolve(&format!("{}/api", dest.endpoint.origin))?;
             Ok(Transfer::Done {
                 from: from.to_string(),
                 detail: json!({"repository_id": id.to_string()}),
@@ -180,15 +195,9 @@ pub fn gitlab(
         200 => Err(failure(
             "GitLab transfer not confirmed; inspect the project before retrying",
         )),
-        400 | 403 | 404 | 409 | 422 => blocked(
-            from,
-            format!(
-                "GitLab refused the transfer: {}",
-                response.body["message"]
-                    .as_str()
-                    .unwrap_or("no reason given")
-            ),
-        ),
+        status @ (400 | 403 | 404 | 409 | 422) => {
+            blocked(from, format!("GitLab refused the transfer (HTTP {status})"))
+        }
         other => Err(failure(format!(
             "GitLab transfer failed with HTTP {other}; inspect the project before retrying"
         ))),
@@ -233,12 +242,17 @@ pub struct Gate {
 }
 
 /// Move a GitHub repository (`dest.repository_id`, now at `from`) to the owner of `dest.path`.
+///
+/// `requested`: this transfer was already posted by an earlier pass and has not shown up yet; it is read back, never posted again.
+/// The one POST is announced to the transport with `note` just before it is sent (the pacing and the request are recorded in
+/// the durable state), so a crash after the POST can never repeat it; a refusal or a success clears the record.
 pub fn github(
     io: &mut dyn Transport,
     dest: &Destination,
     from: &str,
     apply: bool,
     gate: &Gate,
+    requested: bool,
 ) -> Result<Transfer> {
     let id: u64 = dest
         .repository_id
@@ -258,6 +272,31 @@ pub fn github(
     }
     if let Some(reason) = &gate.refusal {
         return blocked(from, format!("the GitHub write gate holds: {reason}"));
+    }
+    let done = |from: &str| Transfer::Done {
+        from: from.to_string(),
+        detail: json!({"repository_id": id.to_string()}),
+    };
+    if requested {
+        let live = expect(
+            github_call(io, dest, "GET", &format!("/repositories/{id}"), None, false)?,
+            &[200],
+        )?;
+        return Ok(
+            if live["full_name"]
+                .as_str()
+                .is_some_and(|n| same(n, &dest.path))
+            {
+                io.note("github-transfer-clear", &id.to_string(), "")?;
+                done(from)
+            } else {
+                Transfer::Pending {
+                from: from.to_string(),
+                detail: "the transfer was requested earlier and is not at the new owner yet; not requested again".into(),
+                new_repository_id: None,
+            }
+            },
+        );
     }
     let target = github_call(
         io,
@@ -291,12 +330,7 @@ pub fn github(
     )?;
     match taken.status {
         404 => {}
-        200 if taken.body["id"].as_u64() == Some(id) => {
-            return Ok(Transfer::Done {
-                from: from.to_string(),
-                detail: json!({"repository_id": id.to_string()}),
-            })
-        }
+        200 if taken.body["id"].as_u64() == Some(id) => return Ok(done(from)),
         200 => return blocked(from, "the wanted name is already taken at the target owner"),
         other => {
             return Err(failure(format!(
@@ -308,30 +342,34 @@ pub fn github(
         return Ok(Transfer::Planned {
             from: from.to_string(),
             steps: vec![format!(
-                "POST /repos/{from}/transfer new_owner={wanted_owner} through the write gate (paced as a creation)"
+                "POST /repos/{from}/transfer new_owner={wanted_owner} through the write gate (one per run, at least three minutes apart)"
             )],
         });
     }
-    let response = github_call(
+    io.note(
+        "github-transfer",
+        &id.to_string(),
+        &crate::native::http::now()?.to_string(),
+    )?;
+    let response = match writing(github_call(
         io,
         dest,
         "POST",
         &format!("/repos/{from}/transfer"),
         Some(json!({"new_owner": wanted_owner})),
         true,
-    )?;
+    ))? {
+        Ok(response) => response,
+        Err(reason) => {
+            io.note("github-transfer-clear", &id.to_string(), "")?;
+            return blocked(from, reason);
+        }
+    };
     match response.status {
         200..=202 => {}
-        403 | 404 | 422 => {
-            return blocked(
-                from,
-                format!(
-                    "GitHub refused the transfer: {}",
-                    response.body["message"]
-                        .as_str()
-                        .unwrap_or("no reason given")
-                ),
-            )
+        status @ (404 | 422) => {
+            io.note("github-transfer-clear", &id.to_string(), "")?;
+            return blocked(from, format!("GitHub refused the transfer (HTTP {status})"));
         }
         other => {
             return Err(failure(format!(
@@ -340,16 +378,17 @@ pub fn github(
         }
     }
     // Read it back by id: only the live name proves the move.
-    let back = github_call(io, dest, "GET", &format!("/repositories/{id}"), None, false)?;
-    let live = expect(back, &[200])?;
+    let live = expect(
+        github_call(io, dest, "GET", &format!("/repositories/{id}"), None, false)?,
+        &[200],
+    )?;
     if live["full_name"]
         .as_str()
         .is_some_and(|n| same(n, &dest.path))
     {
-        Ok(Transfer::Done {
-            from: from.to_string(),
-            detail: json!({"repository_id": id.to_string()}),
-        })
+        io.resolve(&format!("{}/create-repo", dest.endpoint.origin))?;
+        io.note("github-transfer-clear", &id.to_string(), "")?;
+        Ok(done(from))
     } else {
         Ok(Transfer::Pending {
             from: from.to_string(),
@@ -363,9 +402,12 @@ pub fn github(
 // ---------------------------------------------------------------------------------------------------------------------
 // Bitbucket
 
+/// `workspace` is the one whose repository the request addresses: the rate and plan windows are recorded per workspace, the
+/// old repository's calls belong to the old one.
 fn bitbucket_call(
     io: &mut dyn Transport,
     dest: &Destination,
+    workspace: &str,
     method: &'static str,
     path: String,
     body: Option<Value>,
@@ -374,11 +416,6 @@ fn bitbucket_call(
     if dest.provider != Provider::Bitbucket || dest.endpoint.origin != "https://api.bitbucket.org" {
         return Err(failure("Bitbucket Cloud API origin required"));
     }
-    let workspace = dest
-        .path
-        .split('/')
-        .next()
-        .ok_or_else(|| failure("Missing workspace"))?;
     io.send(Request {
         endpoint: dest.endpoint.clone(),
         auth: Auth::Bearer,
@@ -390,22 +427,35 @@ fn bitbucket_call(
     })
 }
 
-/// Every branch and tag of `full_name` as name to commit hash, following the pagination.
+/// A repository addressed by its immutable uuid under a workspace (slugs move; cbkt addresses repositories this way too).
+fn by_uuid(workspace: &str, uuid: &str) -> String {
+    format!("{workspace}/{}", encode(uuid))
+}
+
+/// Every branch and tag of the repository at `address` (`<workspace>/<slug or uuid>`) as kind:name to commit hash, following
+/// the pagination. A page without a `values` array is an error, never an empty listing.
 pub fn bitbucket_refs(
     io: &mut dyn Transport,
     dest: &Destination,
-    full_name: &str,
+    address: &str,
 ) -> Result<BTreeMap<String, String>> {
+    let workspace = address.split('/').next().unwrap_or_default().to_string();
     let mut refs = BTreeMap::new();
-    let mut next = Some(format!("/2.0/repositories/{full_name}/refs?pagelen=100"));
+    let mut next = Some(format!("/2.0/repositories/{address}/refs?pagelen=100"));
     let mut pages = 0;
     while let Some(path) = next.take() {
         pages += 1;
         if pages > 200 {
             return Err(failure("Bitbucket ref listing does not end"));
         }
-        let page = expect(bitbucket_call(io, dest, "GET", path, None, false)?, &[200])?;
-        for value in page["values"].as_array().into_iter().flatten() {
+        let page = expect(
+            bitbucket_call(io, dest, &workspace, "GET", path, None, false)?,
+            &[200],
+        )?;
+        let values = page["values"].as_array().ok_or_else(|| {
+            failure("Bitbucket ref listing has no values; refusing to read it as empty")
+        })?;
+        for value in values {
             let name = value["name"]
                 .as_str()
                 .ok_or_else(|| failure("Missing Bitbucket ref name"))?;
@@ -440,12 +490,23 @@ pub fn compare_refs(old: &BTreeMap<String, String>, new: &BTreeMap<String, Strin
     findings
 }
 
-/// What the move needs besides the destination. `project_key` is the Bitbucket project the new repository goes into.
+/// What the move needs besides the destination (`dest.path` is the new place).
 pub struct BitbucketMove<'a> {
-    pub from: &'a str,
+    /// The workspace the old repository sits in; it is addressed by `old_uuid` under it.
+    pub old_workspace: &'a str,
     pub old_uuid: &'a str,
+    /// The Bitbucket project the new repository goes into (the creation destination's namespace).
     pub project_key: &'a str,
     pub private: bool,
+    /// Whether this operation may create a repository at all (a rename never does).
+    pub allow_create: bool,
+    /// The uuid cfrg's state recorded for the new repository: it is accepted by that uuid whatever its description says.
+    pub known_new: Option<&'a str>,
+}
+
+fn is_ours(target: &Value, marker: &str, known_new: Option<&str>) -> bool {
+    target["description"].as_str() == Some(marker)
+        || known_new.is_some_and(|known| target["uuid"].as_str() == Some(known))
 }
 
 /// One step of the Bitbucket move: create the target, wait for the mirror, delete the old repository after an exact match.
@@ -455,38 +516,80 @@ pub fn bitbucket(
     mv: &BitbucketMove,
     apply: bool,
 ) -> Result<Transfer> {
-    let from = mv.from;
-    let (live_ws, live_slug) = split(from)?;
     let (wanted_ws, wanted_slug) = split(&dest.path)?;
-    if same(live_ws, wanted_ws) {
-        return Err(failure("Bitbucket move asked inside one workspace"));
-    }
-    if !same(live_slug, wanted_slug) {
-        return blocked(
-            from,
-            "the workspace and the name both differ; move first, then rename",
-        );
-    }
-    if mv.project_key.is_empty() {
-        return blocked(
-            from,
-            "the destination names no Bitbucket project key (namespace)",
-        );
-    }
+    let old_ws = mv.old_workspace;
+    let old_address = by_uuid(old_ws, mv.old_uuid);
     let marker = bitbucket_marker(mv.old_uuid);
+    let read_old = |io: &mut dyn Transport| {
+        bitbucket_call(
+            io,
+            dest,
+            old_ws,
+            "GET",
+            format!("/2.0/repositories/{old_address}"),
+            None,
+            false,
+        )
+    };
     let target = bitbucket_call(
         io,
         dest,
+        wanted_ws,
         "GET",
         format!("/2.0/repositories/{}", dest.path),
         None,
         false,
     )?;
+    let old = read_old(io)?;
+    let from = match old.status {
+        200 => {
+            if old.body["uuid"].as_str() != Some(mv.old_uuid) {
+                return Err(failure("Bitbucket destination identity mismatch"));
+            }
+            old.body["full_name"]
+                .as_str()
+                .ok_or_else(|| failure("Missing Bitbucket repository name"))?
+                .to_string()
+        }
+        404 => {
+            // The old repository is gone: resume only if the repository at the new path is the one this move made.
+            return match target.status {
+                200 if is_ours(&target.body, &marker, mv.known_new) => Ok(Transfer::Done {
+                    from: format!("{old_ws}/{wanted_slug}"),
+                    detail: json!({"repository_id": target.body["uuid"], "resumed": true}),
+                }),
+                _ => Err(failure(
+                    "Declared Bitbucket repo disappeared and no repository made by its move sits at the new path; refusing replacement",
+                )),
+            };
+        }
+        other => {
+            return Err(failure(format!(
+                "Bitbucket lookup failed with HTTP {other}"
+            )))
+        }
+    };
+    let (live_ws, live_slug) = split(&from)?;
+    if same(live_ws, wanted_ws) {
+        return Err(failure("Bitbucket move asked inside one workspace"));
+    }
+    if !same(live_slug, wanted_slug) {
+        return blocked(
+            &from,
+            "the workspace and the name both differ; move first, then rename",
+        );
+    }
+    if mv.project_key.is_empty() {
+        return blocked(
+            &from,
+            "the destination names no Bitbucket project key (namespace)",
+        );
+    }
     let new_uuid = match target.status {
         404 => {
             if !apply {
                 return Ok(Transfer::Planned {
-                    from: from.to_string(),
+                    from: from.clone(),
                     steps: vec![
                         format!(
                             "create {} in project {} ({}), marked {marker}",
@@ -494,15 +597,25 @@ pub fn bitbucket(
                             mv.project_key,
                             if mv.private { "private" } else { "public" }
                         ),
-                        "mirror it from Forgejo".into(),
+                        "mirror it from Forgejo (a second owned mirror; the old one keeps running)"
+                            .into(),
                         format!("compare every branch and tag of {from} and {}", dest.path),
-                        format!("delete {from} only after the compare matches"),
+                        format!(
+                            "delete {from} only after the compare matches and the old one has refs"
+                        ),
                     ],
                 });
             }
-            let created = bitbucket_call(
+            if !mv.allow_create {
+                return blocked(
+                    &from,
+                    "this operation never creates a repository; run a reconcile",
+                );
+            }
+            let created = match writing(bitbucket_call(
                 io,
                 dest,
+                wanted_ws,
                 "POST",
                 format!("/2.0/repositories/{}", dest.path),
                 Some(json!({
@@ -512,19 +625,35 @@ pub fn bitbucket(
                     "description": marker,
                 })),
                 true,
-            )?;
+            ))? {
+                Ok(response) => response,
+                Err(reason) => return blocked(&from, reason),
+            };
             let body = expect(created, &[200, 201])?;
             let uuid = body["uuid"].as_str().map(String::from);
+            // Read back before the intent is cleared: only the live repository proves the creation.
+            let back = bitbucket_call(
+                io,
+                dest,
+                wanted_ws,
+                "GET",
+                format!("/2.0/repositories/{}", dest.path),
+                None,
+                false,
+            )?;
+            if back.status == 200 {
+                io.resolve(&format!("{}/workspace/{wanted_ws}", dest.endpoint.origin))?;
+            }
             return Ok(Transfer::Pending {
-                from: from.to_string(),
+                from,
                 detail: "created the new repository; the mirror must carry every ref before the old one goes".into(),
                 new_repository_id: uuid,
             });
         }
         200 => {
-            if target.body["description"].as_str() != Some(marker.as_str()) {
+            if !is_ours(&target.body, &marker, mv.known_new) {
                 return blocked(
-                    from,
+                    &from,
                     "the wanted name is taken by a repository this move did not create",
                 );
             }
@@ -536,43 +665,69 @@ pub fn bitbucket(
             )))
         }
     };
-    let old = bitbucket_refs(io, dest, from)?;
-    let new = bitbucket_refs(io, dest, &dest.path)?;
-    let findings = compare_refs(&old, &new);
+    let old_refs = bitbucket_refs(io, dest, &old_address)?;
+    if old_refs.is_empty() {
+        return blocked(
+            &from,
+            "the old repository has no refs to compare; it is never deleted on an empty compare",
+        );
+    }
+    let new_refs = bitbucket_refs(io, dest, &dest.path)?;
+    let findings = compare_refs(&old_refs, &new_refs);
     if !findings.is_empty() {
         let first: Vec<_> = findings.iter().take(5).cloned().collect();
         return Ok(Transfer::Pending {
-            from: from.to_string(),
             detail: format!(
                 "{} of {} refs do not match yet ({}); the old repository stays",
                 findings.len(),
-                old.len(),
+                old_refs.len(),
                 first.join("; ")
             ),
+            from,
             new_repository_id: new_uuid,
         });
     }
     if !apply {
         return Ok(Transfer::Planned {
-            from: from.to_string(),
             steps: vec![format!(
                 "all {} refs match; delete {from} (the old repository)",
-                old.len()
+                old_refs.len()
             )],
+            from,
         });
     }
-    let deleted = bitbucket_call(
+    // Right before the delete: it is still the repository we compared.
+    let again = read_old(io)?;
+    if again.status != 200
+        || again.body["uuid"].as_str() != Some(mv.old_uuid)
+        || again.body["full_name"].as_str() != Some(from.as_str())
+    {
+        return Err(failure(
+            "The old Bitbucket repository changed during the compare; nothing was deleted",
+        ));
+    }
+    let deleted = match writing(bitbucket_call(
         io,
         dest,
+        old_ws,
         "DELETE",
-        format!("/2.0/repositories/{from}"),
+        format!("/2.0/repositories/{old_address}"),
         None,
         false,
-    )?;
+    ))? {
+        Ok(response) => response,
+        Err(reason) => return blocked(&from, reason),
+    };
     expect(deleted, &[200, 202, 204])?;
+    if read_old(io)?.status != 404 {
+        return Err(failure(
+            "The old Bitbucket repository still answers after the delete; inspect it",
+        ));
+    }
+    io.resolve(&format!("{}/workspace/{old_ws}", dest.endpoint.origin))?;
     Ok(Transfer::Done {
-        from: from.to_string(),
-        detail: json!({"repository_id": new_uuid, "refs_compared": old.len()}),
+        from,
+        detail: json!({"repository_id": new_uuid, "refs_compared": old_refs.len()}),
     })
 }
 
