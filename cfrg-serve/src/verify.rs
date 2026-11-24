@@ -3,7 +3,7 @@
 //! Every verifier works on the RAW body and runs before anything is parsed. The comparison is constant time
 //! (`Mac::verify_slice`). A verifier returns the delivery id the sender gave, which the replay guard remembers.
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::HeaderMap;
 use sha2::Sha256;
 use std::{
