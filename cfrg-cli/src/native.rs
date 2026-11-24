@@ -810,7 +810,12 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                         return Ok(());
                     }
                     let mut replaced = None;
-                    if mirror
+                    // An interval difference alone never replaces a mirror (a replacement means a new key): it is reported only.
+                    if let Some(m) = mirror.as_ref().filter(|m| {
+                        interval_only(m, &dest, &url) && !cfgj::native::matches(m, &dest, &url)
+                    }) {
+                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"interval-drift", "declared_seconds":dest.interval_seconds, "mirror":cfgj::native::status(m)}));
+                    } else if mirror
                         .as_ref()
                         .is_some_and(|m| !cfgj::native::matches(m, &dest, &url))
                     {
@@ -1176,6 +1181,19 @@ fn identified(dest: &Destination, mut row: Value) -> Value {
     });
     row["old_repository_id"] = json!(dest.repository_id);
     row
+}
+
+/// Whether the mirror differs from the declared destination in its interval alone.
+fn interval_only(mirror: &Value, dest: &Destination, url: &str) -> bool {
+    let Some(own) = mirror["interval"]
+        .as_str()
+        .and_then(cfgj::native::duration_seconds)
+    else {
+        return false;
+    };
+    let mut probe = dest.clone();
+    probe.interval_seconds = own;
+    cfgj::native::matches(mirror, &probe, url)
 }
 
 /// A Bitbucket move recorded for `old_uuid` and not yet complete.
@@ -1793,6 +1811,21 @@ mod tests {
             &managed
         ));
     }
+    #[test]
+    fn interval_difference_alone_is_recognised_and_other_drift_is_not() {
+        let dest = gitlab("team/new");
+        let url = destination_url(&dest, "team/new");
+        let mirror = |interval: &str, sync: bool| {
+            json!({"remote_address": url, "public_key": "ssh-ed25519 K", "sync_on_commit": sync,
+                   "branch_filter": "", "interval": interval})
+        };
+        assert!(interval_only(&mirror("10m0s", true), &dest, &url));
+        assert!(!interval_only(&mirror("10m0s", false), &dest, &url));
+        let mut other = mirror("10m0s", true);
+        other["remote_address"] = json!("ssh://git@gitlab.example/other/place.git");
+        assert!(!interval_only(&other, &dest, &url));
+    }
+
     fn gitlab(path: &str) -> Destination {
         serde_json::from_value(json!({"provider":"gitlab","endpoint":{"origin":"https://gitlab.example","token_env":"TOKEN"},"path":path,"namespace":"2","repository_id":"7","mirror_user":"9","password_env":"TOKEN","use_ssh":true,"interval_seconds":3600})).unwrap()
     }

@@ -171,6 +171,15 @@ fn current(copy: &Copy, path: &str, mirror: &Value) -> bool {
         && mirror["interval"].as_str().and_then(duration_seconds) == Some(copy.interval_seconds)
 }
 
+/// Whether the mirror is the wanted one except for its interval, which differs.
+fn interval_only(copy: &Copy, path: &str, mirror: &Value) -> bool {
+    mirror["interval"].as_str().and_then(duration_seconds) != Some(copy.interval_seconds) && {
+        let mut probe = mirror.clone();
+        probe["interval"] = json!(format!("{}s", copy.interval_seconds));
+        current(copy, path, &probe)
+    }
+}
+
 /// One pass over every repository of the source. Returns the report rows and
 /// whether anything is still missing.
 pub fn reconcile(
@@ -248,10 +257,19 @@ pub fn reconcile(
         }
         // A wiki twin made just now cannot have been probed by a mirror that
         // already exists: Forgejo configures the wiki remote only at creation.
-        let replace = mirror
+        // An interval difference alone never replaces a mirror (a replacement means a new key): it is reported, nothing else.
+        let drift = mirror
             .as_ref()
-            .is_some_and(|m| !current(copy, &repo.path, m) || (fresh_twin && repo.has_wiki));
-        let mut state = "current";
+            .is_some_and(|m| interval_only(copy, &repo.path, m));
+        let replace = mirror.as_ref().is_some_and(|m| {
+            (!current(copy, &repo.path, m) && !interval_only(copy, &repo.path, m))
+                || (fresh_twin && repo.has_wiki)
+        });
+        let mut state = if drift && !replace {
+            "interval-drift"
+        } else {
+            "current"
+        };
         if replace {
             if !write || repo.archived {
                 report.push(row("replace-planned", mirror.as_ref()));
@@ -532,8 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn a_renamed_repository_and_a_wrong_interval_replace_the_mirror_and_two_mirrors_stop_the_pass()
-    {
+    fn a_renamed_repository_replaces_the_mirror_a_wrong_interval_does_not_and_two_mirrors_stop_the_pass(
+    ) {
         let mut forge = Forge::default()
             .repo(1, "org/new", false, false)
             .repo(2, "org/slow", false, false);
@@ -541,7 +559,8 @@ mod tests {
         forge.mirror("org/slow", "ssh://192.0.2.6/org/slow.git", "1h0m0s");
         let mut host = Host::default();
         let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
-        assert!(rows.iter().all(|r| r["state"] == "replaced"));
+        assert_eq!(rows[0]["state"], "replaced");
+        assert_eq!(rows[1]["state"], "interval-drift");
         assert_eq!(
             forge.mirrors["org/new"][0]["remote_address"],
             "ssh://192.0.2.6/org/new.git"
@@ -549,6 +568,33 @@ mod tests {
 
         forge.mirror("org/new", "ssh://192.0.2.6/org/new.git", "10m0s");
         assert!(reconcile(&copy(), &source(), &mut forge, &mut host, true, None).is_err());
+    }
+
+    #[test]
+    fn an_interval_difference_alone_never_replaces_a_mirror() {
+        let mut forge = Forge::default().repo(1, "org/a", false, false);
+        forge.mirror("org/a", "ssh://192.0.2.6/org/a.git", "1h0m0s");
+        let mut host = Host::default();
+        let (rows, incomplete) =
+            reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
+        assert_eq!(rows[0]["state"], "interval-drift");
+        assert!(!incomplete);
+        assert!(
+            forge.writes.is_empty(),
+            "no delete, no create: {:?}",
+            forge.writes
+        );
+        assert_eq!(forge.mirrors["org/a"][0]["interval"], "1h0m0s");
+        // Planning says the same.
+        let (rows, incomplete) =
+            reconcile(&copy(), &source(), &mut forge, &mut NoReceiver, false, None).unwrap();
+        assert_eq!(rows[0]["state"], "interval-drift");
+        assert!(!incomplete);
+        // Other drift still replaces.
+        let mut forge = Forge::default().repo(1, "org/a", false, false);
+        forge.mirror("org/a", "ssh://192.0.2.6/org/other.git", "1h0m0s");
+        let (rows, _) = reconcile(&copy(), &source(), &mut forge, &mut host, true, None).unwrap();
+        assert_eq!(rows[0]["state"], "replaced");
     }
 
     #[test]
