@@ -56,7 +56,7 @@ Adapter capability `transfer`. A transfer changes the namespace only; a changed 
 (transfer first, then rename). **Transfers write only under `reconcile --apply`.** `plan` never writes, and `rename --apply`
 (the serve lane's `source-renamed` reaction) never transfers and never creates: it reports `transfer-needed`. States:
 `transfer-planned` (with the steps), `transferred`, `transfer-pending` (a step was taken; the next pass continues),
-`transfer-blocked` (reported, never forced), and `transfer-needed` (also in `--operation names`). A provider's refusal reaches
+`transfer-blocked` (reported, never forced), and `transfer-needed` (also in `--operation names`). Every transfer row also carries `provider` and `old_repository_id` (the destination's identity before the move), so a placement update matches the right destination. A provider's refusal reaches
 the report as its HTTP status only: the transport never parses error bodies.
 
 | Provider | Transfer |

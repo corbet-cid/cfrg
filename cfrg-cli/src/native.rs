@@ -469,7 +469,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             .as_deref()
                             .is_some_and(|id| move_in_flight(&io, id))
                     {
-                        report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "detail":"a Bitbucket move is in flight; only plan and reconcile continue it"}));
+                        report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "detail":"a Bitbucket move is in flight; only plan and reconcile continue it"})));
                         incomplete = true;
                         return Ok(());
                     }
@@ -615,7 +615,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             }
                             if dest.provider == Provider::Github && moving {
                                 if github_transfer_spent {
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":"one GitHub transfer per run"}));
+                                    report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":"one GitHub transfer per run"})));
                                     incomplete = true;
                                     return Ok(());
                                 }
@@ -624,7 +624,7 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                             let outcome = transfer_one(&mut io, options, &dest, &from, moving)?;
                             match outcome {
                                 Transfer::Planned { from, steps } => {
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-planned", "from":from, "steps":steps}));
+                                    report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transfer-planned", "from":from, "steps":steps})));
                                     incomplete = true;
                                     return Ok(());
                                 }
@@ -633,17 +633,17 @@ fn execute(options: &Options) -> Result<(Vec<Value>, bool, Result<()>)> {
                                     detail,
                                     new_repository_id,
                                 } => {
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "from":from, "detail":detail, "new_repository_id":new_repository_id}));
+                                    report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transfer-pending", "from":from, "detail":detail, "new_repository_id":new_repository_id})));
                                     incomplete = true;
                                     return Ok(());
                                 }
                                 Transfer::Blocked { from, reason } => {
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":reason}));
+                                    report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transfer-blocked", "from":from, "reason":reason})));
                                     incomplete = true;
                                     return Ok(());
                                 }
                                 Transfer::Done { from, detail } => {
-                                    report.push(json!({"source":repo.path, "destination":dest.path, "state":"transferred", "from":from, "detail":detail}));
+                                    report.push(identified(&dest, json!({"source":repo.path, "destination":dest.path, "state":"transferred", "from":from, "detail":detail})));
                                     Some(from)
                                 }
                             }
@@ -1166,6 +1166,18 @@ fn transfer_one(
     }
 }
 
+/// A transfer row names the provider and the destination's identity BEFORE the move, so that whoever records the result in the
+/// placement (infra `placement-apply-transfers.py`) matches the right destination.
+fn identified(dest: &Destination, mut row: Value) -> Value {
+    row["provider"] = json!(match dest.provider {
+        Provider::Gitlab => "gitlab",
+        Provider::Bitbucket => "bitbucket",
+        Provider::Github => "github",
+    });
+    row["old_repository_id"] = json!(dest.repository_id);
+    row
+}
+
 /// A Bitbucket move recorded for `old_uuid` and not yet complete.
 fn move_in_flight(io: &dyn Transport, old_uuid: &str) -> bool {
     io.recorded("bitbucket-transfer", old_uuid).is_some()
@@ -1213,7 +1225,10 @@ fn bitbucket_move(
     report: &mut Vec<Value>,
 ) -> Result<MoveStep> {
     let row = |state: &str, extra: Value| {
-        let mut row = json!({"source":repo.path, "destination":dest.path, "state":state});
+        let mut row = identified(
+            dest,
+            json!({"source":repo.path, "destination":dest.path, "state":state}),
+        );
         for (key, value) in extra.as_object().into_iter().flatten() {
             row[key] = value.clone();
         }
@@ -2127,6 +2142,10 @@ mod tests {
         let step = pass(&mut world, &mut mirrors, true, &dest, &mut report);
         assert!(matches!(&step, MoveStep::Continue(id) if id == "{new}"));
         assert_eq!(report.last().unwrap()["state"], "transferred");
+        // The row names the provider and the identity before the move: what a placement update matches on.
+        assert_eq!(report.last().unwrap()["provider"], "bitbucket");
+        assert_eq!(report.last().unwrap()["old_repository_id"], "{old}");
+        assert_eq!(report.last().unwrap()["detail"]["repository_id"], "{new}");
         assert!(!world.old_alive);
         assert_eq!(world.mirrors.len(), 1);
         assert!(world.mirrors[0]["remote_address"]
