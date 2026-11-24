@@ -15,7 +15,7 @@ cfrg.workspace = true
 cfgj.workspace = true
 cghb.workspace = true
 cfrg-relay = { path = "../cfrg-relay" }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 hex = "0.4"
 hmac = "0.12"
