@@ -104,6 +104,7 @@ pub struct Workers {
     dispatch_rx: mpsc::Receiver<DispatchJob>,
     wiki_rx: mpsc::Receiver<String>,
     hook_rx: mpsc::Receiver<crate::hooks::Job>,
+    hook_fast_rx: mpsc::Receiver<crate::hooks::Job>,
 }
 
 impl Bridge {
@@ -117,7 +118,7 @@ impl Bridge {
             Duration::from_secs(cfg.replay.ttl_seconds),
             cfg.replay.capacity,
         );
-        let (hooks, hook_rx) = crate::hooks::Queue::new();
+        let (hooks, hook_rx, hook_fast_rx) = crate::hooks::Queue::new();
         let extra: Vec<&str> = cfg.forge_hosts.iter().skip(1).map(String::as_str).collect();
         let allow = match &cfg.placement {
             Some(path) => crate::allow::Allow::load(Path::new(path), &extra)?,
@@ -148,6 +149,7 @@ impl Bridge {
                 dispatch_rx,
                 wiki_rx,
                 hook_rx,
+                hook_fast_rx,
             },
         ))
     }
@@ -172,8 +174,10 @@ impl Bridge {
             mut dispatch_rx,
             mut wiki_rx,
             hook_rx,
+            hook_fast_rx,
         } = workers;
         crate::hooks::run(Arc::clone(self), hook_rx);
+        crate::hooks::run(Arc::clone(self), hook_fast_rx);
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
             while let Some((repo, tag)) = release_rx.recv().await {

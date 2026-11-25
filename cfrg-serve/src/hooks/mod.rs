@@ -2,8 +2,9 @@
 //!
 //! Each hook is its own module: it knows its path and turns a verified Forgejo payload into a [`Job`] (a command key and
 //! the arguments to append). The command itself is configuration (`hook_commands`, argv by key), so the service stays
-//! free of provider code. Jobs run one at a time in one worker; a job already queued for the same key is dropped as a
-//! duplicate. One attempt per event (R30): nothing is retried; the next event, or the daily drift run, repairs a failure.
+//! free of provider code. Jobs run one at a time in a worker; the release hand-off has a worker of its own, so a minutes-long
+//! copy or gate backlog never holds a published release back (or loses it with the pod). A job already queued for the same
+//! key is dropped as a duplicate. One attempt per event (R30): nothing is retried; the next event, or the daily drift run, repairs a failure.
 use crate::server::{log, Bridge};
 use http::HeaderMap;
 use serde_json::{json, Value};
@@ -74,21 +75,28 @@ pub(crate) fn valid_repo(s: &str) -> bool {
     matches!(s.split_once('/'), Some((o, r)) if part(o) && part(r) && !r.contains('/'))
 }
 
-/// The queue: a bounded channel plus the set of keys waiting in it.
+/// Commands with their own worker (seconds-long, time-critical): the rest share the one slow worker.
+const FAST: &[&str] = &["handoff"];
+
+/// The queue: a bounded channel per worker plus the set of keys waiting in them.
 pub struct Queue {
     tx: mpsc::Sender<Job>,
+    fast_tx: mpsc::Sender<Job>,
     pending: Mutex<HashSet<String>>,
 }
 
 impl Queue {
-    pub fn new() -> (Self, mpsc::Receiver<Job>) {
+    pub fn new() -> (Self, mpsc::Receiver<Job>, mpsc::Receiver<Job>) {
         let (tx, rx) = mpsc::channel(256);
+        let (fast_tx, fast_rx) = mpsc::channel(256);
         (
             Self {
                 tx,
+                fast_tx,
                 pending: Mutex::new(HashSet::new()),
             },
             rx,
+            fast_rx,
         )
     }
 
@@ -103,7 +111,12 @@ impl Queue {
         {
             return "duplicate";
         }
-        if self.tx.try_send(job).is_err() {
+        let tx = if FAST.contains(&job.command) {
+            &self.fast_tx
+        } else {
+            &self.tx
+        };
+        if tx.try_send(job).is_err() {
             self.forget(&id);
             return "busy";
         }
@@ -147,7 +160,7 @@ pub fn accept(
     }
 }
 
-/// The one worker: jobs in order, each a child process, one log line with the exit status.
+/// A worker: jobs in order, each a child process, one log line with the exit status.
 pub fn run(bridge: Arc<Bridge>, mut rx: mpsc::Receiver<Job>) {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
@@ -177,7 +190,7 @@ mod tests {
 
     #[test]
     fn queue_drops_a_duplicate_until_taken() {
-        let (q, mut rx) = Queue::new();
+        let (q, mut rx, _fast) = Queue::new();
         let job = || Job {
             command: "copy",
             key: "a/b".into(),
@@ -188,6 +201,21 @@ mod tests {
         let taken = rx.try_recv().unwrap();
         q.forget(&format!("{}/{}", taken.command, taken.key));
         assert_eq!(q.enqueue(job()), "queued");
+    }
+
+    #[test]
+    fn handoff_has_its_own_lane() {
+        let (q, mut rx, mut fast) = Queue::new();
+        let job = |command| Job {
+            command,
+            key: "a/b".into(),
+            args: vec![],
+        };
+        assert_eq!(q.enqueue(job("gate")), "queued");
+        assert_eq!(q.enqueue(job("handoff")), "queued");
+        assert_eq!(rx.try_recv().unwrap().command, "gate");
+        assert_eq!(fast.try_recv().unwrap().command, "handoff");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
